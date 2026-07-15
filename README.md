@@ -12,6 +12,8 @@ Dependencies:
 - LLVM
 - libC
 
+No WASM support.
+
 ## Quick start
 
 ### 1. Add the dependency
