@@ -1,0 +1,10 @@
+.{
+    .name = .gompute_basic_example,
+    .version = "0.0.0",
+    .fingerprint = 0x9bf7203fb5bbd465,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .gompute = .{ .path = "../.." },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

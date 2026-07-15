@@ -1,0 +1,245 @@
+const std = @import("std");
+
+pub const Gpu = union(enum) {
+    /// Detect the GPU on the build machine; the backend is disabled if none is found.
+    auto,
+    /// Explicit target CPU accepted by Zig, e.g. `sm_89` (CUDA) or `gfx1100` (HIP).
+    name: []const u8,
+};
+
+pub const CudaOptions = struct {
+    enabled: bool = true,
+    gpu: Gpu = .auto,
+    /// Optimize mode for CUDA device code. Overrides `EmitOptions.optimize`.
+    optimize: ?std.builtin.OptimizeMode = null,
+};
+
+pub const HipOptions = struct {
+    enabled: bool = true,
+    gpu: Gpu = .auto,
+    /// Optimize mode for HIP device code. Overrides `EmitOptions.optimize`.
+    optimize: ?std.builtin.OptimizeMode = null,
+};
+
+/// ponytail: nvidia-smi ships with every NVIDIA driver; querying it is the
+/// lightest reliable probe. Compute cap "8.9" maps directly to "sm_89".
+fn detectCudaGpu(b: *std.Build) ?[]const u8 {
+    var code: u8 = undefined;
+    const out = b.runAllowFail(
+        &.{ "nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader" },
+        &code,
+        .ignore,
+    ) catch return null;
+    const line = std.mem.trim(u8, std.mem.sliceTo(out, '\n'), " \r\t");
+    if (line.len == 0) return null;
+    var buf: std.ArrayList(u8) = .empty;
+    buf.appendSlice(b.allocator, "sm_") catch @panic("OOM");
+    for (line) |c| if (c != '.') buf.append(b.allocator, c) catch @panic("OOM");
+    return buf.items;
+}
+
+fn detectHipGpu(b: *std.Build) ?[]const u8 {
+    for ([_][]const []const u8{
+        &.{"amdgpu-arch"},
+        &.{"rocm_agent_enumerator"},
+    }) |argv| {
+        var code: u8 = undefined;
+        const out = b.runAllowFail(argv, &code, .ignore) catch continue;
+        var it = std.mem.tokenizeAny(u8, out, " \r\n\t");
+        while (it.next()) |arch| {
+            // gfx000 is the CPU agent reported by rocm_agent_enumerator.
+            if (std.mem.startsWith(u8, arch, "gfx") and !std.mem.eql(u8, arch, "gfx000"))
+                return arch;
+        }
+    }
+    return null;
+}
+
+/// Debug device code drags std.builtin panic globals into the module and
+/// LLVM's NVPTX backend emits invalid PTX types (.u2/.u4/.u5) for them.
+/// ReleaseSafe keeps safety checks and produces valid PTX.
+fn deviceOptimize(mode: std.builtin.OptimizeMode) std.builtin.OptimizeMode {
+    return if (mode == .Debug) .ReleaseSafe else mode;
+}
+
+pub const EmitOptions = struct {
+    kernels_root: std.Build.LazyPath,
+    cuda: CudaOptions = .{},
+    hip: HipOptions = .{},
+    /// Host target (from standardTargetOptions). Defaults to the host
+    /// artifact's target. Native GPU backends are skipped on wasm.
+    target: ?std.Build.ResolvedTarget = null,
+    /// Optimize mode for device code (from standardOptimizeOption).
+    /// Defaults to the host artifact's optimize mode.
+    optimize: ?std.builtin.OptimizeMode = null,
+};
+
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+
+    const host_mod = b.addModule("gompute", .{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    _ = b.addModule("gompute_device", .{
+        .root_source_file = b.path("src/device.zig"),
+    });
+
+    const unit_tests = b.addTest(.{ .root_module = host_mod });
+    const run_unit_tests = b.addRunArtifact(unit_tests);
+
+    const tool_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/kernel_ir_tool.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_tool_tests = b.addRunArtifact(tool_tests);
+
+    const codegen_probe = b.addObject(.{
+        .name = "gompute-codegen-probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/codegen.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{.{ .name = "gompute", .module = host_mod }},
+        }),
+    });
+
+    const test_step = b.step("test", "Run Gompute unit tests");
+    test_step.dependOn(&run_unit_tests.step);
+    test_step.dependOn(&run_tool_tests.step);
+    test_step.dependOn(&codegen_probe.step);
+}
+
+/// Add CUDA PTX and HIP HSACO sub-compilations for a designated kernel root,
+/// then attach them to `host` as the private `gompute_kernels` module.
+///
+/// Consumer build.zig:
+///
+///     const gompute_build = @import("gompute");
+///     const dep = b.dependency("gompute", .{});
+///     exe.root_module.addImport("gompute", dep.module("gompute"));
+///     gompute_build.emitKernels(b, dep, exe, .{
+///         .kernels_root = b.path("src/kernels.zig"),
+///     });
+pub fn emitKernels(
+    b: *std.Build,
+    dep: *std.Build.Dependency,
+    host: *std.Build.Step.Compile,
+    options: EmitOptions,
+) void {
+    const tool = b.addExecutable(.{
+        .name = "gompute-kernel-ir-tool",
+        .root_module = b.createModule(.{
+            .root_source_file = dep.path("tools/kernel_ir_tool.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+
+    var cuda_ptx: ?std.Build.LazyPath = null;
+    var hip_hsaco: ?std.Build.LazyPath = null;
+    var hip_names: ?std.Build.LazyPath = null;
+
+    const host_target = options.target orelse
+        host.root_module.resolved_target orelse b.graph.host;
+    const optimize = deviceOptimize(options.optimize orelse
+        host.root_module.optimize orelse .ReleaseFast);
+    // CUDA/HIP drivers do not exist on the web; skip the native backends there.
+    const is_wasm = host_target.result.cpu.arch.isWasm();
+
+    const cuda_cpu: ?[]const u8 = if (is_wasm or !options.cuda.enabled) null else switch (options.cuda.gpu) {
+        .name => |n| n,
+        .auto => detectCudaGpu(b),
+    };
+    const hip_cpu: ?[]const u8 = if (is_wasm or !options.hip.enabled) null else switch (options.hip.gpu) {
+        .name => |n| n,
+        .auto => detectHipGpu(b),
+    };
+
+    if (cuda_cpu) |cpu| {
+        const query = std.Target.Query.parse(.{
+            .arch_os_abi = "nvptx64-cuda",
+            .cpu_features = cpu,
+        }) catch @panic("invalid CUDA target CPU");
+        const target = b.resolveTargetQuery(query);
+        const gpu_mod = b.createModule(.{
+            .root_source_file = options.kernels_root,
+            .target = target,
+            .optimize = if (options.cuda.optimize) |m| deviceOptimize(m) else optimize,
+            // Debug info in device IR makes the PTX claim DWARF it doesn't
+            // have; the CUDA driver then rejects the module (error 218).
+            .strip = true,
+            .imports = &.{.{ .name = "gompute", .module = dep.module("gompute_device") }},
+        });
+        const object = b.addObject(.{ .name = "gompute_cuda_ir", .root_module = gpu_mod });
+        const rewrite = b.addRunArtifact(tool);
+        rewrite.addFileArg(object.getEmittedLlvmIr());
+        const rewritten_ir = rewrite.addOutputFileArg("gompute_cuda.ll");
+        _ = rewrite.addOutputFileArg("gompute_cuda_names.zig");
+
+        const assemble = b.addSystemCommand(&.{
+            b.graph.zig_exe,
+            "cc",
+            "-target",
+            "nvptx64-cuda",
+            b.fmt("-mcpu={s}", .{cuda_cpu.?}),
+            "-S",
+            "-g0", // nvptx rejects dwarf debug info; keeps stderr clean
+            "-Wno-unused-command-line-argument",
+        });
+        assemble.addFileArg(rewritten_ir);
+        cuda_ptx = assemble.addPrefixedOutputFileArg("-o", "gompute.ptx");
+    }
+
+    if (hip_cpu) |cpu| {
+        const query = std.Target.Query.parse(.{
+            .arch_os_abi = "amdgcn-amdhsa",
+            .cpu_features = cpu,
+        }) catch @panic("invalid HIP target CPU");
+        const target = b.resolveTargetQuery(query);
+        const gpu_mod = b.createModule(.{
+            .root_source_file = options.kernels_root,
+            .target = target,
+            .optimize = if (options.hip.optimize) |m| deviceOptimize(m) else optimize,
+            .strip = true,
+            .imports = &.{.{ .name = "gompute", .module = dep.module("gompute_device") }},
+        });
+        const object = b.addObject(.{ .name = "gompute_hip_obj", .root_module = gpu_mod });
+
+        const names_run = b.addRunArtifact(tool);
+        names_run.addFileArg(object.getEmittedLlvmIr());
+        _ = names_run.addOutputFileArg("gompute_hip_rewritten.ll");
+        hip_names = names_run.addOutputFileArg("gompute_hip_names.zig");
+
+        const link = b.addSystemCommand(&.{ b.graph.zig_exe, "ld.lld", "-shared" });
+        link.addFileArg(object.getEmittedBin());
+        hip_hsaco = link.addPrefixedOutputFileArg("-o", "gompute.hsaco");
+    }
+
+    const write = b.addWriteFiles();
+    const artifacts_source = write.add("gompute_kernels.zig", b.fmt(
+        \\//! Generated by gompute.emitKernels.
+        \\pub const has_cuda = {};
+        \\pub const has_hip = {};
+        \\pub const cuda: []const u8 = if (has_cuda) @embedFile("cuda_blob") else "";
+        \\pub const hip: []const u8 = if (has_hip) @embedFile("hip_blob") else "";
+        \\pub const hip_names = if (has_hip) @import("hip_names") else struct {{
+        \\    pub fn resolve(comptime _: []const u8) [:0]const u8 {{
+        \\        @compileError("HIP artifacts were not emitted");
+        \\    }}
+        \\}};
+        \\
+    , .{ cuda_cpu != null, hip_cpu != null }));
+
+    const artifacts_mod = b.createModule(.{ .root_source_file = artifacts_source });
+    if (cuda_ptx) |path| artifacts_mod.addAnonymousImport("cuda_blob", .{ .root_source_file = path });
+    if (hip_hsaco) |path| artifacts_mod.addAnonymousImport("hip_blob", .{ .root_source_file = path });
+    if (hip_names) |path| artifacts_mod.addAnonymousImport("hip_names", .{ .root_source_file = path });
+    dep.module("gompute").addImport("gompute_kernels", artifacts_mod);
+    host.root_module.addImport("gompute_kernels", artifacts_mod);
+}
