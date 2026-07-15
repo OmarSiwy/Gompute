@@ -18,11 +18,8 @@ No WASM support.
 
 ### 1. Add the dependency
 
-```zig
-// build.zig.zon
-.dependencies = .{
-    .gompute = .{ .path = "path/to/gompute" },
-},
+```sh
+zig fetch --save git+https://github.com/OmarSiwy/Gompute.git
 ```
 
 ### 2. Define shared kernels
