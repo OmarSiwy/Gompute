@@ -249,8 +249,19 @@ pub const Context = struct {
         try check(g.hipStreamCreate(&s.stream, 0), error.SyncFailed);
         return s;
     }
-    pub const attr_multiprocessor_count: c_int = 16;
-    pub const attr_cooperative_launch: c_int = 97;
+    // hipDeviceAttribute_t, NOT CUdevice_attribute: the two enums are unrelated
+    // and these were copy-pasted from cuda.zig (16 and 95/97). Values taken from
+    // hip/hip_runtime_api.h, ROCm 7.2.3, read out with the preprocessor rather
+    // than counted by eye -- the enum opens with an alias
+    // (hipDeviceAttributeEccEnabled = hipDeviceAttributeCudaCompatibleBegin = 0),
+    // which makes hand-counting land one too high. Cross-check:
+    // hipDeviceAttributeWarpSize == 87.
+    //
+    // The old 97 matched no attribute at all, so hipDeviceGetAttribute returned
+    // hipErrorInvalidValue, `catch 0` ate it, and maxCoopBlocks always answered
+    // 0. Invisible on NVIDIA, where cuda.zig's constants happen to be right.
+    pub const attr_multiprocessor_count: c_int = 63;
+    pub const attr_cooperative_launch: c_int = 10;
     pub fn deviceAttribute(self: *Context, attrib: c_int) Error!c_int {
         try self.makeCurrent();
         var v: c_int = 0;
@@ -271,15 +282,30 @@ pub const Buffer = struct {
     handle: hipDeviceptr_t = null,
     bytes: usize = 0,
 
+    /// `free` nulls the handle and a default-constructed Buffer never had one.
+    /// Either way it is a caller mistake, not a safety panic (or, in
+    /// ReleaseFast, a copy through a dangling pointer).
+    fn devicePtr(self: *const Buffer) Error!hipDeviceptr_t {
+        if (self.handle == null) return error.InvalidArgument;
+        return self.handle;
+    }
+
+    fn offsetPtr(self: *const Buffer, offset: usize) Error!hipDeviceptr_t {
+        return @ptrFromInt(@intFromPtr(try self.devicePtr()) + offset);
+    }
+
     pub fn upload(self: *Buffer, host: *const anyopaque, n: usize) Error!void {
         ensureCurrent();
-        try check(g.hipMemcpyHtoD(self.handle, host, n), error.CopyFailed);
+        try check(g.hipMemcpyHtoD(try self.devicePtr(), host, n), error.CopyFailed);
     }
     pub fn download(self: *Buffer, host: *anyopaque, n: usize) Error!void {
         ensureCurrent();
-        try check(g.hipMemcpyDtoH(host, self.handle, n), error.CopyFailed);
+        try check(g.hipMemcpyDtoH(host, try self.devicePtr(), n), error.CopyFailed);
     }
     pub fn free(self: *Buffer) void {
+        // Also covers a default-constructed Buffer, where `g` is still
+        // `undefined` because nothing ever dlopen'd the runtime.
+        if (self.handle == null) return;
         ensureCurrent();
         _ = g.hipFree(self.handle);
         self.* = .{};
@@ -289,19 +315,15 @@ pub const Buffer = struct {
     }
     pub fn copyFrom(self: *Buffer, src: *const Buffer, src_offset: usize, dst_offset: usize, n: usize) Error!void {
         ensureCurrent();
-        const sp: usize = @intFromPtr(src.handle.?) + src_offset;
-        const dp: usize = @intFromPtr(self.handle.?) + dst_offset;
-        try check(g.hipMemcpyDtoD(@ptrFromInt(dp), @ptrFromInt(sp), n), error.CopyFailed);
+        try check(g.hipMemcpyDtoD(try self.offsetPtr(dst_offset), try src.offsetPtr(src_offset), n), error.CopyFailed);
     }
     pub fn downloadAt(self: *Buffer, host: *anyopaque, offset: usize, n: usize) Error!void {
         ensureCurrent();
-        const src: usize = @intFromPtr(self.handle.?) + offset;
-        try check(g.hipMemcpyDtoH(host, @ptrFromInt(src), n), error.CopyFailed);
+        try check(g.hipMemcpyDtoH(host, try self.offsetPtr(offset), n), error.CopyFailed);
     }
     pub fn uploadAt(self: *Buffer, host: *const anyopaque, offset: usize, n: usize) Error!void {
         ensureCurrent();
-        const dst: usize = @intFromPtr(self.handle.?) + offset;
-        try check(g.hipMemcpyHtoD(@ptrFromInt(dst), host, n), error.CopyFailed);
+        try check(g.hipMemcpyHtoD(try self.offsetPtr(offset), host, n), error.CopyFailed);
     }
 };
 
@@ -354,3 +376,17 @@ pub const Stream = struct {
         self.* = .{};
     }
 };
+
+test "a handle-less Buffer errors instead of panicking, and free is idempotent" {
+    // Runs on any machine: none of these paths reach the driver, which is the
+    // point -- before, each was `self.handle.?` on a null handle.
+    var buffer: Buffer = .{};
+    var byte: u8 = 0;
+    try std.testing.expectError(error.InvalidArgument, buffer.upload(&byte, 1));
+    try std.testing.expectError(error.InvalidArgument, buffer.download(&byte, 1));
+    try std.testing.expectError(error.InvalidArgument, buffer.uploadAt(&byte, 4, 1));
+    try std.testing.expectError(error.InvalidArgument, buffer.downloadAt(&byte, 4, 1));
+    try std.testing.expectError(error.InvalidArgument, buffer.copyFrom(&buffer, 0, 0, 1));
+    buffer.free();
+    buffer.free();
+}
