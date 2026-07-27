@@ -53,6 +53,9 @@ pub fn main() !void {
     // ── Comptime CPU reference (sanity baseline) ────────────────────────
     testCpuReference();
 
+    // ── Hand-written raw kernel through the same artifact pipeline ──────
+    testRawKernel();
+
     // ── Pure comptime: ABI, fusion, Dim3 ────────────────────────────────
     testAbiPack();
     testFusionDirect();
@@ -415,6 +418,60 @@ fn testCpuReference() void {
 }
 
 // ── ABI pack/unpack ─────────────────────────────────────────────────────
+
+/// `raw_increment` is exported by kernels.zig via `exportRaw` and rides the same
+/// PTX/HSACO pipeline as the generated kernels, but is launched by hand: the
+/// caller owns the grid, the block, and the argument list.
+///
+/// `AutoKernel(...).Cuda.available` is the comptime question "did this build
+/// emit CUDA artifacts?" -- `RawKernel(name, .cuda)` is a compile error when it
+/// did not, so a probe that must compile on any machine has to ask first.
+fn testRawKernel() void {
+    print("[raw kernel] ", .{});
+    if (comptime !g.AutoKernel(k.scale_relu).Cuda.available) {
+        print("skipped (build emitted no CUDA artifacts)\n", .{});
+        return;
+    }
+
+    var raw = g.RawKernel("raw_increment", .cuda).init(0) catch |e| {
+        print("skipped ({s})\n", .{@errorName(e)});
+        return;
+    };
+    defer raw.deinit();
+
+    var data = [_]f32{ 1, 2, 3, 4, 5 };
+    const bytes = data.len * @sizeOf(f32);
+    const block: u32 = 256;
+
+    var buffer = raw.alloc(bytes) catch |e| {
+        print("alloc failed: {s}\n", .{@errorName(e)});
+        return;
+    };
+    defer buffer.free();
+
+    var len: u64 = data.len;
+    var args = [_]g.interface.Arg{ buffer.argPtr(), g.interface.arg(&len) };
+
+    buffer.upload(&data, bytes) catch |e| {
+        print("upload failed: {s}\n", .{@errorName(e)});
+        return;
+    };
+    raw.launch(g.Dim3.linear(data.len, block), .{ .x = block }, 0, &args) catch |e| {
+        print("launch failed: {s}\n", .{@errorName(e)});
+        return;
+    };
+    raw.synchronize() catch |e| {
+        print("sync failed: {s}\n", .{@errorName(e)});
+        return;
+    };
+    buffer.download(&data, bytes) catch |e| {
+        print("download failed: {s}\n", .{@errorName(e)});
+        return;
+    };
+
+    check("raw_increment", allApproxEq(&data, &.{ 2, 3, 4, 5, 6 }));
+    print("{any}\n", .{data});
+}
 
 fn testAbiPack() void {
     print("[abi pack/unpack] ", .{});
