@@ -320,6 +320,46 @@ try kernel.run(&data, .{ .scale = 2 });
 has one tagged-union switch. Use a fixed backend when zero runtime dispatch is
 the requirement.
 
+`AutoKernel` distinguishes *no GPU here* from *this build is broken*. A missing
+driver falls back to the CPU silently, as it should. But if the artifact is in
+the binary and still fails to start — wrong device arch, a kernel missing from
+`exportKernels` — it warns, because that is a ~100x slowdown caused by a build
+mistake rather than by hardware. Use `initStrict()` to make that fatal, and
+`kernel.selected()` to assert which backend you actually got.
+
+## Behaviour worth knowing
+
+Things that are easy to get wrong because nothing in the API says them out loud.
+
+| | |
+| --- | --- |
+| `init(0)` | The CUDA/HIP **device ordinal**. Ignored by `.cpu`. |
+| `run` | Allocates a device buffer, uploads, launches, **synchronizes**, downloads, frees — every call. Convenient, not cheap; see the next section to hoist it. |
+| `deinit` | Always safe, and safe to call twice. On `.cpu` it is a no-op. It releases *your handle*, not the shared device state. |
+| Contexts and modules | Shared process-wide, per device. Two `Kernel`s on one GPU share one CUDA primary context and JIT the artifact once, so buffers allocated through one are usable by the other. `runtime.cuda.shutdown()` is the only real teardown. |
+| Threads | Safe. A context is made current per thread on first use. |
+| `Buffer` | `free()` is idempotent. Use-after-free is not checked. `upload`/`download` do not bounds-check against `Buffer.bytes` — the driver catches the overrun and you get `error.CopyFailed`. |
+| Errors | `Error` has 12 members. `lastDriverError()` returns the raw CUDA/HIP code behind the last failure, which is the only way to tell "no driver" from "out of memory". It is cleared on success. |
+| `block_size` | Must be 1…1024. Not required to be a multiple of the warp/wave size, but anything else wastes part of every warp. |
+| Empty input | `run` on a zero-length slice returns without launching. |
+
+### Naming
+
+Two pairs are easy to confuse:
+
+- **`exportKernels`** goes in your *kernels* file and names the entry points to
+  emit. **`emitKernels`** goes in your *build.zig* and wires up the
+  compilation. One word apart, different files, and `@import("gompute")` means
+  a different module in each — the host module in `build.zig`, the device
+  module inside `kernels.zig`. Forgetting either produces a different error.
+- **`map` returns a comptime *type***, not a value, despite the lowercase name.
+  `pub const scale_relu = g.map(...)` binds a type, which is why
+  `Kernel(kernels.scale_relu, .cpu)` takes it as a parameter. `mapFn` is the
+  same thing with `T` and `Params` inferred from the function.
+
+`Unary` is `Fused` with a single operation; it exists so a bare `fn (T, Params) T`
+can be dropped into a `Fused` pipeline alongside op structs.
+
 ## Allocation-free GPU launch path
 
 `run` is intentionally convenient, not magical. Reuse a device buffer to avoid
@@ -461,14 +501,22 @@ AMDGPU metadata while the public API continues to use `scale_relu`.
 
 | Backend | Generated `map` path |              Host runtime | Validation in this package                     |
 | ------- | -------------------: | ------------------------: | ---------------------------------------------- |
-| CPU     |                  Yes |                Native Zig | Executed by `zig build test` and the examples  |
+| CPU     |                  Yes |                Native Zig | Executed, and codegen-compared                 |
 | CUDA    |             Yes, PTX | Runtime-loaded driver API | Cross-compiled; PTX entries inspected          |
 | HIP     |           Yes, HSACO |    Runtime-loaded HIP API | Cross-compiled; ELF symbols/metadata inspected |
 
-`tests/codegen.zig` is only *compiled* (`addObject`, `-fno-emit-bin`) by
-`zig build test`. It proves the specializations type-check and instantiate; it
-is not linked, not run, and no emitted code is diffed against a reference.
-There is no codegen comparison in this package.
+"Codegen-compared" means `zig build test` compiles `tests/codegen.zig` at
+`ReleaseFast`, emits its assembly, and asserts that the generated
+`Kernel(Spec, .cpu)` and the hand-written loop beside it end up as the *same
+machine code*. In practice LLVM folds them into one symbol, along with the
+`mapFn` variant, which is the strongest form that assertion can take. If they
+ever diverge the build fails with an instruction-level diff.
+
+That is the library's central claim — the abstraction is resolved at compile
+time and leaves no runtime residue — so it is checked rather than asserted.
+
+HIP is cross-compiled and its symbols inspected, but **nothing in this package
+has been executed on AMD hardware**; no such device was available.
 
 ## Commands
 
