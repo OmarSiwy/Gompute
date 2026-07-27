@@ -102,7 +102,23 @@ pub fn main(init: std.process.Init) !void {
     while (it.next()) |line| {
         if (parseAlias(line)) |alias| try aliases.append(arena, alias);
     }
-    if (aliases.items.len == 0) return error.NoKernelAliasesFound;
+    // "alias" is an internal detail of the Zig 0.16 NVPTX workaround. A user who
+    // forgot exportKernels has never heard the word, so say what to do instead.
+    if (aliases.items.len == 0) {
+        std.debug.print(
+            \\gompute: the device compilation of your kernels file produced no GPU entry points.
+            \\
+            \\Every kernel launched with Kernel(spec, .cuda) or Kernel(spec, .hip) must be
+            \\exported from the kernels file named by `.kernels_root` in your build.zig:
+            \\
+            \\    comptime {{ g.exportKernels(@This()); }}          // all kernels in this file
+            \\    comptime {{ g.exportKernels(.{{ my_kernel }}); }}   // or an explicit list
+            \\
+            \\Check that the file exporting them is the same file `.kernels_root` points at.
+            \\
+        , .{});
+        return error.NoKernelAliasesFound;
+    }
 
     var rewritten: std.ArrayList(u8) = .empty;
     try rewritten.ensureTotalCapacity(arena, input.len);
