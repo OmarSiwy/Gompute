@@ -24,7 +24,7 @@ pub fn Map(
     validateValue(T);
     const generic = validateFunction(T, Params, func);
     _ = abi.Boundary(Params);
-    if (options.block_size == 0 or options.block_size > 1024)
+    if (!blockSizeValid(options.block_size))
         @compileError("block_size must be in 1...1024");
 
     return struct {
@@ -71,14 +71,26 @@ fn Eval(comptime generic: bool, comptime T: type, comptime P: type, comptime fun
 
 fn validateName(comptime name: []const u8) void {
     if (name.len == 0) @compileError("kernel entry name cannot be empty");
-    for (name, 0..) |c, i| {
-        const valid = switch (c) {
-            'a'...'z', 'A'...'Z', '_' => true,
-            '0'...'9' => i != 0,
-            else => false,
-        };
-        if (!valid) @compileError("kernel names must be C identifiers: " ++ name);
-    }
+    if (!isCIdentifier(name)) @compileError("kernel names must be C identifiers: " ++ name);
+}
+
+/// The entry name is emitted verbatim as a PTX/HSA symbol and looked up by
+/// string, so anything a C compiler would not accept cannot be a kernel.
+/// Split out from `validateName` because a `@compileError` cannot be tested.
+fn isCIdentifier(name: []const u8) bool {
+    if (name.len == 0) return false;
+    for (name, 0..) |c, i| switch (c) {
+        'a'...'z', 'A'...'Z', '_' => {},
+        '0'...'9' => if (i == 0) return false,
+        else => return false,
+    };
+    return true;
+}
+
+/// 1024 is the maximum threads-per-block on every CUDA compute capability and
+/// on every AMD gfx target gompute targets.
+fn blockSizeValid(n: u32) bool {
+    return n > 0 and n <= 1024;
 }
 
 fn validateValue(comptime T: type) void {
@@ -126,4 +138,28 @@ test "map spec validates and evaluates" {
     }.call;
     const S = Map("scale", f32, P, op, .{});
     try std.testing.expectEqual(@as(f32, 6), S.eval(3, .{ .scale = 2 }));
+    try std.testing.expectEqual(@as(u32, 256), S.block_size);
+    try std.testing.expectEqualStrings("scale", S.entry_name);
+
+    // The bounds are real: both ends compile, and they reach the spec.
+    try std.testing.expectEqual(@as(u32, 1), Map("a", f32, P, op, .{ .block_size = 1 }).block_size);
+    try std.testing.expectEqual(@as(u32, 1024), Map("b", f32, P, op, .{ .block_size = 1024 }).block_size);
+}
+
+test "kernel names must be C identifiers" {
+    for ([_][]const u8{ "scale", "_x", "a0", "MAP_9" }) |ok|
+        try std.testing.expect(isCIdentifier(ok));
+    // Leading digit, separators, namespacing, and anything a linker would choke
+    // on -- the name is emitted as a symbol verbatim.
+    for ([_][]const u8{ "", "0scale", "my kernel", "my-kernel", "my.kernel", "add()", "über" }) |bad|
+        try std.testing.expect(!isCIdentifier(bad));
+}
+
+test "block_size bounds" {
+    try std.testing.expect(!blockSizeValid(0));
+    try std.testing.expect(blockSizeValid(1));
+    try std.testing.expect(blockSizeValid(256));
+    try std.testing.expect(blockSizeValid(1024));
+    try std.testing.expect(!blockSizeValid(1025));
+    try std.testing.expect(!blockSizeValid(std.math.maxInt(u32)));
 }

@@ -58,7 +58,15 @@ fn boundaryStruct(comptime T: type, comptime info: std.builtin.Type.Struct, comp
 
     if (has_layout) {
         const U = T.gpu_layout;
-        _ = BoundaryAt(U, @typeName(T) ++ ".gpu_layout");
+        const path = @typeName(T) ++ ".gpu_layout";
+        assertFixedLayout(U, path);
+        // A packed struct is one integer with a fixed bit layout, so it is that
+        // backing integer that crosses, not the sub-byte fields.
+        const info_u = @typeInfo(U);
+        if (info_u == .@"struct" and info_u.@"struct".layout == .@"packed")
+            _ = BoundaryAt(info_u.@"struct".backing_integer.?, path)
+        else
+            _ = BoundaryAt(U, path);
         return U;
     }
 
@@ -74,6 +82,34 @@ fn boundaryStruct(comptime T: type, comptime info: std.builtin.Type.Struct, comp
     }
 
     return @Struct(.@"extern", null, &names, &types, &attrs);
+}
+
+/// `gpu_layout` is the one type gompute does not derive, so it is the one type
+/// whose layout has to be checked by hand. `BoundaryAt` only vets the element
+/// types and throws its result away, which leaves an `.auto` struct -- no
+/// guaranteed field order, no guaranteed padding -- accepted by the very hatch
+/// that exists to make the boundary safe. Host and device are separate
+/// compilations for different targets, so both ends must agree by construction.
+///
+/// Only the outermost type needs checking: Zig already rejects a non-extern
+/// struct field inside an `extern struct` and a non-packed one inside a
+/// `packed struct`.
+fn assertFixedLayout(comptime U: type, comptime at: []const u8) void {
+    if (!hasFixedLayout(U)) @compileError(
+        "gompute: `" ++ at ++ "` is `" ++ @typeName(U) ++ "`, a default-layout (`.auto`) struct.\n" ++
+            "  A GPU wire type must have a layout both compilations agree on; `.auto` fixes\n" ++
+            "  neither field order nor padding, and the host and the device are compiled\n" ++
+            "  separately for different targets.\n" ++
+            "  Declare it as `extern struct` (C layout) or `packed struct` (bit layout).",
+    );
+}
+
+fn hasFixedLayout(comptime U: type) bool {
+    return switch (@typeInfo(U)) {
+        .@"struct" => |s| s.layout != .auto,
+        .array => |a| hasFixedLayout(a.child),
+        else => true,
+    };
 }
 
 pub fn assertStable(comptime T: type) void {
@@ -122,6 +158,95 @@ pub fn unpack(comptime T: type, value: Boundary(T)) T {
         },
         else => unreachable,
     };
+}
+
+// The tests below lock in what an on-hardware audit confirmed already works on
+// NVPTX. They are regressions locks for the derivation, not open questions.
+
+test "enums cross as their tag type, signed and negative included" {
+    const Mode = enum(u8) { off, on };
+    const Signed = enum(i16) { back = -3, forward = 4 };
+
+    try std.testing.expectEqual(u8, Boundary(Mode));
+    try std.testing.expectEqual(i16, Boundary(Signed));
+    try std.testing.expectEqual(@as(u8, 1), pack(Mode, .on));
+    try std.testing.expectEqual(@as(i16, -3), pack(Signed, .back));
+    try std.testing.expectEqual(Mode.on, unpack(Mode, pack(Mode, .on)));
+    try std.testing.expectEqual(Signed.back, unpack(Signed, pack(Signed, .back)));
+}
+
+test "arrays and vectors round-trip element by element" {
+    const Flags = [3]bool;
+    try std.testing.expectEqual([3]u8, Boundary(Flags));
+    const flags: Flags = .{ true, false, true };
+    try std.testing.expectEqual([3]u8{ 1, 0, 1 }, pack(Flags, flags));
+    try std.testing.expectEqual(flags, unpack(Flags, pack(Flags, flags)));
+
+    const V4 = @Vector(4, f32);
+    try std.testing.expectEqual(V4, Boundary(V4));
+    const v: V4 = .{ 1, 2, 3, 4 };
+    try std.testing.expectEqual(v, unpack(V4, pack(V4, v)));
+
+    // Enum arrays reduce to tag arrays, not to a derived struct.
+    const Mode = enum(u32) { a, b };
+    try std.testing.expectEqual([2]u32, Boundary([2]Mode));
+    try std.testing.expectEqual([2]u32{ 1, 0 }, pack([2]Mode, .{ .b, .a }));
+}
+
+test "nested structs, f16 and a zero-field params struct" {
+    const Inner = struct { half: f16, mode: enum(i8) { lo = -1, hi = 1 } };
+    const Outer = struct { inner: Inner, samples: [2]u16, weights: @Vector(2, f32) };
+
+    const B = Boundary(Outer);
+    try std.testing.expect(@typeInfo(B).@"struct".layout == .@"extern");
+    try std.testing.expect(@typeInfo(@FieldType(B, "inner")).@"struct".layout == .@"extern");
+
+    const value: Outer = .{
+        .inner = .{ .half = 0.5, .mode = .lo },
+        .samples = .{ 7, 9 },
+        .weights = .{ 1.5, 2.5 },
+    };
+    const wire = pack(Outer, value);
+    try std.testing.expectEqual(@as(f16, 0.5), wire.inner.half);
+    try std.testing.expectEqual(@as(i8, -1), wire.inner.mode);
+
+    const back = unpack(Outer, wire);
+    try std.testing.expectEqual(value.inner.mode, back.inner.mode);
+    try std.testing.expectEqual(value.samples, back.samples);
+    try std.testing.expectEqual(value.weights, back.weights);
+
+    // A kernel that takes no parameters still has to pack something.
+    const Empty = struct {};
+    try std.testing.expectEqual(@as(usize, 0), @typeInfo(Boundary(Empty)).@"struct".fields.len);
+    _ = unpack(Empty, pack(Empty, .{}));
+}
+
+test "a custom gpu_layout must have a layout both compilations agree on" {
+    // `.auto` fixes neither field order nor padding, and it is the one type the
+    // derivation skips, so it is the one that has to be checked by hand.
+    try std.testing.expect(!hasFixedLayout(struct { lo: u32, hi: u32 }));
+    try std.testing.expect(!hasFixedLayout([2]struct { lo: u32 }));
+    try std.testing.expect(hasFixedLayout(extern struct { lo: u32, hi: u32 }));
+    try std.testing.expect(hasFixedLayout(packed struct { lo: u32, hi: u32 }));
+    try std.testing.expect(hasFixedLayout([2]extern struct { lo: u32 }));
+    try std.testing.expect(hasFixedLayout(u32));
+
+    // A packed wire type is accepted end to end.
+    const Bits = struct {
+        a: bool,
+        b: bool,
+
+        pub const gpu_layout = packed struct(u32) { a: u1, b: u1, _pad: u30 = 0 };
+        pub fn toGpu(v: @This()) gpu_layout {
+            return .{ .a = @intFromBool(v.a), .b = @intFromBool(v.b) };
+        }
+        pub fn fromGpu(w: gpu_layout) @This() {
+            return .{ .a = w.a == 1, .b = w.b == 1 };
+        }
+    };
+    try std.testing.expectEqual(@as(usize, 4), @sizeOf(Boundary(Bits)));
+    const back = unpack(Bits, pack(Bits, .{ .a = false, .b = true }));
+    try std.testing.expect(!back.a and back.b);
 }
 
 test "gpu_layout/toGpu/fromGpu round-trips a host-only type" {
