@@ -7,7 +7,7 @@ Gompute pins one Zig release at a time; Zig 0.16 moved `std.Build`,
 
 | Gompute | Zig    |
 | ------- | ------ |
-| 0.1.x   | 0.16.0 |
+| 1.0.x   | 0.16.0 |
 
 `minimum_zig_version` in `build.zig.zon` is the same value. Nothing older or
 newer is supported.

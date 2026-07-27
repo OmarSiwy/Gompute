@@ -200,7 +200,7 @@ zig build run
 With Nix:
 
 ```sh
-nix build        # generated API docs
+nix build        # documentation site
 nix flake check  # zig build test
 nix develop      # Zig + ROCm/CUDA library paths
 ```
