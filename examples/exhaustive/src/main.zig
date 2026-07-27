@@ -246,7 +246,10 @@ fn testAutoLarge() void {
     for (buf, 0..) |v, i| {
         const orig: f32 = @as(f32, @floatFromInt(i)) - 5000;
         const expected: f32 = if (orig > 0) orig else 0;
-        if (!approxEq(v, expected)) { ok = false; break; }
+        if (!approxEq(v, expected)) {
+            ok = false;
+            break;
+        }
     }
     check("large_10k", ok);
     print("ok\n", .{});
@@ -349,7 +352,10 @@ fn testRuntimeDynamic() void {
         const orig: f32 = @as(f32, @floatFromInt(i)) - 512;
         const y = orig * 2.0;
         const expected: f32 = if (y > 0) y else 0;
-        if (!approxEq(v, expected)) { ok = false; break; }
+        if (!approxEq(v, expected)) {
+            ok = false;
+            break;
+        }
     }
     check("runtime_result_correct", ok);
 
