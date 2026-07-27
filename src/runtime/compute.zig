@@ -71,7 +71,7 @@ pub const Compute = struct {
         };
     }
 
-    pub fn loadModule(self: *Compute, image: []const u8) Error!Module {
+    pub fn loadModule(self: *Compute, image: [:0]const u8) Error!Module {
         return switch (self.backend) {
             .cuda => .{ .cuda = try self.cuda_ctx.loadModuleFromMemory(image) },
             .hip => .{ .hip = try self.hip_ctx.loadModuleFromMemory(image) },

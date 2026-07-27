@@ -273,7 +273,7 @@ fn testRuntimeDynamic() void {
 
     // Load compiled kernel module
     const artifacts = @import("gompute_kernels");
-    const image: []const u8 = switch (gpu.backend) {
+    const image: [:0]const u8 = switch (gpu.backend) {
         .cuda => if (artifacts.has_cuda) artifacts.cuda else {
             print("  no CUDA artifacts\n", .{});
             return;

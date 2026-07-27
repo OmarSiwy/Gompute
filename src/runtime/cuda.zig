@@ -173,7 +173,7 @@ var module_slots: [max_modules]ModuleSlot = @splat(.{});
 /// ponytail: keyed on image identity (ptr + len), not contents. Artifacts come
 /// from `@embedFile` and live for the process; hash the bytes instead if anyone
 /// ever loads a module from a buffer they then free and reuse.
-fn loadModuleCached(ordinal: c_int, image: []const u8) Error!Module {
+fn loadModuleCached(ordinal: c_int, image: [:0]const u8) Error!Module {
     acquire();
     defer lock.unlock();
     var free_slot: ?*ModuleSlot = null;
@@ -185,18 +185,12 @@ fn loadModuleCached(ordinal: c_int, image: []const u8) Error!Module {
         }
     }
 
-    // cuModuleLoadData requires null-terminated PTX; @embedFile doesn't guarantee it.
-    // The driver consumes the image during the call, so the copy is scoped to it.
+    // cuModuleLoadData requires null-terminated PTX, and the sentinel is now in
+    // the parameter type -- so there is nothing to probe and nothing to copy.
+    // Probing it as `image.ptr[image.len]` read one byte past the slice on every
+    // call, which segfaults when the image ends exactly on a guard page.
     var m: CUmodule = null;
-    if (image.len > 0 and image.ptr[image.len] == 0) {
-        try check(g.cuModuleLoadData(&m, image.ptr), error.ModuleLoadFailed);
-    } else {
-        const buf = std.heap.page_allocator.alloc(u8, image.len + 1) catch return error.ModuleLoadFailed;
-        defer std.heap.page_allocator.free(buf);
-        @memcpy(buf[0..image.len], image);
-        buf[image.len] = 0;
-        try check(g.cuModuleLoadData(&m, buf.ptr), error.ModuleLoadFailed);
-    }
+    try check(g.cuModuleLoadData(&m, image.ptr), error.ModuleLoadFailed);
 
     const slot = free_slot orelse return .{ .module = m, .cached = false };
     slot.* = .{ .ordinal = ordinal, .image = image, .module = m };
@@ -283,7 +277,7 @@ pub const Context = struct {
     }
     /// (#3) Cached per (device, image): the artifact holds every kernel, so this
     /// JITs once per process instead of once per handle.
-    pub fn loadModuleFromMemory(self: *Context, image: []const u8) Error!Module {
+    pub fn loadModuleFromMemory(self: *Context, image: [:0]const u8) Error!Module {
         try self.makeCurrent();
         return loadModuleCached(self.ordinal, image);
     }
