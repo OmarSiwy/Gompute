@@ -184,8 +184,9 @@ becomes a compile error naming both causes and both fixes.
 # Library tests
 zig build test
 
-# API documentation -> zig-out/docs
+# Documentation site -> zig-out/docs (add -Dopen to view it in a browser)
 zig build docs
+zig build docs -Dopen
 
 # Basic example (CPU path)
 cd examples/basic

@@ -66,7 +66,8 @@ wires up the device compilation — see the
 
 ```sh
 zig build test    # library tests, including the codegen comparison
-zig build docs    # API reference -> zig-out/docs
+zig build docs    # documentation site -> zig-out/docs
+zig build docs -Dopen   # ...and open it in a browser
 
 cd examples/basic     && zig build run   # CPU path
 cd examples/exhaustive && zig build run  # GPU, needs libc + a driver

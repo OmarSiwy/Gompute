@@ -247,13 +247,84 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_check_tests.step);
     test_step.dependOn(&run_codegen_check.step);
 
-    const docs_obj = b.addObject(.{ .name = "gompute", .root_module = host_mod });
-    const docs_step = b.step("docs", "Emit API documentation to zig-out/docs");
+    buildDocs(b, host_mod, test_step);
+}
+
+/// Assemble the whole documentation site into `zig-out/docs`: the hand-written
+/// landing page, every `docs/*.md` rendered to HTML, and Zig's generated API
+/// reference under `api/`.
+///
+/// Rendering is done by `tools/md2html.zig` rather than a system Markdown tool
+/// so that the site builds with nothing but Zig -- the docs can be previewed on
+/// any machine that can build the library, and CI has no second rendering path
+/// to drift from.
+fn buildDocs(b: *std.Build, host_mod: *std.Build.Module, test_step: *std.Build.Step) void {
+    const docs_step = b.step("docs", "Build the documentation site into zig-out/docs");
+
+    const api = b.addObject(.{ .name = "gompute", .root_module = host_mod });
     docs_step.dependOn(&b.addInstallDirectory(.{
-        .source_dir = docs_obj.getEmittedDocs(),
+        .source_dir = api.getEmittedDocs(),
         .install_dir = .prefix,
-        .install_subdir = "docs",
+        .install_subdir = "docs/api",
     }).step);
+
+    for ([_][]const u8{ "index.html", "style.css" }) |asset| {
+        docs_step.dependOn(&b.addInstallFileWithDir(
+            b.path(b.fmt("docs/{s}", .{asset})),
+            .prefix,
+            b.fmt("docs/{s}", .{asset}),
+        ).step);
+    }
+
+    const md2html = b.addExecutable(.{
+        .name = "gompute-md2html",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/md2html.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+
+    // Every docs/*.md becomes a page. Adding one needs no build.zig change.
+    const io = b.graph.io;
+    var dir = b.build_root.handle.openDir(io, "docs", .{ .iterate = true }) catch
+        @panic("gompute: docs/ is missing; the documentation site cannot be built");
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (it.next(io) catch @panic("gompute: cannot read docs/")) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".md")) continue;
+        const stem = entry.name[0 .. entry.name.len - ".md".len];
+
+        const run = b.addRunArtifact(md2html);
+        run.addFileArg(b.path(b.fmt("docs/{s}", .{entry.name})));
+        run.addFileArg(b.path("docs/page.template.html"));
+        const out = run.addOutputFileArg(b.fmt("{s}.html", .{stem}));
+        docs_step.dependOn(&b.addInstallFileWithDir(
+            out,
+            .prefix,
+            b.fmt("docs/{s}.html", .{stem}),
+        ).step);
+    }
+
+    // The renderer's own tests belong to `test`, not just `docs`, so
+    // `nix flake check` covers them too.
+    const md_tests = b.addRunArtifact(b.addTest(.{ .root_module = md2html.root_module }));
+    docs_step.dependOn(&md_tests.step);
+    test_step.dependOn(&md_tests.step);
+
+    // `zig build docs -Dopen` previews it. Opt-in, so CI can build the site
+    // without a browser trying to launch on a headless runner.
+    if (b.option(bool, "open", "Open the built documentation in a browser") orelse false) {
+        const opener = switch (b.graph.host.result.os.tag) {
+            .macos => "open",
+            else => "xdg-open",
+        };
+        const open = b.addSystemCommand(&.{opener});
+        open.addFileArg(b.path("zig-out/docs/index.html"));
+        open.step.dependOn(docs_step);
+        docs_step.dependOn(&open.step);
+    }
 }
 
 /// `gompute` plus whatever `options.imports` builds for this backend.
