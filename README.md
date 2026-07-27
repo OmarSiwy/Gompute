@@ -7,12 +7,51 @@ I am aware, as the zig library evolves that this library will need to be updated
 greatly. Hence, I'll attempt to maintain the interface, only ADDING features, rather
 than removing any features.
 
-Dependencies:
+## Versions
 
-- LLVM
-- libC
+Gompute pins one Zig release at a time; Zig 0.16 moved `std.Build`,
+`std.DynLib` and the NVPTX backend under it.
 
-No WASM support.
+| Gompute | Zig    |
+| ------- | ------ |
+| 0.1.x   | 0.16.0 |
+
+`minimum_zig_version` in `build.zig.zon` is the same value. Nothing older or
+newer is supported.
+
+## Dependencies
+
+- **LLVM** — supplied by Zig itself; the PTX/HSACO steps call `zig cc` and
+  `zig ld.lld`. Nothing to install.
+- **libc, linked into your executable** — `exe.root_module.linkSystemLibrary("c", .{})`
+  is **required for the CUDA and HIP backends**. Without libc, Zig 0.16's
+  `std.DynLib` resolves to `ElfDynLib` instead of `DlDynLib`; it opens
+  `libcuda.so` but cannot resolve symbols out of it, and you get
+  `cuda: symbol not found: cuInit` at run time, which looks exactly like a
+  driver mismatch and is not one. CPU-only builds do not need it.
+- **A CUDA or HIP driver at run time**, if you use those backends. Both are
+  `dlopen`'d; neither is needed to build.
+
+## Platform support
+
+| Platform            | CPU backend | CUDA / HIP backends                |
+| ------------------- | ----------- | ---------------------------------- |
+| Linux               | Yes         | Yes                                |
+| macOS               | Yes         | Compiles, but no such driver exists |
+| `wasm32-wasi`       | Yes         | **Does not compile**                |
+| Windows             | Yes         | **Does not compile**                |
+
+Zig 0.16's `std.DynLib` only has an implementation for Linux and the
+Darwin/BSD family; every other target hits `@compileError("unsupported
+platform")`. Gompute `dlopen`s the CUDA and HIP drivers, so on Windows and
+wasm anything that instantiates `Kernel(spec, .cuda)`, `Kernel(spec, .hip)`,
+`RawKernel` or `AutoKernel` fails to compile (≈29 errors, all from
+`std/dynamic_library.zig`). The `nvcuda.dll` entry in `src/runtime/cuda.zig`
+is aspirational; **Windows is not supported.**
+
+A program that only ever names `.cpu` compiles and runs on all four —
+`emitKernels` already skips the GPU sub-compilations on wasm. `AutoKernel`
+does *not* count as CPU-only: it instantiates all three backends.
 
 ## Quick start
 
@@ -91,27 +130,113 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    // Required for the CUDA/HIP backends. Without libc, std.DynLib is
+    // ElfDynLib, which opens libcuda.so but cannot resolve symbols from it:
+    // you get "cuda: symbol not found: cuInit" at run time. Harmless if you
+    // only ever use .cpu.
+    exe.root_module.linkSystemLibrary("c", .{});
+
     gompute_build.emitKernels(b, dep, exe, .{
         .kernels_root = b.path("src/kernels.zig"),
-        // .gpu defaults to .auto: the build detects the GPU on this machine
-        // and disables a backend when its GPU is absent. Pin explicitly with:
-        // .cuda = .{ .gpu = .{ .name = "sm_80" } },
-        // .hip = .{ .gpu = .{ .name = "gfx1030" } },
+        .target = target,
+        .optimize = optimize,
+        // .gpu defaults to .auto: the build probes the GPU in THIS machine and
+        // disables a backend when its GPU is absent. Pin it for CI, Docker,
+        // Nix and releases -- see "Pin .auto off the build machine" below.
+        // .cuda = .{ .gpu = .{ .name = "sm_89" } },
+        // .hip = .{ .gpu = .{ .name = "gfx1100" } },
     });
 
     b.installArtifact(exe);
 }
 ```
 
-Backends can be omitted from the artifact graph:
+### CPU-only builds
+
+Turn both GPU backends off to drop the PTX/HSACO sub-compilations from the
+graph entirely. This is the supported way to force CPU-only, and it also
+silences the `.auto` detection warning:
 
 ```zig
-.cuda = .{ .enabled = false },
-.hip = .{ .enabled = false },
+gompute_build.emitKernels(b, dep, exe, .{
+    .kernels_root = b.path("src/kernels.zig"),
+    .cuda = .{ .enabled = false },
+    .hip = .{ .enabled = false },
+});
 ```
 
-Call `emitKernels` once per Gompute dependency instance. It attaches a private
-`gompute_kernels` module to the host module and embeds all emitted blobs.
+`Kernel(spec, .cpu)` and `AutoKernel` keep working; `Kernel(spec, .cuda)`
+returns `error.BackendUnavailable`.
+
+### Pin `.auto` off the build machine
+
+`.auto` runs `nvidia-smi` / `amdgpu-arch` **on the machine running
+`zig build`**, not on the machine that will run the binary. When the probe
+finds nothing, the backend is compiled out and the build still succeeds — the
+binary can then never use a GPU, and you find out in production.
+
+Gompute now warns when this happens. Treat the warning as an error in any
+build whose output leaves the machine:
+
+- **CI, Docker, Nix** — build hosts almost never have a GPU. Always pin
+  `.cuda = .{ .gpu = .{ .name = "sm_89" } }` (or the `gfx*` you target).
+- **Releases** — pin, or you ship whatever card the release runner happened
+  to have.
+- **Genuinely CPU-only** — set `.enabled = false` rather than relying on
+  detection failing.
+
+`.auto` is also why the Nix dev shell is not hermetic: `nvidia-smi` comes from
+the ambient `PATH`, so the same source tree can produce different artifacts on
+two machines. The flake's `packages.default` and `checks.default` never call
+`emitKernels`; anything of yours that does must pin the GPU.
+
+### One executable per dependency, or `addKernels`
+
+`emitKernels` attaches `gompute_kernels` to `dep.module("gompute")`, which is
+**shared**. Two executables calling `emitKernels` against the same `dep` do not
+get one artifact set each — the last call overwrites the first, the build is
+green, and the first executable ships the second one's PTX and fails at run
+time with `error.KernelNotFound`.
+
+For two or more executables, use `addKernels`, which returns a private
+`gompute` module carrying only that root's artifacts:
+
+```zig
+const k = gompute_build.addKernels(b, dep, .{
+    .root_source_file = b.path("src/kernels_a.zig"),
+    .target = target,
+    .optimize = optimize,
+});
+
+const kernels_mod = b.createModule(.{
+    .root_source_file = b.path("src/kernels_a.zig"),
+    .target = target,
+    .optimize = optimize,
+    // note: k.gompute, not dep.module("gompute")
+    .imports = &.{.{ .name = "gompute", .module = k.gompute }},
+});
+
+const exe = b.addExecutable(.{
+    .name = "a",
+    .root_module = b.createModule(.{
+        .root_source_file = b.path("src/main_a.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "gompute", .module = k.gompute },
+            .{ .name = "kernels", .module = kernels_mod },
+        },
+    }),
+});
+exe.root_module.linkSystemLibrary("c", .{});
+b.installArtifact(exe);
+```
+
+Repeat verbatim for the second executable with its own kernel root; the two
+instances do not collide. `k.kernels` is the generated artifact module
+(`has_cuda`, `has_hip`, the blobs) if you want to read it directly.
+
+`emitKernels` is unchanged and stays supported for the single-executable case.
 
 ### Kernel roots that import their own modules
 
@@ -201,16 +326,19 @@ the requirement.
 allocating and copying on every launch:
 
 ```zig
+var data = [_]f32{ -1, 2, -3, 4 };
+const bytes = data.len * @sizeOf(f32);
+
 var kernel = try g.Kernel(kernels.scale_relu, .cuda).init(0);
 defer kernel.deinit();
 
 var buffer = try kernel.alloc(data.len);
 defer buffer.free();
 
-try buffer.upload(data.ptr, data.len * @sizeOf(f32));
+try buffer.upload(&data, bytes);
 try kernel.launch(&buffer, data.len, .{ .scale = 2 });
 try kernel.context.synchronize();
-try buffer.download(data.ptr, data.len * @sizeOf(f32));
+try buffer.download(&data, bytes);
 ```
 
 `launch` creates only three stack-resident argument values: device pointer,
@@ -333,15 +461,23 @@ AMDGPU metadata while the public API continues to use `scale_relu`.
 
 | Backend | Generated `map` path |              Host runtime | Validation in this package                     |
 | ------- | -------------------: | ------------------------: | ---------------------------------------------- |
-| CPU     |                  Yes |                Native Zig | Executed and codegen-compared                  |
+| CPU     |                  Yes |                Native Zig | Executed by `zig build test` and the examples  |
 | CUDA    |             Yes, PTX | Runtime-loaded driver API | Cross-compiled; PTX entries inspected          |
 | HIP     |           Yes, HSACO |    Runtime-loaded HIP API | Cross-compiled; ELF symbols/metadata inspected |
+
+`tests/codegen.zig` is only *compiled* (`addObject`, `-fno-emit-bin`) by
+`zig build test`. It proves the specializations type-check and instantiate; it
+is not linked, not run, and no emitted code is diffed against a reference.
+There is no codegen comparison in this package.
 
 ## Commands
 
 ```sh
 # Library tests
 zig build test
+
+# API documentation -> zig-out/docs
+zig build docs
 
 # Basic example (CPU path)
 cd examples/basic
@@ -350,4 +486,12 @@ zig build run
 # Exhaustive example (GPU — requires libc + CUDA/HIP driver)
 cd examples/exhaustive
 zig build run
+```
+
+With Nix:
+
+```sh
+nix build        # generated API docs
+nix flake check  # zig build test
+nix develop      # Zig + ROCm/CUDA library paths
 ```
