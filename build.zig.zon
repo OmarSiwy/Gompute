@@ -4,16 +4,18 @@
     .fingerprint = 0x4f38064d65c9560,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{},
+    // `examples` is deliberately absent: consumers never build it, and each
+    // example is a self-contained sub-project (own build.zig.zon, own
+    // `.zig-cache`/`zig-out`) that would be vendored verbatim into every
+    // dependent's package hash. `tests` stays because `build.zig` names
+    // `tests/codegen.zig` at configure time.
     .paths = .{
         "build.zig",
         "build.zig.zon",
         "src",
         "tools",
-        "examples",
         "tests",
         "README.md",
-        "ARCHITECTURE.md",
-        "VALIDATION.md",
         "LICENSE",
         ".gitignore",
     },

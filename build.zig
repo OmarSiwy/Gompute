@@ -1,7 +1,9 @@
 const std = @import("std");
 
 pub const Gpu = union(enum) {
-    /// Detect the GPU on the build machine; the backend is disabled if none is found.
+    /// Detect the GPU on the BUILD machine; the backend is compiled out (with a
+    /// warning) if none is found. Not the deploy machine -- pin `.name` in CI,
+    /// Docker, Nix and releases.
     auto,
     /// Explicit target CPU accepted by Zig, e.g. `sm_89` (CUDA) or `gfx1100` (HIP).
     name: []const u8,
@@ -53,6 +55,36 @@ fn detectHipGpu(b: *std.Build) ?[]const u8 {
         }
     }
     return null;
+}
+
+/// Resolve one backend's device CPU, shouting when `.auto` comes up empty.
+///
+/// `.auto` probes the BUILD machine. A failed probe used to produce a green
+/// build whose GPU backend was quietly compiled out -- invisible until the
+/// deploy machine hit `error.BackendUnavailable`. Detection failing is normal
+/// in CI/Docker/Nix, so it must be loud rather than fatal.
+fn resolveGpu(
+    b: *std.Build,
+    comptime backend: []const u8,
+    comptime example: []const u8,
+    gpu: Gpu,
+    detect: fn (*std.Build) ?[]const u8,
+) ?[]const u8 {
+    switch (gpu) {
+        .name => |n| return n,
+        .auto => {
+            if (detect(b)) |n| return n;
+            std.log.warn(
+                "gompute: .auto found no " ++ backend ++ " GPU on this BUILD machine, so the " ++
+                    backend ++ " backend is compiled out: Kernel(spec, ." ++ backend ++
+                    ") returns error.BackendUnavailable at run time, on every deploy machine. " ++
+                    "Pin it with ." ++ backend ++ " = .{{ .gpu = .{{ .name = \"" ++ example ++
+                    "\" }} }}, or silence this with ." ++ backend ++ " = .{{ .enabled = false }}.",
+                .{},
+            );
+            return null;
+        },
+    }
 }
 
 /// Debug device code drags std.builtin panic globals into the module and
@@ -143,6 +175,14 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_unit_tests.step);
     test_step.dependOn(&run_tool_tests.step);
     test_step.dependOn(&codegen_probe.step);
+
+    const docs_obj = b.addObject(.{ .name = "gompute", .root_module = host_mod });
+    const docs_step = b.step("docs", "Emit API documentation to zig-out/docs");
+    docs_step.dependOn(&b.addInstallDirectory(.{
+        .source_dir = docs_obj.getEmittedDocs(),
+        .install_dir = .prefix,
+        .install_subdir = "docs",
+    }).step);
 }
 
 /// `gompute` plus whatever `options.imports` builds for this backend.
@@ -165,25 +205,16 @@ fn deviceImports(
     return all;
 }
 
-/// Add CUDA PTX and HIP HSACO sub-compilations for a designated kernel root,
-/// then attach them to `host` as the private `gompute_kernels` module.
-///
-/// Consumer build.zig:
-///
-///     const gompute_build = @import("gompute");
-///     const dep = b.dependency("gompute", .{});
-///     exe.root_module.addImport("gompute", dep.module("gompute"));
-///     gompute_build.emitKernels(b, dep, exe, .{
-///         .kernels_root = b.path("src/kernels.zig"),
-///     });
-///
-/// If the kernel root imports modules of its own, also set `.imports`.
-pub fn emitKernels(
+/// Builds the CUDA PTX and HIP HSACO sub-compilations for one kernel root and
+/// wraps them in a generated `gompute_kernels` module. Shared by `emitKernels`
+/// and `addKernels`; the two differ only in who gets the resulting module.
+fn buildArtifacts(
     b: *std.Build,
     dep: *std.Build.Dependency,
-    host: *std.Build.Step.Compile,
     options: EmitOptions,
-) void {
+    host_target: std.Build.ResolvedTarget,
+    host_optimize: std.builtin.OptimizeMode,
+) *std.Build.Module {
     const tool = b.addExecutable(.{
         .name = "gompute-kernel-ir-tool",
         .root_module = b.createModule(.{
@@ -197,27 +228,28 @@ pub fn emitKernels(
     var hip_hsaco: ?std.Build.LazyPath = null;
     var hip_names: ?std.Build.LazyPath = null;
 
-    const host_target = options.target orelse
-        host.root_module.resolved_target orelse b.graph.host;
-    const optimize = deviceOptimize(options.optimize orelse
-        host.root_module.optimize orelse .ReleaseFast);
+    const optimize = deviceOptimize(host_optimize);
     // CUDA/HIP drivers do not exist on the web; skip the native backends there.
     const is_wasm = host_target.result.cpu.arch.isWasm();
 
-    const cuda_cpu: ?[]const u8 = if (is_wasm or !options.cuda.enabled) null else switch (options.cuda.gpu) {
-        .name => |n| n,
-        .auto => detectCudaGpu(b),
-    };
-    const hip_cpu: ?[]const u8 = if (is_wasm or !options.hip.enabled) null else switch (options.hip.gpu) {
-        .name => |n| n,
-        .auto => detectHipGpu(b),
-    };
+    const cuda_cpu: ?[]const u8 = if (is_wasm or !options.cuda.enabled)
+        null
+    else
+        resolveGpu(b, "cuda", "sm_89", options.cuda.gpu, detectCudaGpu);
+    const hip_cpu: ?[]const u8 = if (is_wasm or !options.hip.enabled)
+        null
+    else
+        resolveGpu(b, "hip", "gfx1100", options.hip.gpu, detectHipGpu);
 
     if (cuda_cpu) |cpu| {
         const query = std.Target.Query.parse(.{
             .arch_os_abi = "nvptx64-cuda",
             .cpu_features = cpu,
-        }) catch @panic("invalid CUDA target CPU");
+        }) catch |err| std.debug.panic(
+            "gompute: invalid CUDA target CPU \"{s}\" ({t}). Expected an NVPTX CPU name such " ++
+                "as sm_70, sm_80, sm_89 or sm_90; run `zig targets` for the full list.",
+            .{ cpu, err },
+        );
         const target = b.resolveTargetQuery(query);
         const mode = if (options.cuda.optimize) |m| deviceOptimize(m) else optimize;
         const gpu_mod = b.createModule(.{
@@ -253,7 +285,11 @@ pub fn emitKernels(
         const query = std.Target.Query.parse(.{
             .arch_os_abi = "amdgcn-amdhsa",
             .cpu_features = cpu,
-        }) catch @panic("invalid HIP target CPU");
+        }) catch |err| std.debug.panic(
+            "gompute: invalid HIP target CPU \"{s}\" ({t}). Expected an AMDGCN CPU name such " ++
+                "as gfx900, gfx1030 or gfx1100; run `zig targets` for the full list.",
+            .{ cpu, err },
+        );
         const target = b.resolveTargetQuery(query);
         const mode = if (options.hip.optimize) |m| deviceOptimize(m) else optimize;
         const gpu_mod = b.createModule(.{
@@ -294,6 +330,99 @@ pub fn emitKernels(
     if (cuda_ptx) |path| artifacts_mod.addAnonymousImport("cuda_blob", .{ .root_source_file = path });
     if (hip_hsaco) |path| artifacts_mod.addAnonymousImport("hip_blob", .{ .root_source_file = path });
     if (hip_names) |path| artifacts_mod.addAnonymousImport("hip_names", .{ .root_source_file = path });
+    return artifacts_mod;
+}
+
+/// Add CUDA PTX and HIP HSACO sub-compilations for a designated kernel root,
+/// then attach them as `gompute_kernels` to the dependency's shared `gompute`
+/// module -- the same module the consumer imported into `host`.
+///
+/// Supports ONE artifact-consuming executable per `gompute` dependency
+/// instance. `dep.module("gompute")` is shared, so a second `emitKernels` call
+/// against the same `dep` overwrites the first one's artifacts and the earlier
+/// executable ships the later one's PTX (green build, `error.KernelNotFound` at
+/// run time). For two or more executables, use `addKernels` instead.
+///
+/// Consumer build.zig:
+///
+///     const gompute_build = @import("gompute");
+///     const dep = b.dependency("gompute", .{});
+///     exe.root_module.addImport("gompute", dep.module("gompute"));
+///     gompute_build.emitKernels(b, dep, exe, .{
+///         .kernels_root = b.path("src/kernels.zig"),
+///     });
+///
+/// If the kernel root imports modules of its own, also set `.imports`.
+pub fn emitKernels(
+    b: *std.Build,
+    dep: *std.Build.Dependency,
+    host: *std.Build.Step.Compile,
+    options: EmitOptions,
+) void {
+    const artifacts_mod = buildArtifacts(
+        b,
+        dep,
+        options,
+        options.target orelse host.root_module.resolved_target orelse b.graph.host,
+        options.optimize orelse host.root_module.optimize orelse .ReleaseFast,
+    );
+    // Resolution happens inside the shared `gompute` module; the host import is
+    // only so a consumer's own code may `@import("gompute_kernels")` directly.
     dep.module("gompute").addImport("gompute_kernels", artifacts_mod);
     host.root_module.addImport("gompute_kernels", artifacts_mod);
+}
+
+pub const KernelsOptions = struct {
+    root_source_file: std.Build.LazyPath,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    /// Extra imports for the kernel root, on top of `gompute`. Leave null when
+    /// the kernel root imports nothing of its own.
+    imports: ?DeviceImportsFn = null,
+    /// Passed through to `imports` untouched.
+    imports_ctx: ?*anyopaque = null,
+    cuda: CudaOptions = .{},
+    hip: HipOptions = .{},
+};
+
+/// What `addKernels` hands back.
+pub const Kernels = struct {
+    /// The generated artifact module: `has_cuda`, `has_hip`, and the blobs.
+    kernels: *std.Build.Module,
+    /// A private `gompute` instance wired to `kernels`. Import THIS wherever
+    /// the consumer would have used `dep.module("gompute")` -- both in the
+    /// executable's root module and in its host-side kernels module.
+    gompute: *std.Build.Module,
+};
+
+/// Like `emitKernels`, but returns a fresh `gompute` module carrying only this
+/// root's artifacts instead of mutating the dependency's shared one.
+///
+/// Call once per executable; instances do not collide, so two executables in
+/// one build can each have their own kernels.
+///
+///     const k = gompute_build.addKernels(b, dep, .{
+///         .root_source_file = b.path("src/kernels.zig"),
+///         .target = target,
+///         .optimize = optimize,
+///     });
+///     exe.root_module.addImport("gompute", k.gompute);
+pub fn addKernels(b: *std.Build, dep: *std.Build.Dependency, o: KernelsOptions) Kernels {
+    const artifacts_mod = buildArtifacts(b, dep, .{
+        .kernels_root = o.root_source_file,
+        .imports = o.imports,
+        .imports_ctx = o.imports_ctx,
+        .cuda = o.cuda,
+        .hip = o.hip,
+        .target = o.target,
+        .optimize = o.optimize,
+    }, o.target, o.optimize);
+
+    const gompute_mod = b.createModule(.{
+        .root_source_file = dep.path("src/root.zig"),
+        .target = o.target,
+        .optimize = o.optimize,
+    });
+    gompute_mod.addImport("gompute_kernels", artifacts_mod);
+    return .{ .kernels = artifacts_mod, .gompute = gompute_mod };
 }
