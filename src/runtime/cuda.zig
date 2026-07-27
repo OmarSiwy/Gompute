@@ -68,6 +68,13 @@ const lib_names = switch (builtin.os.tag) {
     },
 };
 
+/// The candidate list as one literal, so the debug line costs no formatting.
+const tried_paths = blk: {
+    var s: []const u8 = "";
+    for (lib_names, 0..) |n, i| s = s ++ (if (i == 0) "" else ", ") ++ n;
+    break :blk s;
+};
+
 fn openFirst(names: []const []const u8) ?std.DynLib {
     for (names) |n| {
         if (std.DynLib.open(n)) |l| return l else |_| {}
@@ -78,10 +85,11 @@ fn openFirst(names: []const []const u8) ?std.DynLib {
 /// Caller holds `lock`.
 fn loadApiLocked() Error!void {
     if (loaded) return;
+    // "No NVIDIA driver here" is an ordinary outcome -- AutoKernel probes CUDA
+    // on every machine -- so this is debug, not a print to stderr on the normal
+    // path of a non-NVIDIA box. The caller gets error.InitFailed either way.
     var lib = openFirst(lib_names) orelse {
-        std.debug.print("cuda: failed to open any of: ", .{});
-        for (lib_names) |n| std.debug.print("{s} ", .{n});
-        std.debug.print("\n", .{});
+        std.log.debug("gompute: no CUDA driver; tried " ++ tried_paths, .{});
         return error.InitFailed;
     };
     errdefer lib.close();
@@ -95,7 +103,18 @@ fn loadApiLocked() Error!void {
         } else if (optional) {
             @field(g, field.name) = null;
         } else {
-            std.debug.print("cuda: symbol not found: {s}\n", .{field.name});
+            // Opening the driver and then failing to resolve a symbol out of it
+            // is almost never a driver problem: without libc, Zig 0.16's
+            // std.DynLib is ElfDynLib, which opens libcuda.so but cannot
+            // resolve from it. Stays loud -- the bare old message
+            // ("symbol not found: cuInit") sent people hunting a version
+            // mismatch that does not exist.
+            std.log.err(
+                "gompute: opened the CUDA driver but symbol '{s}' is missing.\n" ++
+                    "  This almost always means the executable was not linked against libc.\n" ++
+                    "  Add to your build.zig:  exe.root_module.linkSystemLibrary(\"c\", .{{}});",
+                .{field.name},
+            );
             return error.InitFailed;
         }
     }
@@ -317,6 +336,10 @@ pub const Buffer = struct {
         try check(g.cuMemcpyHtoD_v2(self.handle + offset, host, n), error.CopyFailed);
     }
     pub fn free(self: *Buffer) void {
+        // `g` is undefined until loadApi succeeds, and every handle type here is
+        // pub with all-default fields -- so a hand-constructed `Buffer{}` freed
+        // on a machine with no driver would call through garbage.
+        if (!loaded) return;
         ensureCurrent();
         _ = g.cuMemFree_v2(self.handle);
         self.* = .{};
@@ -382,6 +405,7 @@ pub const Stream = struct {
         try check(g.cuStreamSynchronize(self.stream), error.SyncFailed);
     }
     pub fn deinit(self: *Stream) void {
+        if (!loaded) return;
         ensureCurrent();
         _ = g.cuStreamDestroy_v2(self.stream);
         self.* = .{};
