@@ -19,12 +19,29 @@ fn Entry(comptime Spec: type) type {
     };
 }
 
+/// Accepts a tuple of map specs, or a module/struct type — in which case every
+/// pub decl that looks like a map spec is exported, in declaration order.
 pub fn exportAll(comptime specs: anytype) void {
     if (builtin.cpu.arch != .nvptx64 and builtin.cpu.arch != .amdgcn)
         @compileError("exportAll must be compiled for nvptx64 or amdgcn");
 
-    inline for (specs) |Spec| {
-        const E = Entry(Spec);
-        @export(&E.run, .{ .name = Spec.entry_name });
+    if (@TypeOf(specs) == type) {
+        inline for (@typeInfo(specs).@"struct".decls) |decl| {
+            const Spec = @field(specs, decl.name);
+            if (comptime isSpec(Spec)) exportOne(Spec);
+        }
+    } else {
+        inline for (specs) |Spec| exportOne(Spec);
     }
+}
+
+fn isSpec(comptime Spec: anytype) bool {
+    if (@TypeOf(Spec) != type) return false;
+    if (@typeInfo(Spec) != .@"struct") return false;
+    return @hasDecl(Spec, "entry_name") and @hasDecl(Spec, "eval");
+}
+
+fn exportOne(comptime Spec: type) void {
+    const E = Entry(Spec);
+    @export(&E.run, .{ .name = Spec.entry_name });
 }

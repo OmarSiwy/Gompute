@@ -36,5 +36,6 @@ fn rawAdd(data: g.GlobalPtr(f32), len: u64) callconv(g.kernel_callconv) void {
 
 comptime {
     if (g.is_device) g.exportRaw("raw_add", &rawAdd);
-    g.exportKernels(.{ scale_relu, scale_square });
+    // Every pub map spec in this file; no second list to keep in sync.
+    g.exportKernels(@This());
 }
