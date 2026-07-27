@@ -238,10 +238,11 @@ pub fn shutdown() void {
 
 /// Check CUresult, stash raw code for #7 error detail.
 inline fn check(rc: CUresult, err: Error) Error!void {
-    if (rc != 0) {
-        iface.last_driver_error = .{ .code = rc, .backend = .cuda };
-        return err;
-    }
+    // Records on failure AND clears on success -- assigning only on failure left
+    // lastDriverError() reporting a stale code indefinitely, so a caller could
+    // not tell a fresh failure from one several calls ago.
+    iface.recordDriverResult(.cuda, rc);
+    if (rc != 0) return err;
 }
 
 // ---- Public API ----
