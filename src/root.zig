@@ -15,6 +15,9 @@ pub const Backend = host.Backend;
 pub const Kernel = host.Kernel;
 pub const AutoKernel = host.AutoKernel;
 pub const RawKernel = @import("host/raw.zig").RawKernel;
+/// Load a kernel whose name is only known at run time. See `host/raw.zig`.
+pub const rawKernelByName = @import("host/raw.zig").rawKernelByName;
+pub const RawByName = @import("host/raw.zig").RawByName;
 pub const MapOptions = spec.MapOptions;
 pub const is_device = false;
 pub const kernel_callconv: std.builtin.CallingConvention = .auto;

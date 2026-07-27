@@ -97,10 +97,10 @@ inline fn check(rc: hipError_t, err: Error) Error!void {
 // Mirrors cuda.zig: device pointers are context-scoped, so every handle on a
 // device shares one retained primary context and one JIT'd copy of the image.
 //
-// ponytail: fixed tables sized for one node -- 16 devices, 16 distinct images.
-// Overflow degrades to uncached, not to wrong.
+// ponytail: fixed tables sized for one node -- 16 devices, 64 distinct images
+// (one per kernel root, per device). Overflow degrades to uncached, not to wrong.
 const max_devices = 16;
-const max_modules = 16;
+const max_modules = 64;
 
 const CtxSlot = struct {
     device: hipDevice_t = 0,
