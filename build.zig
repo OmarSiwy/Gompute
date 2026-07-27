@@ -69,8 +69,31 @@ fn deviceOptimize(mode: std.builtin.OptimizeMode) std.builtin.OptimizeMode {
     return if (mode == .Debug) .ReleaseFast else mode;
 }
 
+/// Builds the extra imports for the kernel root, for one backend.
+///
+/// Called once per enabled backend, with that backend's resolved device target
+/// (`nvptx64-cuda`/`sm_*` or `amdgcn-amdhsa`/`gfx*`) and its post-`deviceOptimize`
+/// mode. Create every module inside this function using the `target` and
+/// `optimize` handed to you, including nested imports.
+///
+/// It is a callback rather than a plain module list because a `std.Build.Module`
+/// carries its own target and optimize mode: one prebuilt module cannot serve
+/// both the nvptx64 and amdgcn compilations, and a host-built module dragged
+/// into device code keeps the host's optimize mode.
+pub const DeviceImportsFn = *const fn (
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    ctx: ?*anyopaque,
+) []const std.Build.Module.Import;
+
 pub const EmitOptions = struct {
     kernels_root: std.Build.LazyPath,
+    /// Extra imports for the kernel root, on top of `gompute`. Leave null when
+    /// the kernel root imports nothing of its own.
+    imports: ?DeviceImportsFn = null,
+    /// Passed through to `imports` untouched.
+    imports_ctx: ?*anyopaque = null,
     cuda: CudaOptions = .{},
     hip: HipOptions = .{},
     /// Host target (from standardTargetOptions). Defaults to the host
@@ -122,6 +145,26 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&codegen_probe.step);
 }
 
+/// `gompute` plus whatever `options.imports` builds for this backend.
+fn deviceImports(
+    b: *std.Build,
+    dep: *std.Build.Dependency,
+    options: EmitOptions,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) []const std.Build.Module.Import {
+    // `&.{base}` would return a pointer to a stack temporary; always allocate.
+    const extra: []const std.Build.Module.Import = if (options.imports) |build_extra|
+        build_extra(b, target, optimize, options.imports_ctx)
+    else
+        &.{};
+
+    const all = b.allocator.alloc(std.Build.Module.Import, extra.len + 1) catch @panic("OOM");
+    all[0] = .{ .name = "gompute", .module = dep.module("gompute_device") };
+    @memcpy(all[1..], extra);
+    return all;
+}
+
 /// Add CUDA PTX and HIP HSACO sub-compilations for a designated kernel root,
 /// then attach them to `host` as the private `gompute_kernels` module.
 ///
@@ -133,6 +176,8 @@ pub fn build(b: *std.Build) void {
 ///     gompute_build.emitKernels(b, dep, exe, .{
 ///         .kernels_root = b.path("src/kernels.zig"),
 ///     });
+///
+/// If the kernel root imports modules of its own, also set `.imports`.
 pub fn emitKernels(
     b: *std.Build,
     dep: *std.Build.Dependency,
@@ -174,14 +219,15 @@ pub fn emitKernels(
             .cpu_features = cpu,
         }) catch @panic("invalid CUDA target CPU");
         const target = b.resolveTargetQuery(query);
+        const mode = if (options.cuda.optimize) |m| deviceOptimize(m) else optimize;
         const gpu_mod = b.createModule(.{
             .root_source_file = options.kernels_root,
             .target = target,
-            .optimize = if (options.cuda.optimize) |m| deviceOptimize(m) else optimize,
+            .optimize = mode,
             // Debug info in device IR makes the PTX claim DWARF it doesn't
             // have; the CUDA driver then rejects the module (error 218).
             .strip = true,
-            .imports = &.{.{ .name = "gompute", .module = dep.module("gompute_device") }},
+            .imports = deviceImports(b, dep, options, target, mode),
         });
         const object = b.addObject(.{ .name = "gompute_cuda_ir", .root_module = gpu_mod });
         const rewrite = b.addRunArtifact(tool);
@@ -209,12 +255,13 @@ pub fn emitKernels(
             .cpu_features = cpu,
         }) catch @panic("invalid HIP target CPU");
         const target = b.resolveTargetQuery(query);
+        const mode = if (options.hip.optimize) |m| deviceOptimize(m) else optimize;
         const gpu_mod = b.createModule(.{
             .root_source_file = options.kernels_root,
             .target = target,
-            .optimize = if (options.hip.optimize) |m| deviceOptimize(m) else optimize,
+            .optimize = mode,
             .strip = true,
-            .imports = &.{.{ .name = "gompute", .module = dep.module("gompute_device") }},
+            .imports = deviceImports(b, dep, options, target, mode),
         });
         const object = b.addObject(.{ .name = "gompute_hip_obj", .root_module = gpu_mod });
 

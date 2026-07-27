@@ -113,6 +113,50 @@ Backends can be omitted from the artifact graph:
 Call `emitKernels` once per Gompute dependency instance. It attaches a private
 `gompute_kernels` module to the host module and embeds all emitted blobs.
 
+### Kernel roots that import their own modules
+
+If `kernels.zig` imports anything besides `gompute`, supply an `.imports`
+callback. Gompute calls it once per enabled backend with that backend's
+resolved device target and optimize mode; build every module — including
+nested ones — from the values it hands you:
+
+```zig
+fn deviceImports(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    _: ?*anyopaque,
+) []const std.Build.Module.Import {
+    const contract = b.createModule(.{
+        .root_source_file = b.path("src/contract.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const models = b.createModule(.{
+        .root_source_file = b.path("src/models.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "contract", .module = contract }},
+    });
+    const out = b.allocator.alloc(std.Build.Module.Import, 2) catch @panic("OOM");
+    out[0] = .{ .name = "models", .module = models };
+    out[1] = .{ .name = "contract", .module = contract };
+    return out;
+}
+
+gompute_build.emitKernels(b, dep, exe, .{
+    .kernels_root = b.path("src/kernels.zig"),
+    .imports = &deviceImports,
+});
+```
+
+It is a callback rather than a plain list of modules because a
+`std.Build.Module` carries its own target and optimize mode. One prebuilt
+module cannot serve both the `nvptx64` and `amdgcn` compilations, and a
+host-built module dragged into device code would silently keep the host's
+optimize mode — which is how a `Debug` import ends up inside an otherwise
+`ReleaseFast` device build.
+
 ### 4. Select a backend
 
 ```zig
