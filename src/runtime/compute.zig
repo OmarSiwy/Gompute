@@ -83,14 +83,6 @@ pub const Compute = struct {
             .cpu => error.InitFailed,
         };
     }
-
-    pub fn maxCoopBlocks(self: *Compute, k: Kernel, block_dim: u32, shared_bytes: usize) Error!u32 {
-        return switch (self.backend) {
-            .cuda => self.cuda_ctx.maxCoopBlocks(k.cuda, block_dim, shared_bytes),
-            .hip => self.hip_ctx.maxCoopBlocks(k.hip, block_dim, shared_bytes),
-            .cpu => 0,
-        };
-    }
 };
 
 pub const Buffer = union(Backend) {
@@ -196,13 +188,6 @@ pub const Kernel = union(Backend) {
             .cpu => unreachable,
         }
     }
-    pub fn launchCooperative(self: Kernel, grid: Dim3, block: Dim3, shared_bytes: u32, args: []const Arg) Error!void {
-        switch (self) {
-            .cuda => |k| try k.launchCooperative(grid, block, shared_bytes, args, null),
-            .hip => |k| try k.launchCooperative(grid, block, shared_bytes, args, null),
-            .cpu => unreachable,
-        }
-    }
 };
 
 pub const Stream = union(Backend) {
@@ -225,17 +210,3 @@ pub const Stream = union(Backend) {
         }
     }
 };
-
-pub const Graph = cuda.Graph;
-pub fn beginCapture(stream: *Stream) Error!void {
-    switch (stream.*) {
-        .cuda => |*s| try cuda.beginCapture(s),
-        else => unreachable,
-    }
-}
-pub fn endCapture(stream: *Stream) Error!Graph {
-    return switch (stream.*) {
-        .cuda => |*s| try cuda.endCapture(s),
-        else => unreachable,
-    };
-}

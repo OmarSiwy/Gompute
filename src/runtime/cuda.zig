@@ -1,6 +1,4 @@
 //! CUDA backend via runtime dlopen.
-//! Changes from v1:  #6 multi-GPU, #7 error detail, #8 pinned/unified mem,
-//! #10 events/timing, #19 occupancy API.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -14,51 +12,16 @@ const CUcontext = ?*anyopaque;
 const CUmodule = ?*anyopaque;
 const CUfunction = ?*anyopaque;
 const CUstream = ?*anyopaque;
-const CUevent = ?*anyopaque;
-const CUgraph = ?*anyopaque;
-const CUgraphExec = ?*anyopaque;
 const CUdeviceptr = c_ulonglong;
-const CUtexObject = u64;
-const CUsurfObject = u64;
-const CUmemoryPool = ?*anyopaque;
-
-/// CUDA_RESOURCE_DESC for texture/surface creation.
-pub const ResourceDesc = extern struct {
-    res_type: c_uint = 0, // 0=ARRAY, 1=MIPMAPPED_ARRAY, 2=LINEAR, 3=PITCH2D
-    // Union: for LINEAR (type 2), fields are:
-    dev_ptr: CUdeviceptr = 0,
-    format: c_uint = 0, // CU_AD_FORMAT_FLOAT = 0x20
-    num_channels: c_uint = 1,
-    size_in_bytes: usize = 0,
-    // Pad to match CUDA struct layout (192 bytes total)
-    _pad: [192 - 32]u8 = [_]u8{0} ** (192 - 32),
-};
-
-/// CUDA_TEXTURE_DESC for texture creation.
-pub const TextureDesc = extern struct {
-    address_mode: [3]c_uint = .{ 0, 0, 0 }, // CU_TR_ADDRESS_MODE_WRAP=0
-    filter_mode: c_uint = 0, // CU_TR_FILTER_MODE_POINT=0
-    flags: c_uint = 0,
-    max_anisotropy: c_uint = 1,
-    mipmap_filter_mode: c_uint = 0,
-    mipmap_level_bias: f32 = 0,
-    min_mipmap_level_clamp: f32 = 0,
-    max_mipmap_level_clamp: f32 = 0,
-    border_color: [4]f32 = .{ 0, 0, 0, 0 },
-    _reserved: [12]c_int = [_]c_int{0} ** 12,
-};
 
 const Api = struct {
     lib: std.DynLib,
     // Core
     cuInit: *const fn (c_uint) callconv(.c) CUresult,
     cuDeviceGet: *const fn (*CUdevice, c_int) callconv(.c) CUresult,
-    cuDeviceGetCount: *const fn (*c_int) callconv(.c) CUresult,
-    cuDeviceGetName: *const fn ([*]u8, c_int, CUdevice) callconv(.c) CUresult,
     cuCtxCreate_v2: *const fn (*CUcontext, c_uint, CUdevice) callconv(.c) CUresult,
     cuCtxDestroy_v2: *const fn (CUcontext) callconv(.c) CUresult,
     cuCtxSynchronize: *const fn () callconv(.c) CUresult,
-    cuCtxSetCurrent: *const fn (CUcontext) callconv(.c) CUresult,
     // Module
     cuModuleLoadData: *const fn (*CUmodule, *const anyopaque) callconv(.c) CUresult,
     cuModuleUnload: *const fn (CUmodule) callconv(.c) CUresult,
@@ -71,46 +34,14 @@ const Api = struct {
     cuMemcpyDtoD_v2: *const fn (CUdeviceptr, CUdeviceptr, usize) callconv(.c) CUresult,
     cuMemcpyHtoDAsync_v2: *const fn (CUdeviceptr, *const anyopaque, usize, CUstream) callconv(.c) CUresult,
     cuMemcpyDtoHAsync_v2: *const fn (*anyopaque, CUdeviceptr, usize, CUstream) callconv(.c) CUresult,
-    // Pinned host memory (#8)
-    cuMemAllocHost_v2: *const fn (**anyopaque, usize) callconv(.c) CUresult,
-    cuMemFreeHost: *const fn (*anyopaque) callconv(.c) CUresult,
-    // Managed / unified memory (#8)
-    cuMemAllocManaged: *const fn (*CUdeviceptr, usize, c_uint) callconv(.c) CUresult,
     // Launch
     cuLaunchKernel: *const fn (CUfunction, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, CUstream, ?[*]iface.Arg, ?[*]iface.Arg) callconv(.c) CUresult,
-    cuLaunchCooperativeKernel: *const fn (CUfunction, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, CUstream, ?[*]iface.Arg) callconv(.c) CUresult,
-    // Occupancy (#19)
-    cuOccupancyMaxActiveBlocksPerMultiprocessor: *const fn (*c_int, CUfunction, c_int, usize) callconv(.c) CUresult,
-    cuOccupancyMaxPotentialBlockSize: *const fn (*c_int, *c_int, CUfunction, ?*const anyopaque, usize, c_int) callconv(.c) CUresult,
     // Device attributes
     cuDeviceGetAttribute: *const fn (*c_int, c_int, CUdevice) callconv(.c) CUresult,
     // Streams
     cuStreamCreate: *const fn (*CUstream, c_uint) callconv(.c) CUresult,
     cuStreamDestroy_v2: *const fn (CUstream) callconv(.c) CUresult,
     cuStreamSynchronize: *const fn (CUstream) callconv(.c) CUresult,
-    // Events (#10)
-    cuEventCreate: *const fn (*CUevent, c_uint) callconv(.c) CUresult,
-    cuEventDestroy_v2: *const fn (CUevent) callconv(.c) CUresult,
-    cuEventRecord: *const fn (CUevent, CUstream) callconv(.c) CUresult,
-    cuEventSynchronize: *const fn (CUevent) callconv(.c) CUresult,
-    cuEventElapsedTime: *const fn (*f32, CUevent, CUevent) callconv(.c) CUresult,
-    // Texture / surface objects (#5)
-    cuTexObjectCreate: *const fn (*CUtexObject, *const ResourceDesc, *const TextureDesc, ?*const anyopaque) callconv(.c) CUresult,
-    cuTexObjectDestroy: *const fn (CUtexObject) callconv(.c) CUresult,
-    cuSurfObjectCreate: *const fn (*CUsurfObject, *const ResourceDesc) callconv(.c) CUresult,
-    cuSurfObjectDestroy: *const fn (CUsurfObject) callconv(.c) CUresult,
-    // Memory pools (#8) — optional, CUDA 11.2+
-    cuMemPoolCreate: ?*const fn (*CUmemoryPool, ?*const anyopaque) callconv(.c) CUresult = null,
-    cuMemPoolDestroy: ?*const fn (CUmemoryPool) callconv(.c) CUresult = null,
-    cuMemAllocAsync: ?*const fn (*CUdeviceptr, usize, CUstream) callconv(.c) CUresult = null,
-    cuMemFreeAsync: ?*const fn (CUdeviceptr, CUstream) callconv(.c) CUresult = null,
-    // Graph capture
-    cuStreamBeginCapture_v2: *const fn (CUstream, c_uint) callconv(.c) CUresult,
-    cuStreamEndCapture: *const fn (CUstream, *CUgraph) callconv(.c) CUresult,
-    cuGraphInstantiate_v2: *const fn (*CUgraphExec, CUgraph, ?*anyopaque, ?*anyopaque, usize) callconv(.c) CUresult,
-    cuGraphLaunch: *const fn (CUgraphExec, CUstream) callconv(.c) CUresult,
-    cuGraphExecDestroy: *const fn (CUgraphExec) callconv(.c) CUresult,
-    cuGraphDestroy: *const fn (CUgraph) callconv(.c) CUresult,
 };
 
 var g: Api = undefined;
@@ -142,15 +73,10 @@ fn loadApi() Error!void {
     errdefer lib.close();
     inline for (@typeInfo(Api).@"struct".fields) |field| {
         if (comptime std.mem.eql(u8, field.name, "lib")) continue;
-        const FT = @TypeOf(@field(g, field.name));
-        if (comptime @typeInfo(FT) == .optional) {
-            @field(g, field.name) = lib.lookup(@typeInfo(FT).optional.child, field.name);
-        } else {
-            @field(g, field.name) = lib.lookup(FT, field.name) orelse {
-                std.debug.print("cuda: symbol not found: {s}\n", .{field.name});
-                return error.InitFailed;
-            };
-        }
+        @field(g, field.name) = lib.lookup(@TypeOf(@field(g, field.name)), field.name) orelse {
+            std.debug.print("cuda: symbol not found: {s}\n", .{field.name});
+            return error.InitFailed;
+        };
     }
     g.lib = lib;
     loaded = true;
@@ -188,27 +114,6 @@ pub const Context = struct {
         try check(g.cuCtxSynchronize(), error.SyncFailed);
     }
 
-    /// (#6) Make this context current on the calling thread.
-    pub fn makeCurrent(self: *Context) Error!void {
-        try check(g.cuCtxSetCurrent(self.ctx), error.ContextFailed);
-    }
-
-    /// (#6) Query number of CUDA devices.
-    pub fn deviceCount() Error!c_int {
-        try loadApi();
-        try check(g.cuInit(0), error.InitFailed);
-        var count: c_int = 0;
-        try check(g.cuDeviceGetCount(&count), error.NoDevice);
-        return count;
-    }
-
-    /// (#6) Get device name.
-    pub fn deviceName(self: *Context, buf: []u8) Error![]u8 {
-        try check(g.cuDeviceGetName(buf.ptr, @intCast(buf.len), self.device), error.NoDevice);
-        const len = std.mem.indexOfScalar(u8, buf, 0) orelse buf.len;
-        return buf[0..len];
-    }
-
     pub fn createStream(_: *Context) Error!Stream {
         var s: Stream = .{};
         try check(g.cuStreamCreate(&s.stream, 0), error.SyncFailed);
@@ -234,85 +139,6 @@ pub const Context = struct {
         return m;
     }
 
-    /// (#8) Allocate page-locked (pinned) host memory.
-    pub fn allocPinned(_: *Context, bytes: usize) Error!PinnedBuffer {
-        var ptr: *anyopaque = undefined;
-        try check(g.cuMemAllocHost_v2(&ptr, bytes), error.AllocFailed);
-        return .{ .ptr = ptr, .bytes = bytes };
-    }
-
-    /// (#8) Allocate managed (unified) memory.
-    /// Flags: 1 = CU_MEM_ATTACH_GLOBAL, 2 = CU_MEM_ATTACH_HOST.
-    pub fn allocManaged(_: *Context, bytes: usize) Error!Buffer {
-        var b: Buffer = .{ .bytes = bytes };
-        try check(g.cuMemAllocManaged(&b.handle, bytes, 1), error.AllocFailed);
-        return b;
-    }
-
-    /// (#10) Create an event for timing.
-    pub fn createEvent(_: *Context) Error!Event {
-        var ev: Event = .{};
-        try check(g.cuEventCreate(&ev.event, 0), error.InitFailed);
-        return ev;
-    }
-
-    // -- Texture / surface objects (#5) --
-
-    /// Create a bindless texture object over a linear device buffer.
-    /// Pass the returned u64 handle as a kernel argument; use
-    /// gpu.tex1Dfetch_f32(handle, idx) on device.
-    pub fn createTexObject(_: *Context, dev_ptr: CUdeviceptr, num_elems: usize, num_channels: u32) Error!CUtexObject {
-        var rd: ResourceDesc = .{};
-        rd.res_type = 2; // CU_RESOURCE_TYPE_LINEAR
-        rd.dev_ptr = dev_ptr;
-        rd.format = 0x20; // CU_AD_FORMAT_FLOAT
-        rd.num_channels = num_channels;
-        rd.size_in_bytes = num_elems * num_channels * @sizeOf(f32);
-        var td: TextureDesc = .{};
-        td.filter_mode = 0; // CU_TR_FILTER_MODE_POINT
-        var obj: CUtexObject = 0;
-        try check(g.cuTexObjectCreate(&obj, &rd, &td, null), error.InitFailed);
-        return obj;
-    }
-
-    pub fn destroyTexObject(_: *Context, obj: CUtexObject) void {
-        _ = g.cuTexObjectDestroy(obj);
-    }
-
-    pub fn createSurfObject(_: *Context, dev_ptr: CUdeviceptr, size_bytes: usize) Error!CUsurfObject {
-        var rd: ResourceDesc = .{};
-        rd.res_type = 2;
-        rd.dev_ptr = dev_ptr;
-        rd.format = 0x20;
-        rd.num_channels = 1;
-        rd.size_in_bytes = size_bytes;
-        var obj: CUsurfObject = 0;
-        try check(g.cuSurfObjectCreate(&obj, &rd), error.InitFailed);
-        return obj;
-    }
-
-    pub fn destroySurfObject(_: *Context, obj: CUsurfObject) void {
-        _ = g.cuSurfObjectDestroy(obj);
-    }
-
-    // -- Memory pools (#8, CUDA 11.2+) --
-
-    /// Async alloc from the default pool. Returns error.AllocFailed
-    /// if pool APIs are not available (pre-11.2 driver).
-    pub fn allocAsync(_: *Context, bytes: usize, stream: *Stream) Error!Buffer {
-        const f = g.cuMemAllocAsync orelse return error.AllocFailed;
-        var b: Buffer = .{ .bytes = bytes };
-        try check(f(&b.handle, bytes, stream.stream), error.AllocFailed);
-        return b;
-    }
-
-    /// Async free to the default pool.
-    pub fn freeAsync(_: *Context, buf: *Buffer, stream: *Stream) Error!void {
-        const f = g.cuMemFreeAsync orelse return error.AllocFailed;
-        try check(f(buf.handle, stream.stream), error.AllocFailed);
-        buf.* = .{};
-    }
-
     pub const attr_multiprocessor_count: c_int = 16;
     pub const attr_cooperative_launch: c_int = 95;
     pub const attr_max_threads_per_block: c_int = 1;
@@ -323,22 +149,6 @@ pub const Context = struct {
         var v: c_int = 0;
         try check(g.cuDeviceGetAttribute(&v, attrib, self.device), error.NoDevice);
         return v;
-    }
-    pub fn maxCoopBlocks(self: *Context, k: Kernel, block_dim: u32, shared_bytes: usize) Error!u32 {
-        const coop = self.deviceAttribute(attr_cooperative_launch) catch 0;
-        if (coop == 0) return 0;
-        var per_sm: c_int = 0;
-        try check(g.cuOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, k.func, @intCast(block_dim), shared_bytes), error.LaunchFailed);
-        const sms = try self.deviceAttribute(attr_multiprocessor_count);
-        return @intCast(per_sm * sms);
-    }
-
-    /// (#19) Query optimal block size for a kernel.
-    pub fn optimalBlockSize(_: *Context, k: Kernel, shared_bytes: usize) Error!struct { grid: c_int, block: c_int } {
-        var min_grid: c_int = 0;
-        var block_size: c_int = 0;
-        try check(g.cuOccupancyMaxPotentialBlockSize(&min_grid, &block_size, k.func, null, shared_bytes, 0), error.LaunchFailed);
-        return .{ .grid = min_grid, .block = block_size };
     }
 };
 
@@ -380,21 +190,6 @@ pub const Buffer = struct {
     }
 };
 
-/// (#8) Pinned (page-locked) host memory for async transfers.
-pub const PinnedBuffer = struct {
-    ptr: *anyopaque,
-    bytes: usize,
-
-    pub fn free(self: *PinnedBuffer) void {
-        _ = g.cuMemFreeHost(self.ptr);
-        self.* = undefined;
-    }
-    pub fn slice(self: *PinnedBuffer, comptime T: type) []T {
-        const typed: [*]T = @ptrCast(@alignCast(self.ptr));
-        return typed[0 .. self.bytes / @sizeOf(T)];
-    }
-};
-
 pub const Module = struct {
     module: CUmodule = null,
     pub fn getKernel(self: *Module, name: [*:0]const u8) Error!Kernel {
@@ -416,9 +211,6 @@ pub const Kernel = struct {
     pub fn launchOnStream(self: Kernel, grid: Dim3, block: Dim3, shared_bytes: u32, args: []const iface.Arg, stream: CUstream) Error!void {
         try check(g.cuLaunchKernel(self.func, grid.x, grid.y, grid.z, block.x, block.y, block.z, shared_bytes, stream, @constCast(args.ptr), null), error.LaunchFailed);
     }
-    pub fn launchCooperative(self: Kernel, grid: Dim3, block: Dim3, shared_bytes: u32, args: []const iface.Arg, stream: CUstream) Error!void {
-        try check(g.cuLaunchCooperativeKernel(self.func, grid.x, grid.y, grid.z, block.x, block.y, block.z, shared_bytes, stream, @constCast(args.ptr)), error.LaunchFailed);
-    }
 };
 
 pub const Stream = struct {
@@ -431,48 +223,3 @@ pub const Stream = struct {
         self.* = .{};
     }
 };
-
-/// (#10) Event for GPU-side timing.
-pub const Event = struct {
-    event: CUevent = null,
-    pub fn record(self: *Event, stream: *Stream) Error!void {
-        try check(g.cuEventRecord(self.event, stream.stream), error.SyncFailed);
-    }
-    pub fn synchronize(self: *Event) Error!void {
-        try check(g.cuEventSynchronize(self.event), error.SyncFailed);
-    }
-    pub fn deinit(self: *Event) void {
-        _ = g.cuEventDestroy_v2(self.event);
-        self.* = undefined;
-    }
-    /// Elapsed time in milliseconds between two recorded events.
-    pub fn elapsedMs(start: *Event, stop: *Event) Error!f32 {
-        var ms: f32 = 0;
-        try check(g.cuEventElapsedTime(&ms, start.event, stop.event), error.SyncFailed);
-        return ms;
-    }
-};
-
-pub const Graph = struct {
-    exec: CUgraphExec = null,
-    graph: CUgraph = null,
-    pub fn deinit(self: *Graph) void {
-        if (self.exec != null) _ = g.cuGraphExecDestroy(self.exec);
-        if (self.graph != null) _ = g.cuGraphDestroy(self.graph);
-        self.* = .{};
-    }
-    pub fn launch(self: *Graph, stream: *Stream) Error!void {
-        try check(g.cuGraphLaunch(self.exec, stream.stream), error.LaunchFailed);
-    }
-};
-
-pub fn beginCapture(stream: *Stream) Error!void {
-    try check(g.cuStreamBeginCapture_v2(stream.stream, 0), error.LaunchFailed);
-}
-pub fn endCapture(stream: *Stream) Error!Graph {
-    var gr: Graph = .{};
-    try check(g.cuStreamEndCapture(stream.stream, &gr.graph), error.LaunchFailed);
-    errdefer gr.deinit();
-    try check(g.cuGraphInstantiate_v2(&gr.exec, gr.graph, null, null, 0), error.LaunchFailed);
-    return gr;
-}
