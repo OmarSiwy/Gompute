@@ -7,6 +7,12 @@ pub const MapOptions = struct {
     block_size: u32 = 256,
 };
 
+/// Broadcast a scalar so one generic map body compiles at scalar and vector
+/// width: `x * splat(@TypeOf(x), p.scale)`.
+pub inline fn splat(comptime T: type, value: anytype) T {
+    return if (@typeInfo(T) == .vector) @splat(value) else value;
+}
+
 pub fn Map(
     comptime name: [:0]const u8,
     comptime T: type,
@@ -16,7 +22,7 @@ pub fn Map(
 ) type {
     validateName(name);
     validateValue(T);
-    validateFunction(T, Params, func);
+    const generic = validateFunction(T, Params, func);
     _ = abi.Boundary(Params);
     if (options.block_size == 0 or options.block_size > 1024)
         @compileError("block_size must be in 1...1024");
@@ -27,8 +33,37 @@ pub fn Map(
         pub const Parameters = Params;
         pub const BoundaryParameters = abi.Boundary(Params);
         pub const block_size: u32 = options.block_size;
+        /// The map function takes `anytype`, so `eval` also instantiates at
+        /// `@Vector(n, Value)`; the CPU backend uses that to vectorize.
+        pub const is_generic: bool = generic;
+        pub const eval = Eval(generic, T, Params, func).eval;
+    };
+}
 
-        pub inline fn eval(x: T, params: Params) T {
+/// `Map` with `T` and `Params` read off the function signature.
+pub fn MapFn(
+    comptime name: [:0]const u8,
+    comptime func: anytype,
+    comptime options: MapOptions,
+) type {
+    const f = fnInfo(func);
+    const T = f.params[0].type orelse @compileError(
+        "cannot infer the value type of a generic map function; use the " ++
+            "5-argument form g.map(name, T, Params, func, options)",
+    );
+    const P = f.params[1].type orelse @compileError(
+        "cannot infer the parameter type; use g.map(name, T, Params, func, options)",
+    );
+    return Map(name, T, P, func, options);
+}
+
+fn Eval(comptime generic: bool, comptime T: type, comptime P: type, comptime func: anytype) type {
+    return if (generic) struct {
+        pub inline fn eval(x: anytype, params: P) @TypeOf(x) {
+            return @call(.always_inline, func, .{ x, params });
+        }
+    } else struct {
+        pub inline fn eval(x: T, params: P) T {
             return @call(.always_inline, func, .{ x, params });
         }
     };
@@ -59,17 +94,27 @@ fn validateValue(comptime T: type) void {
     }
 }
 
-fn validateFunction(comptime T: type, comptime P: type, comptime func: anytype) void {
+fn fnInfo(comptime func: anytype) std.builtin.Type.Fn {
     const info = @typeInfo(@TypeOf(func));
     if (info != .@"fn") @compileError("map operation must be a function");
     const f = info.@"fn";
     if (f.is_var_args or f.params.len != 2)
         @compileError("map operation must have signature fn (T, Params) T");
-    const a = f.params[0].type orelse @compileError("generic function parameters are not supported");
-    const b = f.params[1].type orelse @compileError("generic function parameters are not supported");
+    return f;
+}
+
+/// Returns true for a generic map function (`fn (x: anytype, p: Params)`),
+/// which the CPU backend may instantiate at vector width.
+fn validateFunction(comptime T: type, comptime P: type, comptime func: anytype) bool {
+    const f = fnInfo(func);
+    const b = f.params[1].type orelse @compileError("the params argument cannot be anytype");
+    if (b != P)
+        @compileError("map operation must take " ++ @typeName(P) ++ " as its second argument");
+    if (f.params[0].type == null) return true;
     const r = f.return_type orelse @compileError("map operation must return T");
-    if (a != T or b != P or r != T)
+    if (f.params[0].type.? != T or r != T)
         @compileError("map operation must have signature fn (" ++ @typeName(T) ++ ", " ++ @typeName(P) ++ ") " ++ @typeName(T));
+    return false;
 }
 
 test "map spec validates and evaluates" {

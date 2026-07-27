@@ -11,8 +11,8 @@ pub const Backend = enum { cpu, cuda, hip };
 pub fn Kernel(comptime Spec: type, comptime backend: Backend) type {
     return switch (backend) {
         .cpu => CpuKernel(Spec),
-        .cuda => CudaKernel(Spec),
-        .hip => HipKernel(Spec),
+        .cuda => GpuKernel(Spec, gpu_cuda),
+        .hip => GpuKernel(Spec, gpu_hip),
     };
 }
 
@@ -28,99 +28,76 @@ fn CpuKernel(comptime Spec: type) type {
 
         pub inline fn deinit(_: *Self) void {}
 
+        /// A generic map body (`fn (x: anytype, p: Params)`) instantiates at
+        /// vector width; a strict `fn (T, Params) T` cannot, so it stays scalar.
+        const lanes: usize = if (@hasDecl(Spec, "is_generic") and Spec.is_generic)
+            std.simd.suggestVectorLength(Spec.Value) orelse 1
+        else
+            1;
+
         pub inline fn run(_: *Self, data: []Spec.Value, params: Spec.Parameters) iface.Error!void {
-            for (data) |*value| value.* = Spec.eval(value.*, params);
+            if (comptime lanes == 1) {
+                for (data) |*value| value.* = Spec.eval(value.*, params);
+                return;
+            }
+            var i: usize = 0;
+            while (i + lanes <= data.len) : (i += lanes) {
+                const chunk: @Vector(lanes, Spec.Value) = data[i..][0..lanes].*;
+                data[i..][0..lanes].* = Spec.eval(chunk, params);
+            }
+            for (data[i..]) |*value| value.* = Spec.eval(value.*, params);
         }
     };
 }
 
-fn CudaKernel(comptime Spec: type) type {
-    return struct {
-        const Self = @This();
-        pub const backend: Backend = .cuda;
-        pub const Buffer = cuda.Buffer;
+/// The two GPU backends differ only in which runtime module they call and how
+/// a kernel's entry name is spelled in the emitted artifact.
+pub const Gpu = struct {
+    backend: Backend,
+    rt: type,
+    /// Field names in the generated `gompute_kernels` module.
+    has: []const u8,
+    image: []const u8,
+    /// HIP entry points keep their mangled Zig name; look it up in `hip_names`.
+    mangled: bool,
+};
 
-        context: cuda.Context,
-        module: cuda.Module,
-        kernel: cuda.Kernel,
+pub const gpu_cuda: Gpu = .{ .backend = .cuda, .rt = cuda, .has = "has_cuda", .image = "cuda", .mangled = false };
+pub const gpu_hip: Gpu = .{ .backend = .hip, .rt = hip, .has = "has_hip", .image = "hip", .mangled = true };
 
-        pub fn init(ordinal: c_int) iface.Error!Self {
-            const artifacts = @import("gompute_kernels");
-            if (comptime !artifacts.has_cuda) return error.BackendUnavailable;
+/// Open the artifact for `gpu` and resolve `entry_name` in it.
+pub fn openModule(comptime gpu: Gpu, comptime entry_name: [:0]const u8, ordinal: c_int) iface.Error!struct {
+    context: gpu.rt.Context,
+    module: gpu.rt.Module,
+    kernel: gpu.rt.Kernel,
+} {
+    const artifacts = @import("gompute_kernels");
+    if (comptime !@field(artifacts, gpu.has)) return error.BackendUnavailable;
 
-            var context = try cuda.Context.init(ordinal);
-            errdefer context.deinit();
-            var module = try context.loadModuleFromMemory(artifacts.cuda);
-            errdefer module.deinit();
-            const kernel = try module.getKernel(Spec.entry_name.ptr);
-            return .{ .context = context, .module = module, .kernel = kernel };
-        }
-
-        pub fn deinit(self: *Self) void {
-            self.module.deinit();
-            self.context.deinit();
-            self.* = undefined;
-        }
-
-        pub fn alloc(self: *Self, count: usize) iface.Error!Buffer {
-            return self.context.alloc(count * @sizeOf(Spec.Value));
-        }
-
-        pub fn launch(
-            self: *Self,
-            buffer: *Buffer,
-            count: usize,
-            params: Spec.Parameters,
-        ) iface.Error!void {
-            if (count == 0) return;
-            var len: u64 = @intCast(count);
-            var packed_params = abi.pack(Spec.Parameters, params);
-            var args = [_]iface.Arg{
-                buffer.argPtr(),
-                iface.arg(&len),
-                iface.arg(&packed_params),
-            };
-            try self.kernel.launch(
-                iface.Dim3.linear(count, Spec.block_size),
-                .{ .x = Spec.block_size },
-                0,
-                &args,
-            );
-        }
-
-        pub fn run(self: *Self, data: []Spec.Value, params: Spec.Parameters) iface.Error!void {
-            if (data.len == 0) return;
-            var buffer = try self.alloc(data.len);
-            defer buffer.free();
-            try buffer.upload(data.ptr, data.len * @sizeOf(Spec.Value));
-            try self.launch(&buffer, data.len, params);
-            try self.context.synchronize();
-            try buffer.download(data.ptr, data.len * @sizeOf(Spec.Value));
-        }
-    };
+    var context = try gpu.rt.Context.init(ordinal);
+    errdefer context.deinit();
+    var module = try context.loadModuleFromMemory(@field(artifacts, gpu.image));
+    errdefer module.deinit();
+    const internal_name = comptime if (gpu.mangled)
+        artifacts.hip_names.resolve(entry_name)
+    else
+        entry_name;
+    return .{ .context = context, .module = module, .kernel = try module.getKernel(internal_name.ptr) };
 }
 
-fn HipKernel(comptime Spec: type) type {
+fn GpuKernel(comptime Spec: type, comptime gpu: Gpu) type {
     return struct {
         const Self = @This();
-        pub const backend: Backend = .hip;
-        pub const Buffer = hip.Buffer;
+        pub const backend: Backend = gpu.backend;
+        pub const Buffer = gpu.rt.Buffer;
 
-        context: hip.Context,
-        module: hip.Module,
-        kernel: hip.Kernel,
+        context: gpu.rt.Context,
+        module: gpu.rt.Module,
+        kernel: gpu.rt.Kernel,
 
         pub fn init(ordinal: c_int) iface.Error!Self {
-            const artifacts = @import("gompute_kernels");
-            if (comptime !artifacts.has_hip) return error.BackendUnavailable;
-
-            var context = try hip.Context.init(ordinal);
-            errdefer context.deinit();
-            var module = try context.loadModuleFromMemory(artifacts.hip);
-            errdefer module.deinit();
-            const internal_name = artifacts.hip_names.resolve(Spec.entry_name);
-            const kernel = try module.getKernel(internal_name.ptr);
-            return .{ .context = context, .module = module, .kernel = kernel };
+            const opened = try openModule(gpu, Spec.entry_name, ordinal);
+            return .{ .context = opened.context, .module = opened.module, .kernel = opened.kernel };
         }
 
         pub fn deinit(self: *Self) void {
@@ -209,4 +186,30 @@ pub fn AutoKernel(comptime Spec: type) type {
             };
         }
     };
+}
+
+test "vectorized cpu run matches the scalar loop at every tail boundary" {
+    const spec = @import("../core/spec.zig");
+    const P = struct { scale: f32 };
+    const Generic = spec.Map("simd_probe", f32, P, struct {
+        fn call(x: anytype, p: P) @TypeOf(x) {
+            const y = x * spec.splat(@TypeOf(x), p.scale);
+            return @max(y, spec.splat(@TypeOf(x), @as(f32, 0)));
+        }
+    }.call, .{});
+    try std.testing.expect(Generic.is_generic);
+
+    const K = CpuKernel(Generic);
+    const params: P = .{ .scale = 2 };
+    var buf: [3 * 64 + 1]f32 = undefined;
+    var expected: [buf.len]f32 = undefined;
+
+    for (0..3 * K.lanes + 2) |len| {
+        for (buf[0..len], 0..) |*v, i| v.* = @as(f32, @floatFromInt(i)) - 8;
+        for (buf[0..len], expected[0..len]) |v, *e| e.* = Generic.eval(v, params);
+
+        var kernel = try K.init(0);
+        try kernel.run(buf[0..len], params);
+        try std.testing.expectEqualSlices(f32, expected[0..len], buf[0..len]);
+    }
 }

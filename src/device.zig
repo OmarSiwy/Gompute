@@ -33,6 +33,17 @@ pub fn map(
     return spec.Map(name, T, Params, func, options);
 }
 
+/// `map` with `T` and `Params` read off `func`'s signature.
+pub fn mapFn(
+    comptime name: [:0]const u8,
+    comptime func: anytype,
+    comptime options: MapOptions,
+) type {
+    return spec.MapFn(name, func, options);
+}
+
+pub const splat = spec.splat;
+
 pub const Fused = fusion.Fused;
 pub const Unary = fusion.Unary;
 pub const exportKernels = @import("device/export.zig").exportAll;
