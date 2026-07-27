@@ -8,11 +8,14 @@ const hip = @import("../runtime/hip.zig");
 
 pub const Backend = enum { cpu, cuda, hip };
 
+/// Naming an explicit backend is a promise made in build.zig. If the build did
+/// not keep it, that is a build bug and belongs at build time, not at run time.
+/// `AutoKernel` deliberately bypasses this and gates on `.available` instead.
 pub fn Kernel(comptime Spec: type, comptime backend: Backend) type {
     return switch (backend) {
         .cpu => CpuKernel(Spec),
-        .cuda => GpuKernel(Spec, gpu_cuda),
-        .hip => GpuKernel(Spec, gpu_hip),
+        .cuda => requireArtifacts(gpu_cuda, GpuKernel(Spec, gpu_cuda)),
+        .hip => requireArtifacts(gpu_hip, GpuKernel(Spec, gpu_hip)),
     };
 }
 
@@ -20,6 +23,7 @@ fn CpuKernel(comptime Spec: type) type {
     return struct {
         const Self = @This();
         pub const backend: Backend = .cpu;
+        pub const available = true;
         pub const Buffer = void;
 
         pub inline fn init(_: c_int) iface.Error!Self {
@@ -60,10 +64,54 @@ pub const Gpu = struct {
     image: []const u8,
     /// HIP entry points keep their mangled Zig name; look it up in `hip_names`.
     mangled: bool,
+    /// A device arch to name in diagnostics, so the fix is copy-pasteable.
+    example_cpu: []const u8,
 };
 
-pub const gpu_cuda: Gpu = .{ .backend = .cuda, .rt = cuda, .has = "has_cuda", .image = "cuda", .mangled = false };
-pub const gpu_hip: Gpu = .{ .backend = .hip, .rt = hip, .has = "has_hip", .image = "hip", .mangled = true };
+pub const gpu_cuda: Gpu = .{ .backend = .cuda, .rt = cuda, .has = "has_cuda", .image = "cuda", .mangled = false, .example_cpu = "sm_89" };
+pub const gpu_hip: Gpu = .{ .backend = .hip, .rt = hip, .has = "has_hip", .image = "hip", .mangled = true, .example_cpu = "gfx1100" };
+
+/// Whether this build actually carries a device artifact for `gpu`.
+///
+/// The only public way to ask before writing `Kernel(Spec, .cuda)`, which is a
+/// compile error when the answer is `false`. Reachable as
+/// `AutoKernel(Spec).Cuda.available` / `.Hip.available`.
+///
+/// The import stays inside the function on purpose: the library's own test
+/// build has no `gompute_kernels` module at all, and a file-scope import would
+/// be analyzed there.
+pub fn available(comptime gpu: Gpu) bool {
+    return @field(@import("gompute_kernels"), gpu.has);
+}
+
+/// Whether `emitKernels`/`addKernels` was ever called. The generated module says
+/// `emitted = true`, build.zig's default stub says `false`; a build.zig old
+/// enough to declare neither can only have resolved the real generated module.
+fn emitted() bool {
+    const artifacts = @import("gompute_kernels");
+    return !@hasDecl(artifacts, "emitted") or artifacts.emitted;
+}
+
+/// Passes `T` through, or explains at compile time why `gpu` has no artifact.
+pub fn requireArtifacts(comptime gpu: Gpu, comptime T: type) type {
+    if (comptime available(gpu)) return T;
+    const tag = @tagName(gpu.backend);
+    if (comptime !emitted()) @compileError(
+        "gompute: Kernel(Spec, ." ++ tag ++ ") needs device artifacts, but this build never " ++
+            "emitted any. Add to build.zig:\n" ++
+            "    const gompute_build = @import(\"gompute\");\n" ++
+            "    gompute_build.emitKernels(b, dep, exe, .{ .kernels_root = b.path(\"src/kernels.zig\") });\n" ++
+            "(or gompute_build.addKernels for more than one executable).",
+    );
+    @compileError(
+        "gompute: Kernel(Spec, ." ++ tag ++ ") was asked for, but this build emitted no " ++ tag ++
+            " artifacts. Either .auto detected no " ++ tag ++ " GPU on the BUILD machine, or you " ++
+            "passed ." ++ tag ++ " = .{ .enabled = false }. Fix it by pinning the arch you deploy " ++
+            "to -- ." ++ tag ++ " = .{ .gpu = .{ .name = \"" ++ gpu.example_cpu ++ "\" } } in " ++
+            "emitKernels -- or switch to AutoKernel(Spec), which compiles either way and falls " ++
+            "back to the CPU at run time.",
+    );
+}
 
 /// Open the artifact for `gpu` and resolve `entry_name` in it.
 pub fn openModule(comptime gpu: Gpu, comptime entry_name: [:0]const u8, ordinal: c_int) iface.Error!struct {
@@ -73,27 +121,57 @@ pub fn openModule(comptime gpu: Gpu, comptime entry_name: [:0]const u8, ordinal:
 } {
     const artifacts = @import("gompute_kernels");
     if (comptime !@field(artifacts, gpu.has)) return error.BackendUnavailable;
+    const tag = @tagName(gpu.backend);
 
     var context = try gpu.rt.Context.init(ordinal);
     errdefer context.deinit();
-    var module = try context.loadModuleFromMemory(@field(artifacts, gpu.image));
+    // Past this point the artifact is in the binary and the device is up, so
+    // every remaining failure is a build bug. Callers are allowed to swallow the
+    // error (AutoKernel does); they are not allowed to swallow the reason.
+    var module = context.loadModuleFromMemory(@field(artifacts, gpu.image)) catch |err| {
+        std.log.err(
+            "gompute: this binary's " ++ tag ++ " artifact will not load on this device " ++
+                "({t}, driver code {d}). The usual cause is a device arch mismatch -- the build " ++
+                "compiled for one GPU and this machine has another. Pin the arch you deploy to " ++
+                "with ." ++ tag ++ " = .{{ .gpu = .{{ .name = \"" ++ gpu.example_cpu ++
+                "\" }} }} in emitKernels.",
+            .{ err, iface.last_driver_error.code },
+        );
+        return err;
+    };
     errdefer module.deinit();
     const internal_name = comptime if (gpu.mangled)
         artifacts.hip_names.resolve(entry_name)
     else
         entry_name;
-    return .{ .context = context, .module = module, .kernel = try module.getKernel(internal_name.ptr) };
+    const kernel = module.getKernel(internal_name.ptr) catch |err| {
+        std.log.err(
+            "gompute: " ++ tag ++ " kernel \"" ++ entry_name ++ "\" is not in the emitted " ++
+                "artifact ({t}, driver code {d}). Two things to check: is it listed in the " ++
+                "gompute.exportKernels(.{{ ... }}) call in your kernels root, and does the " ++
+                ".kernels_root you passed to emitKernels point at that same file?",
+            .{ err, iface.last_driver_error.code },
+        );
+        return err;
+    };
+    return .{ .context = context, .module = module, .kernel = kernel };
 }
+
+/// `GpuKernel` declares its own `available`, which would shadow the function.
+const host_available = available;
 
 fn GpuKernel(comptime Spec: type, comptime gpu: Gpu) type {
     return struct {
         const Self = @This();
         pub const backend: Backend = gpu.backend;
+        /// False when this build emitted no artifact for `gpu`; `init` then
+        /// always returns `error.BackendUnavailable`.
+        pub const available = host_available(gpu);
         pub const Buffer = gpu.rt.Buffer;
 
-        context: gpu.rt.Context,
-        module: gpu.rt.Module,
-        kernel: gpu.rt.Kernel,
+        context: gpu.rt.Context = .{},
+        module: gpu.rt.Module = .{},
+        kernel: gpu.rt.Kernel = .{},
 
         /// (#3) Handles on the same device share one primary context and one
         /// JIT'd copy of the artifact, so this is cheap after the first one and
@@ -108,10 +186,15 @@ fn GpuKernel(comptime Spec: type, comptime gpu: Gpu) type {
         /// this no longer tears them down; call `gompute.runtime.<backend>
         /// .shutdown()` if you genuinely want that. Still safe to call, still
         /// safe to call on a handle nobody else shares.
+        ///
+        /// Resets rather than `undefined`: in ReleaseFast `undefined` leaves the
+        /// old live handles in place, so a stray double-deinit becomes a
+        /// driver-level double free. Cleared handles make it a no-op, which is
+        /// what the runtime structs already do.
         pub fn deinit(self: *Self) void {
             self.module.deinit();
             self.context.deinit();
-            self.* = undefined;
+            self.* = .{};
         }
 
         pub fn alloc(self: *Self, count: usize) iface.Error!Buffer {
@@ -155,11 +238,30 @@ fn GpuKernel(comptime Spec: type, comptime gpu: Gpu) type {
     };
 }
 
-pub fn AutoKernel(comptime Spec: type) type {
-    const Cpu = Kernel(Spec, .cpu);
-    const Cuda = Kernel(Spec, .cuda);
-    const Hip = Kernel(Spec, .hip);
+/// A backend that is simply not on this machine is a legitimate quiet CPU
+/// fallback. Anything else means the artifact IS in the binary and is wrong,
+/// and a ~100x downgrade must never be silent.
+fn absent(err: iface.Error) bool {
+    return switch (err) {
+        // No artifact in the build, no driver to dlopen, no such device.
+        error.BackendUnavailable, error.InitFailed, error.NoDevice => true,
+        else => false,
+    };
+}
 
+/// `openModule` has already logged the specifics; this adds the consequence.
+fn reportSkip(comptime tag: []const u8, err: iface.Error, strict: bool) iface.Error!void {
+    if (absent(err)) return;
+    if (strict) return err;
+    std.log.warn(
+        "gompute: this build contains " ++ tag ++ " artifacts but the " ++ tag ++ " backend " ++
+            "failed to start ({t}), so AutoKernel fell back to the CPU -- typically ~100x " ++
+            "slower. That is a broken build, not a missing GPU. Use initStrict() to make it fatal.",
+        .{err},
+    );
+}
+
+pub fn AutoKernel(comptime Spec: type) type {
     return union(enum) {
         cpu: Cpu,
         cuda: Cuda,
@@ -167,9 +269,35 @@ pub fn AutoKernel(comptime Spec: type) type {
 
         const Self = @This();
 
+        pub const Cpu = Kernel(Spec, .cpu);
+        /// Not `Kernel(Spec, .cuda)`: that is a compile error when the build
+        /// emitted no CUDA, and the entire point of `AutoKernel` is to compile
+        /// either way. Ask `Cuda.available` for the answer instead.
+        pub const Cuda = GpuKernel(Spec, gpu_cuda);
+        pub const Hip = GpuKernel(Spec, gpu_hip);
+
+        /// Picks the fastest backend that works, silently falling back to the
+        /// CPU when this machine has no GPU -- but warning loudly when it has
+        /// one and the artifact is broken. Use `initStrict` to refuse instead.
         pub fn init() Self {
-            if (Cuda.init(0)) |value| return .{ .cuda = value } else |_| {}
-            if (Hip.init(0)) |value| return .{ .hip = value } else |_| {}
+            // `reportSkip` only errors when strict; the CPU tail is infallible.
+            return probe(false) catch .{ .cpu = Cpu.init(0) catch unreachable };
+        }
+
+        /// `init`, except a build that ships an artifact the device rejects is
+        /// an error rather than a quiet CPU downgrade. A machine with no GPU at
+        /// all still returns `.cpu`.
+        pub fn initStrict() iface.Error!Self {
+            return probe(true);
+        }
+
+        fn probe(strict: bool) iface.Error!Self {
+            if (comptime Cuda.available) {
+                if (Cuda.init(0)) |value| return .{ .cuda = value } else |err| try reportSkip("cuda", err, strict);
+            }
+            if (comptime Hip.available) {
+                if (Hip.init(0)) |value| return .{ .hip = value } else |err| try reportSkip("hip", err, strict);
+            }
             return .{ .cpu = Cpu.init(0) catch unreachable };
         }
 
@@ -222,5 +350,18 @@ test "vectorized cpu run matches the scalar loop at every tail boundary" {
         var kernel = try K.init(0);
         try kernel.run(buf[0..len], params);
         try std.testing.expectEqualSlices(f32, expected[0..len], buf[0..len]);
+    }
+}
+
+test "a broken build is distinguishable from a machine that simply has no GPU" {
+    // The whole of C5: get this classification wrong and a ~100x CPU downgrade
+    // goes back to being silent. `strict = true` returns before it logs.
+    for ([_]iface.Error{ error.BackendUnavailable, error.InitFailed, error.NoDevice }) |absence| {
+        try std.testing.expect(absent(absence));
+        try reportSkip("cuda", absence, true);
+    }
+    for ([_]iface.Error{ error.ModuleLoadFailed, error.KernelNotFound, error.LaunchFailed }) |broken| {
+        try std.testing.expect(!absent(broken));
+        try std.testing.expectError(broken, reportSkip("cuda", broken, true));
     }
 }

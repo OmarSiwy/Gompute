@@ -5,8 +5,8 @@ const host = @import("kernel.zig");
 
 pub fn RawKernel(comptime entry_name: [:0]const u8, comptime backend: host.Backend) type {
     return switch (backend) {
-        .cuda => GpuRaw(entry_name, host.gpu_cuda),
-        .hip => GpuRaw(entry_name, host.gpu_hip),
+        .cuda => host.requireArtifacts(host.gpu_cuda, GpuRaw(entry_name, host.gpu_cuda)),
+        .hip => host.requireArtifacts(host.gpu_hip, GpuRaw(entry_name, host.gpu_hip)),
         .cpu => @compileError("RawKernel is device-only; use a normal Zig function on CPU"),
     };
 }
@@ -16,9 +16,9 @@ fn GpuRaw(comptime entry_name: [:0]const u8, comptime gpu: host.Gpu) type {
         const Self = @This();
         pub const Buffer = gpu.rt.Buffer;
 
-        context: gpu.rt.Context,
-        module: gpu.rt.Module,
-        kernel: gpu.rt.Kernel,
+        context: gpu.rt.Context = .{},
+        module: gpu.rt.Module = .{},
+        kernel: gpu.rt.Kernel = .{},
 
         /// (#3) Handles on the same device share one primary context and one
         /// JIT'd copy of the artifact, so this is cheap after the first one and
@@ -30,10 +30,13 @@ fn GpuRaw(comptime entry_name: [:0]const u8, comptime gpu: host.Gpu) type {
 
         /// (#3) Drops this handle only; the shared context and module stay up for
         /// the process. See `gompute.runtime.<backend>.shutdown()`.
+        ///
+        /// Resets rather than `undefined`, so a stray double-deinit stays a
+        /// no-op instead of a driver-level double free in ReleaseFast.
         pub fn deinit(self: *Self) void {
             self.module.deinit();
             self.context.deinit();
-            self.* = undefined;
+            self.* = .{};
         }
 
         pub fn alloc(self: *Self, bytes: usize) iface.Error!Buffer {
