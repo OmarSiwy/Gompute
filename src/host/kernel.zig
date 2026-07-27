@@ -61,19 +61,19 @@ pub const Gpu = struct {
     rt: type,
     /// Field names in the generated `gompute_kernels` module.
     has: []const u8,
-    image: []const u8,
-    /// HIP entry points keep their mangled Zig name; look it up in the name map.
-    mangled: bool,
-    /// The generated name map. Both backends consult it -- only HIP needs the
-    /// result, but the lookup is what turns a missing kernel into a compile
-    /// error instead of a runtime KernelNotFound. See `openModule`.
-    names: []const u8,
+    /// One device image per kernel root, in blob order.
+    images: []const u8,
+    /// Kernel name -> `.{ .blob, .symbol }`, merged from every root at comptime.
+    /// Both backends consult it: it says which blob to load, and the lookup
+    /// itself is what turns a missing kernel into a compile error rather than a
+    /// runtime KernelNotFound. See `openModule`.
+    index: []const u8,
     /// A device arch to name in diagnostics, so the fix is copy-pasteable.
     example_cpu: []const u8,
 };
 
-pub const gpu_cuda: Gpu = .{ .backend = .cuda, .rt = cuda, .has = "has_cuda", .image = "cuda", .names = "cuda_names", .mangled = false, .example_cpu = "sm_89" };
-pub const gpu_hip: Gpu = .{ .backend = .hip, .rt = hip, .has = "has_hip", .image = "hip", .names = "hip_names", .mangled = true, .example_cpu = "gfx1100" };
+pub const gpu_cuda: Gpu = .{ .backend = .cuda, .rt = cuda, .has = "has_cuda", .images = "cuda_images", .index = "cuda_index", .example_cpu = "sm_89" };
+pub const gpu_hip: Gpu = .{ .backend = .hip, .rt = hip, .has = "has_hip", .images = "hip_images", .index = "hip_index", .example_cpu = "gfx1100" };
 
 /// Whether this build actually carries a device artifact for `gpu`.
 ///
@@ -117,14 +117,56 @@ pub fn requireArtifacts(comptime gpu: Gpu, comptime T: type) type {
     );
 }
 
+/// A device, the loaded blob it came from, and one kernel inside it.
+pub fn Opened(comptime gpu: Gpu) type {
+    return struct {
+        context: gpu.rt.Context,
+        module: gpu.rt.Module,
+        kernel: gpu.rt.Kernel,
+    };
+}
+
 /// Open the artifact for `gpu` and resolve `entry_name` in it.
-pub fn openModule(comptime gpu: Gpu, comptime entry_name: [:0]const u8, ordinal: c_int) iface.Error!struct {
-    context: gpu.rt.Context,
-    module: gpu.rt.Module,
-    kernel: gpu.rt.Kernel,
-} {
+///
+/// The name is resolved at compile time: a kernel that is not in any emitted
+/// root is a `@compileError` naming it, rather than a runtime `KernelNotFound`
+/// discovered on a customer's machine. Nothing else in the pipeline verifies
+/// that a requested kernel was actually emitted.
+pub fn openModule(
+    comptime gpu: Gpu,
+    comptime entry_name: [:0]const u8,
+    ordinal: c_int,
+) iface.Error!Opened(gpu) {
     const artifacts = @import("gompute_kernels");
     if (comptime !@field(artifacts, gpu.has)) return error.BackendUnavailable;
+    const entry = comptime @field(artifacts, gpu.index).get(entry_name) orelse @compileError(
+        "gompute: " ++ @tagName(gpu.backend) ++ " kernel \"" ++ entry_name ++ "\" is not in " ++
+            "any emitted kernel root; export it from the root file with " ++
+            "`comptime { g.exportKernels(@This()); }`, and check that the root is listed in " ++
+            "your emitKernels call.",
+    );
+    // Only this kernel's blob is loaded: one root out of N is JIT'd, not all N.
+    return open(gpu, entry_name, entry, ordinal);
+}
+
+/// `openModule` for a kernel name that is only known at run time -- a name read
+/// out of a config file or a netlist. The set of kernels is still closed at
+/// build time, so an unknown name is `error.KernelNotFound`, not a panic.
+pub fn openModuleByName(
+    comptime gpu: Gpu,
+    name: []const u8,
+    ordinal: c_int,
+) iface.Error!Opened(gpu) {
+    const artifacts = @import("gompute_kernels");
+    if (comptime !@field(artifacts, gpu.has)) return error.BackendUnavailable;
+    const entry = @field(artifacts, gpu.index).get(name) orelse return error.KernelNotFound;
+    return open(gpu, name, entry, ordinal);
+}
+
+/// `entry` is `gompute_kernels.Entry`, duck-typed so the generated module owns
+/// the definition.
+fn open(comptime gpu: Gpu, name: []const u8, entry: anytype, ordinal: c_int) iface.Error!Opened(gpu) {
+    const artifacts = @import("gompute_kernels");
     const tag = @tagName(gpu.backend);
 
     var context = try gpu.rt.Context.init(ordinal);
@@ -132,34 +174,25 @@ pub fn openModule(comptime gpu: Gpu, comptime entry_name: [:0]const u8, ordinal:
     // Past this point the artifact is in the binary and the device is up, so
     // every remaining failure is a build bug. Callers are allowed to swallow the
     // error (AutoKernel does); they are not allowed to swallow the reason.
-    var module = context.loadModuleFromMemory(@field(artifacts, gpu.image)) catch |err| {
+    var module = context.loadModuleFromMemory(@field(artifacts, gpu.images)[entry.blob]) catch |err| {
         std.log.err(
-            "gompute: this binary's " ++ tag ++ " artifact will not load on this device " ++
-                "({t}, driver code {d}). The usual cause is a device arch mismatch -- the build " ++
-                "compiled for one GPU and this machine has another. Pin the arch you deploy to " ++
-                "with ." ++ tag ++ " = .{{ .gpu = .{{ .name = \"" ++ gpu.example_cpu ++
-                "\" }} }} in emitKernels.",
-            .{ err, iface.last_driver_error.code },
+            "gompute: this binary's " ++ tag ++ " artifact for kernel root \"{s}\" will not " ++
+                "load on this device ({t}, driver code {d}). The usual cause is a device arch " ++
+                "mismatch -- the build compiled for one GPU and this machine has another. Pin " ++
+                "the arch you deploy to with ." ++ tag ++ " = .{{ .gpu = .{{ .name = \"" ++
+                gpu.example_cpu ++ "\" }} }} in emitKernels.",
+            .{ artifacts.root_names[entry.blob], err, iface.last_driver_error.code },
         );
         return err;
     };
     errdefer module.deinit();
-    // Resolve on BOTH backends. HIP needs the mangled symbol; CUDA launches the
-    // public name and throws the result away -- but the lookup itself is the
-    // check: a kernel missing from the artifact is a @compileError naming it,
-    // rather than a runtime KernelNotFound discovered on a customer's machine.
-    // Nothing else in the pipeline verified that a requested kernel was emitted.
-    const internal_name = comptime blk: {
-        const resolved = @field(artifacts, gpu.names).resolve(entry_name);
-        break :blk if (gpu.mangled) resolved else entry_name;
-    };
-    const kernel = module.getKernel(internal_name.ptr) catch |err| {
+    const kernel = module.getKernel(entry.symbol.ptr) catch |err| {
         std.log.err(
-            "gompute: " ++ tag ++ " kernel \"" ++ entry_name ++ "\" is not in the emitted " ++
+            "gompute: " ++ tag ++ " kernel \"{s}\" is in the name table but not in the emitted " ++
                 "artifact ({t}, driver code {d}). Two things to check: is it listed in the " ++
                 "gompute.exportKernels(.{{ ... }}) call in your kernels root, and does the " ++
-                ".kernels_root you passed to emitKernels point at that same file?",
-            .{ err, iface.last_driver_error.code },
+                "root you passed to emitKernels point at that same file?",
+            .{ name, err, iface.last_driver_error.code },
         );
         return err;
     };

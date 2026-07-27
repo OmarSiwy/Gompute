@@ -135,13 +135,40 @@ pub const DeviceImportsFn = *const fn (
     ctx: ?*anyopaque,
 ) []const std.Build.Module.Import;
 
+/// One independently compiled kernel root.
+///
+/// Each root becomes its own `zig build-obj` per backend, so the build runner
+/// compiles them on its thread pool and caches them separately: editing one root
+/// rebuilds that root only. Kernel names must not repeat across roots.
+pub const KernelRoot = struct {
+    /// Artifact id, unique within one emitKernels/addKernels call. Shows up in
+    /// object names and in diagnostics; keep it a plain identifier.
+    name: []const u8,
+    root: std.Build.LazyPath,
+    /// Extra imports for this root, on top of `gompute`.
+    imports: ?DeviceImportsFn = null,
+    /// Passed through to `imports` untouched.
+    imports_ctx: ?*anyopaque = null,
+    /// Marks a root whose device compilation is big enough that running it
+    /// alongside the other big ones is a memory problem rather than a speedup.
+    /// Heavy roots are chained into `heavy_lanes` serial lanes; light roots run
+    /// unconstrained.
+    heavy: bool = false,
+};
+
 pub const EmitOptions = struct {
-    kernels_root: std.Build.LazyPath,
-    /// Extra imports for the kernel root, on top of `gompute`. Leave null when
+    /// The single-root form. Equivalent to one `kernel_roots` entry; the two may
+    /// be combined, and at least one of them must be set.
+    kernels_root: ?std.Build.LazyPath = null,
+    /// Extra imports for `kernels_root`, on top of `gompute`. Leave null when
     /// the kernel root imports nothing of its own.
     imports: ?DeviceImportsFn = null,
     /// Passed through to `imports` untouched.
     imports_ctx: ?*anyopaque = null,
+    /// Roots compiled independently and in parallel. See `KernelRoot`.
+    kernel_roots: []const KernelRoot = &.{},
+    /// How many `heavy` roots may compile at once. 1 means fully serial.
+    heavy_lanes: u8 = 1,
     cuda: CudaOptions = .{},
     hip: HipOptions = .{},
     /// Host target (from standardTargetOptions). Defaults to the host
@@ -183,21 +210,16 @@ pub fn build(b: *std.Build) void {
     host_mod.addImport("gompute_kernels", b.createModule(.{
         .root_source_file = b.addWriteFiles().add("gompute_kernels.zig",
             \\//! Placeholder: gompute.emitKernels was never called in this build.
+            \\const std = @import("std");
             \\pub const emitted = false;
             \\pub const has_cuda = false;
             \\pub const has_hip = false;
-            \\pub const cuda: [:0]const u8 = "";
-            \\pub const hip: [:0]const u8 = "";
-            \\pub const cuda_names = struct {
-            \\    pub fn resolve(comptime name: []const u8) [:0]const u8 {
-            \\        @compileError("no GPU artifacts were emitted for: " ++ name);
-            \\    }
-            \\};
-            \\pub const hip_names = struct {
-            \\    pub fn resolve(comptime name: []const u8) [:0]const u8 {
-            \\        @compileError("no GPU artifacts were emitted for: " ++ name);
-            \\    }
-            \\};
+            \\pub const Entry = struct { blob: u16, symbol: [:0]const u8 };
+            \\pub const root_names: []const []const u8 = &.{};
+            \\pub const cuda_images: []const [:0]const u8 = &.{};
+            \\pub const hip_images: []const [:0]const u8 = &.{};
+            \\pub const cuda_index = std.StaticStringMap(Entry).initComptime(.{});
+            \\pub const hip_index = std.StaticStringMap(Entry).initComptime(.{});
             \\
         ),
     }));
@@ -238,17 +260,17 @@ pub fn build(b: *std.Build) void {
     }).step);
 }
 
-/// `gompute` plus whatever `options.imports` builds for this backend.
+/// `gompute` plus whatever `root.imports` builds for this backend.
 fn deviceImports(
     b: *std.Build,
     dep: *std.Build.Dependency,
-    options: EmitOptions,
+    root: KernelRoot,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
 ) []const std.Build.Module.Import {
     // `&.{base}` would return a pointer to a stack temporary; always allocate.
-    const extra: []const std.Build.Module.Import = if (options.imports) |build_extra|
-        build_extra(b, target, optimize, options.imports_ctx)
+    const extra: []const std.Build.Module.Import = if (root.imports) |build_extra|
+        build_extra(b, target, optimize, root.imports_ctx)
     else
         &.{};
 
@@ -258,7 +280,65 @@ fn deviceImports(
     return all;
 }
 
-/// Builds the CUDA PTX and HIP HSACO sub-compilations for one kernel root and
+/// `options.kernels_root` and `options.kernel_roots` as one list, checked.
+fn normalizeRoots(b: *std.Build, options: EmitOptions) []const KernelRoot {
+    var roots: std.ArrayList(KernelRoot) = .empty;
+    if (options.kernels_root) |path| roots.append(b.allocator, .{
+        .name = "kernels",
+        .root = path,
+        .imports = options.imports,
+        .imports_ctx = options.imports_ctx,
+    }) catch @panic("OOM");
+    roots.appendSlice(b.allocator, options.kernel_roots) catch @panic("OOM");
+
+    if (roots.items.len == 0) @panic("gompute: no kernels to emit. Set .kernels_root (one root) " ++
+        "or .kernel_roots (several, compiled in parallel and cached separately).");
+    // Names become object-file names and blob indices; a collision would make
+    // one root silently overwrite the other's artifact.
+    for (roots.items, 0..) |a, i| for (roots.items[i + 1 ..]) |c| {
+        if (std.mem.eql(u8, a.name, c.name)) std.debug.panic(
+            "gompute: two kernel roots are both named \"{s}\". Root names must be unique " ++
+                "(note that .kernels_root takes the name \"kernels\").",
+            .{a.name},
+        );
+    };
+    return roots.items;
+}
+
+/// One kernel root's outputs for one backend.
+const RootArtifacts = struct {
+    /// PTX (CUDA) or HSACO (HIP), ready to `@embedFile`.
+    blob: std.Build.LazyPath,
+    /// The generated `exported -> internal` name table for this root.
+    names: std.Build.LazyPath,
+};
+
+/// Serializes `heavy` roots into `lanes` chains, leaving light roots free.
+///
+/// A plain `dependOn` edge between two unrelated compilations is a false
+/// dependency, which only constrains ordering -- exactly what is wanted. 37
+/// concurrent LLVM processes on 140k-line device models is an OOM, not a
+/// speedup.
+const HeavyLanes = struct {
+    last: []?*std.Build.Step,
+    next: usize = 0,
+
+    fn init(b: *std.Build, lanes: u8) HeavyLanes {
+        const n = @max(lanes, 1);
+        const slots = b.allocator.alloc(?*std.Build.Step, n) catch @panic("OOM");
+        @memset(slots, null);
+        return .{ .last = slots };
+    }
+
+    fn chain(self: *HeavyLanes, step: *std.Build.Step) void {
+        const lane = self.next % self.last.len;
+        self.next += 1;
+        if (self.last[lane]) |prev| step.dependOn(prev);
+        self.last[lane] = step;
+    }
+};
+
+/// Builds the CUDA PTX and HIP HSACO sub-compilations for every kernel root and
 /// wraps them in a generated `gompute_kernels` module. Shared by `emitKernels`
 /// and `addKernels`; the two differ only in who gets the resulting module.
 fn buildArtifacts(
@@ -268,6 +348,7 @@ fn buildArtifacts(
     host_target: std.Build.ResolvedTarget,
     host_optimize: std.builtin.OptimizeMode,
 ) *std.Build.Module {
+    const roots = normalizeRoots(b, options);
     const tool = b.addExecutable(.{
         .name = "gompute-kernel-ir-tool",
         .root_module = b.createModule(.{
@@ -276,11 +357,6 @@ fn buildArtifacts(
             .optimize = .Debug,
         }),
     });
-
-    var cuda_ptx: ?std.Build.LazyPath = null;
-    var hip_hsaco: ?std.Build.LazyPath = null;
-    var hip_names: ?std.Build.LazyPath = null;
-    var cuda_names: ?std.Build.LazyPath = null;
 
     const optimize = deviceOptimize(host_optimize);
     // CUDA/HIP drivers do not exist on the web; skip the native backends there.
@@ -295,6 +371,11 @@ fn buildArtifacts(
     else
         resolveGpu(b, "hip", "gfx1100", options.hip.gpu, detectHipGpu);
 
+    const cuda_out = b.allocator.alloc(RootArtifacts, roots.len) catch @panic("OOM");
+    const hip_out = b.allocator.alloc(RootArtifacts, roots.len) catch @panic("OOM");
+    var cuda_lanes: HeavyLanes = .init(b, options.heavy_lanes);
+    var hip_lanes: HeavyLanes = .init(b, options.heavy_lanes);
+
     if (cuda_cpu) |cpu| {
         const query = std.Target.Query.parse(.{
             .arch_os_abi = "nvptx64-cuda",
@@ -306,33 +387,40 @@ fn buildArtifacts(
         );
         const target = b.resolveTargetQuery(query);
         const mode = if (options.cuda.optimize) |m| deviceOptimize(m) else optimize;
-        const gpu_mod = b.createModule(.{
-            .root_source_file = options.kernels_root,
-            .target = target,
-            .optimize = mode,
-            // Debug info in device IR makes the PTX claim DWARF it doesn't
-            // have; the CUDA driver then rejects the module (error 218).
-            .strip = true,
-            .imports = deviceImports(b, dep, options, target, mode),
-        });
-        const object = b.addObject(.{ .name = "gompute_cuda_ir", .root_module = gpu_mod });
-        const rewrite = b.addRunArtifact(tool);
-        rewrite.addFileArg(object.getEmittedLlvmIr());
-        const rewritten_ir = rewrite.addOutputFileArg("gompute_cuda.ll");
-        cuda_names = rewrite.addOutputFileArg("gompute_cuda_names.zig");
+        for (roots, cuda_out) |root, *out| {
+            const gpu_mod = b.createModule(.{
+                .root_source_file = root.root,
+                .target = target,
+                .optimize = mode,
+                // Debug info in device IR makes the PTX claim DWARF it doesn't
+                // have; the CUDA driver then rejects the module (error 218).
+                .strip = true,
+                .imports = deviceImports(b, dep, root, target, mode),
+            });
+            const object = b.addObject(.{
+                .name = b.fmt("gompute_cuda_ir_{s}", .{root.name}),
+                .root_module = gpu_mod,
+            });
+            if (root.heavy) cuda_lanes.chain(&object.step);
 
-        const assemble = b.addSystemCommand(&.{
-            b.graph.zig_exe,
-            "cc",
-            "-target",
-            "nvptx64-cuda",
-            b.fmt("-mcpu={s}", .{cuda_cpu.?}),
-            "-S",
-            "-g0", // nvptx rejects dwarf debug info; keeps stderr clean
-            "-Wno-unused-command-line-argument",
-        });
-        assemble.addFileArg(rewritten_ir);
-        cuda_ptx = assemble.addPrefixedOutputFileArg("-o", "gompute.ptx");
+            const rewrite = b.addRunArtifact(tool);
+            rewrite.addFileArg(object.getEmittedLlvmIr());
+            const rewritten_ir = rewrite.addOutputFileArg(b.fmt("gompute_cuda_{s}.ll", .{root.name}));
+            out.names = rewrite.addOutputFileArg(b.fmt("gompute_cuda_names_{s}.zig", .{root.name}));
+
+            const assemble = b.addSystemCommand(&.{
+                b.graph.zig_exe,
+                "cc",
+                "-target",
+                "nvptx64-cuda",
+                b.fmt("-mcpu={s}", .{cpu}),
+                "-S",
+                "-g0", // nvptx rejects dwarf debug info; keeps stderr clean
+                "-Wno-unused-command-line-argument",
+            });
+            assemble.addFileArg(rewritten_ir);
+            out.blob = assemble.addPrefixedOutputFileArg("-o", b.fmt("gompute_{s}.ptx", .{root.name}));
+        }
     }
 
     if (hip_cpu) |cpu| {
@@ -346,52 +434,145 @@ fn buildArtifacts(
         );
         const target = b.resolveTargetQuery(query);
         const mode = if (options.hip.optimize) |m| deviceOptimize(m) else optimize;
-        const gpu_mod = b.createModule(.{
-            .root_source_file = options.kernels_root,
-            .target = target,
-            .optimize = mode,
-            .strip = true,
-            .imports = deviceImports(b, dep, options, target, mode),
-        });
-        const object = b.addObject(.{ .name = "gompute_hip_obj", .root_module = gpu_mod });
+        for (roots, hip_out) |root, *out| {
+            const gpu_mod = b.createModule(.{
+                .root_source_file = root.root,
+                .target = target,
+                .optimize = mode,
+                .strip = true,
+                .imports = deviceImports(b, dep, root, target, mode),
+            });
+            const object = b.addObject(.{
+                .name = b.fmt("gompute_hip_obj_{s}", .{root.name}),
+                .root_module = gpu_mod,
+            });
+            if (root.heavy) hip_lanes.chain(&object.step);
 
-        const names_run = b.addRunArtifact(tool);
-        names_run.addFileArg(object.getEmittedLlvmIr());
-        _ = names_run.addOutputFileArg("gompute_hip_rewritten.ll");
-        hip_names = names_run.addOutputFileArg("gompute_hip_names.zig");
+            const names_run = b.addRunArtifact(tool);
+            names_run.addFileArg(object.getEmittedLlvmIr());
+            _ = names_run.addOutputFileArg(b.fmt("gompute_hip_rewritten_{s}.ll", .{root.name}));
+            out.names = names_run.addOutputFileArg(b.fmt("gompute_hip_names_{s}.zig", .{root.name}));
 
-        const link = b.addSystemCommand(&.{ b.graph.zig_exe, "ld.lld", "-shared" });
-        link.addFileArg(object.getEmittedBin());
-        hip_hsaco = link.addPrefixedOutputFileArg("-o", "gompute.hsaco");
+            const link = b.addSystemCommand(&.{ b.graph.zig_exe, "ld.lld", "-shared" });
+            link.addFileArg(object.getEmittedBin());
+            out.blob = link.addPrefixedOutputFileArg("-o", b.fmt("gompute_{s}.hsaco", .{root.name}));
+        }
     }
 
     const write = b.addWriteFiles();
-    const artifacts_source = write.add("gompute_kernels.zig", b.fmt(
-        \\//! Generated by gompute.emitKernels.
+    const artifacts_source = write.add("gompute_kernels.zig", artifactsSource(
+        b,
+        roots,
+        cuda_cpu != null,
+        hip_cpu != null,
+    ));
+    const artifacts_mod = b.createModule(.{ .root_source_file = artifacts_source });
+    for (roots, cuda_out, hip_out, 0..) |_, cuda, hip, i| {
+        if (cuda_cpu != null) {
+            artifacts_mod.addAnonymousImport(b.fmt("cuda_blob_{d}", .{i}), .{ .root_source_file = cuda.blob });
+            artifacts_mod.addAnonymousImport(b.fmt("cuda_names_{d}", .{i}), .{ .root_source_file = cuda.names });
+        }
+        if (hip_cpu != null) {
+            artifacts_mod.addAnonymousImport(b.fmt("hip_blob_{d}", .{i}), .{ .root_source_file = hip.blob });
+            artifacts_mod.addAnonymousImport(b.fmt("hip_names_{d}", .{i}), .{ .root_source_file = hip.names });
+        }
+    }
+    return artifacts_mod;
+}
+
+/// The generated `gompute_kernels` module: the blobs, plus one comptime
+/// name -> (blob, symbol) map per backend merged from the per-root tables the
+/// IR tool emitted. `src/host/kernel.zig` reads both.
+fn artifactsSource(
+    b: *std.Build,
+    roots: []const KernelRoot,
+    has_cuda: bool,
+    has_hip: bool,
+) []const u8 {
+    var out: std.Io.Writer.Allocating = .init(b.allocator);
+    const w = &out.writer;
+
+    w.print(
+        \\//! Generated by gompute.emitKernels. Do not edit.
+        \\const std = @import("std");
+        \\
         \\pub const emitted = true;
         \\pub const has_cuda = {};
         \\pub const has_hip = {};
-        \\pub const cuda: [:0]const u8 = if (has_cuda) @embedFile("cuda_blob") else "";
-        \\pub const hip: [:0]const u8 = if (has_hip) @embedFile("hip_blob") else "";
-        \\pub const cuda_names = if (has_cuda) @import("cuda_names") else struct {{
-        \\    pub fn resolve(comptime name: []const u8) [:0]const u8 {{
-        \\        @compileError("no CUDA artifacts were emitted for: " ++ name);
-        \\    }}
-        \\}};
-        \\pub const hip_names = if (has_hip) @import("hip_names") else struct {{
-        \\    pub fn resolve(comptime _: []const u8) [:0]const u8 {{
-        \\        @compileError("HIP artifacts were not emitted");
-        \\    }}
-        \\}};
         \\
-    , .{ cuda_cpu != null, hip_cpu != null }));
+        \\/// Kernel roots, in blob order.
+        \\pub const root_names = [_][]const u8{{
+        \\
+    , .{ has_cuda, has_hip }) catch @panic("OOM");
+    for (roots) |root| w.print("    \"{f}\",\n", .{std.zig.fmtString(root.name)}) catch @panic("OOM");
 
-    const artifacts_mod = b.createModule(.{ .root_source_file = artifacts_source });
-    if (cuda_ptx) |path| artifacts_mod.addAnonymousImport("cuda_blob", .{ .root_source_file = path });
-    if (hip_hsaco) |path| artifacts_mod.addAnonymousImport("hip_blob", .{ .root_source_file = path });
-    if (hip_names) |path| artifacts_mod.addAnonymousImport("hip_names", .{ .root_source_file = path });
-    if (cuda_names) |path| artifacts_mod.addAnonymousImport("cuda_names", .{ .root_source_file = path });
-    return artifacts_mod;
+    w.writeAll(
+        \\};
+        \\
+        \\/// Where a kernel lives: which blob, and its symbol name inside it.
+        \\pub const Entry = struct { blob: u16, symbol: [:0]const u8 };
+        \\const KV = struct { []const u8, Entry };
+        \\
+        \\/// Fold one root's name table into the merged map. `mangled` is HIP,
+        \\/// whose entry points keep the mangled Zig symbol; a CUDA entry point is
+        \\/// the exported name itself.
+        \\///
+        \\/// ponytail: O(kernels^2) duplicate scan, at comptime. Fine into the
+        \\/// hundreds; sort first if a consumer ever gets to thousands.
+        \\fn merge(
+        \\    comptime kvs: []const KV,
+        \\    comptime blob: u16,
+        \\    comptime table: anytype,
+        \\    comptime mangled: bool,
+        \\) []const KV {
+        \\    @setEvalBranchQuota(100_000);
+        \\    var out = kvs;
+        \\    for (table) |e| {
+        \\        for (out) |prev| if (std.mem.eql(u8, prev[0], e.exported)) @compileError(
+        \\            "gompute: kernel \"" ++ e.exported ++ "\" is exported by two kernel roots (" ++
+        \\                root_names[prev[1].blob] ++ " and " ++ root_names[blob] ++
+        \\                "). A kernel name is the run-time dispatch key, so it must name one root.",
+        \\        );
+        \\        out = out ++ .{KV{ e.exported, .{
+        \\            .blob = blob,
+        \\            .symbol = if (mangled) e.internal else e.exported,
+        \\        } }};
+        \\    }
+        \\    return out;
+        \\}
+        \\
+        \\
+    ) catch @panic("OOM");
+
+    for ([_]struct { []const u8, bool, bool }{
+        .{ "cuda", has_cuda, false },
+        .{ "hip", has_hip, true },
+    }) |backend| {
+        const tag, const present, const mangled = backend;
+        if (!present) {
+            w.print(
+                \\pub const {s}_images: []const [:0]const u8 = &.{{}};
+                \\pub const {s}_index = std.StaticStringMap(Entry).initComptime(.{{}});
+                \\
+                \\
+            , .{ tag, tag }) catch @panic("OOM");
+            continue;
+        }
+        w.print("pub const {s}_images = [_][:0]const u8{{\n", .{tag}) catch @panic("OOM");
+        for (roots, 0..) |_, i| w.print("    @embedFile(\"{s}_blob_{d}\"),\n", .{ tag, i }) catch @panic("OOM");
+        w.print(
+            \\}};
+            \\pub const {s}_index = std.StaticStringMap(Entry).initComptime(blk: {{
+            \\    var kv: []const KV = &.{{}};
+            \\
+        , .{tag}) catch @panic("OOM");
+        for (roots, 0..) |_, i| w.print(
+            "    kv = merge(kv, {d}, @import(\"{s}_names_{d}\").entries, {});\n",
+            .{ i, tag, i, mangled },
+        ) catch @panic("OOM");
+        w.writeAll("    break :blk kv;\n});\n\n") catch @panic("OOM");
+    }
+    return out.written();
 }
 
 /// Add CUDA PTX and HIP HSACO sub-compilations for a designated kernel root,
@@ -414,6 +595,20 @@ fn buildArtifacts(
 ///     });
 ///
 /// If the kernel root imports modules of its own, also set `.imports`.
+///
+/// For several roots, use `.kernel_roots`: each is its own sub-compilation, so
+/// they compile on the build runner's thread pool and cache separately -- an
+/// edit to one root rebuilds that root alone. Kernel names must be unique
+/// across roots, since a name is what run-time dispatch looks up.
+///
+///     gompute_build.emitKernels(b, dep, exe, .{
+///         .kernel_roots = &.{
+///             .{ .name = "bsim4", .root = b.path("src/bsim4.zig"), .heavy = true },
+///             .{ .name = "hisim", .root = b.path("src/hisim.zig"), .heavy = true },
+///             .{ .name = "vbic", .root = b.path("src/vbic.zig") },
+///         },
+///         .heavy_lanes = 2,
+///     });
 pub fn emitKernels(
     b: *std.Build,
     dep: *std.Build.Dependency,
@@ -443,14 +638,20 @@ pub fn emitKernels(
 }
 
 pub const KernelsOptions = struct {
-    root_source_file: std.Build.LazyPath,
+    /// The single-root form. Equivalent to one `kernel_roots` entry; the two may
+    /// be combined, and at least one of them must be set.
+    root_source_file: ?std.Build.LazyPath = null,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
-    /// Extra imports for the kernel root, on top of `gompute`. Leave null when
-    /// the kernel root imports nothing of its own.
+    /// Extra imports for `root_source_file`, on top of `gompute`. Leave null
+    /// when the kernel root imports nothing of its own.
     imports: ?DeviceImportsFn = null,
     /// Passed through to `imports` untouched.
     imports_ctx: ?*anyopaque = null,
+    /// Roots compiled independently and in parallel. See `KernelRoot`.
+    kernel_roots: []const KernelRoot = &.{},
+    /// How many `heavy` roots may compile at once. 1 means fully serial.
+    heavy_lanes: u8 = 1,
     cuda: CudaOptions = .{},
     hip: HipOptions = .{},
 };
@@ -482,6 +683,8 @@ pub fn addKernels(b: *std.Build, dep: *std.Build.Dependency, o: KernelsOptions) 
         .kernels_root = o.root_source_file,
         .imports = o.imports,
         .imports_ctx = o.imports_ctx,
+        .kernel_roots = o.kernel_roots,
+        .heavy_lanes = o.heavy_lanes,
         .cuda = o.cuda,
         .hip = o.hip,
         .target = o.target,

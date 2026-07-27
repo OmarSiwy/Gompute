@@ -282,6 +282,61 @@ host-built module dragged into device code would silently keep the host's
 optimize mode — which is how a `Debug` import ends up inside an otherwise
 `ReleaseFast` device build.
 
+### Several kernel roots
+
+One `kernels_root` is one `zig build-obj` per backend: no parallelism, and an
+edit to any kernel recompiles all of them. `.kernel_roots` splits that into one
+sub-compilation per root, which the build runner schedules on its thread pool
+and caches independently.
+
+```zig
+gompute_build.emitKernels(b, dep, exe, .{
+    .kernel_roots = &.{
+        .{ .name = "hisim", .root = b.path("src/hisim.zig"), .heavy = true },
+        .{ .name = "bsimsoi", .root = b.path("src/bsimsoi.zig"), .heavy = true },
+        .{ .name = "vbic", .root = b.path("src/vbic.zig") },
+    },
+    .heavy_lanes = 2,
+});
+```
+
+Each root may carry its own `.imports`/`.imports_ctx`. `.kernels_root` still
+works and may be combined with `.kernel_roots`; it becomes a root named
+`"kernels"`. `addKernels` takes the same two fields.
+
+`.heavy = true` marks a root whose device compilation is big enough that running
+it next to the other big ones costs memory rather than saving time. Heavy roots
+are chained into `heavy_lanes` serial lanes with ordinary build-graph edges;
+light roots run unconstrained.
+
+Kernel names must be unique across roots — a duplicate is a compile error naming
+both roots — because the name is what run-time dispatch looks up.
+
+### Picking a kernel at run time
+
+The set of kernels is closed at build time, but which one a given run launches
+need not be. `rawKernelByName` looks a name up in a `StaticStringMap` built at
+compile time from every root's name table, then loads only the blob that holds
+it:
+
+```zig
+const model = netlist.deviceModel();          // decided at run time
+var kernel = g.rawKernelByName(.cuda, model, 0) catch |err| switch (err) {
+    error.KernelNotFound => return reportUnknownModel(model),
+    else => return err,
+};
+defer kernel.deinit();
+try kernel.launch(grid, block, 0, &args);
+```
+
+An unknown name is `error.KernelNotFound`, not a panic. The comptime paths —
+`Kernel(spec, .cuda)`, `RawKernel(name, .cuda)` — resolve through the same map
+at compile time, so a kernel that is in no root is still a compile error.
+
+Either way only the one root that exports the kernel is JIT'd, and the runtime
+caches it per `(device, blob)`, so a process that touches 3 of 37 models pays
+for 3.
+
 ### 4. Select a backend
 
 ```zig
@@ -434,6 +489,9 @@ For shared memory, barriers, multidimensional indexing, textures, or a custom
 ABI, use a raw kernel and the low-level runtime modules.
 
 ## Artifact pipeline
+
+Run once per kernel root; the per-root name tables are then merged into one
+comptime name -> `(blob, symbol)` map in the generated `gompute_kernels` module.
 
 ### CUDA
 

@@ -185,34 +185,32 @@ fn rewriteIr(arena: std.mem.Allocator, input: []const u8, aliases: []const Alias
 
 /// Public entry name -> symbol as it appears in the *unrewritten* object, which
 /// is what HIP loads. CUDA loads the rewritten module, where the entry is the
-/// public name itself, so a CUDA caller discards the result and keeps the name
-/// it asked for -- it calls `resolve` only for the missing-kernel compile error.
+/// public name itself, so a CUDA caller ignores `internal` and keeps the name it
+/// asked for -- it reads this table only to know the kernel is in the artifact.
+///
+/// A plain table rather than a `resolve` function: `emitKernels` merges one of
+/// these per kernel root into a single comptime name -> (blob, symbol) map, and
+/// a chain of comptime `if`s cannot be merged.
 fn emitMap(arena: std.mem.Allocator, aliases: []const Alias) ![]const u8 {
     var map_source: std.ArrayList(u8) = .empty;
     try map_source.appendSlice(arena,
         \\//! Generated from LLVM aliases. Do not edit.
         \\//!
-        \\//! `resolve` returns the symbol name in the HIP artifact. In the CUDA
-        \\//! artifact the entry is the exported name itself; call it there only
-        \\//! to turn a missing kernel into a compile error.
-        \\const std = @import("std");
+        \\//! `internal` is the symbol name in the HIP artifact. In the CUDA
+        \\//! artifact the entry point is `exported` itself.
+        \\pub const Entry = struct { exported: [:0]const u8, internal: [:0]const u8 };
         \\
-        \\pub fn resolve(comptime exported: []const u8) [:0]const u8 {
+        \\pub const entries = [_]Entry{
         \\
     );
     for (aliases) |alias| {
-        try map_source.appendSlice(arena, "    if (comptime std.mem.eql(u8, exported, ");
+        try map_source.appendSlice(arena, "    .{ .exported = ");
         try appendZigString(&map_source, arena, alias.name);
-        try map_source.appendSlice(arena, ")) return ");
+        try map_source.appendSlice(arena, ", .internal = ");
         try appendZigString(&map_source, arena, try decodeLlvmName(arena, alias.aliasee));
-        try map_source.appendSlice(arena, ";\n");
+        try map_source.appendSlice(arena, " },\n");
     }
-    try map_source.appendSlice(arena,
-        \\    @compileError("kernel \"" ++ exported ++ "\" is not in the GPU artifact; " ++
-        \\        "export it from your `.kernels_root` file with `comptime { g.exportKernels(@This()); }`");
-        \\}
-        \\
-    );
+    try map_source.appendSlice(arena, "};\n");
     return map_source.items;
 }
 
@@ -308,7 +306,11 @@ test "string constants survive the rewrite and stay out of the name map" {
 
     const map = try emitMap(arena, &.{.{ .name = "add", .aliasee = "kernels.add" }});
     try std.testing.expect(std.mem.indexOf(u8, map, ".str") == null);
-    try std.testing.expect(std.mem.indexOf(u8, map, "\"add\")) return \"kernels.add\";") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        map,
+        ".{ .exported = \"add\", .internal = \"kernels.add\" },",
+    ) != null);
 }
 
 test "cloning a shared definition copies the whole body" {

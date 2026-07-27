@@ -11,7 +11,36 @@ pub fn RawKernel(comptime entry_name: [:0]const u8, comptime backend: host.Backe
     };
 }
 
-fn GpuRaw(comptime entry_name: [:0]const u8, comptime gpu: host.Gpu) type {
+/// The handle `rawKernelByName` returns: a `RawKernel` whose kernel was picked
+/// at run time, so it has no comptime `init` of its own.
+pub fn RawByName(comptime backend: host.Backend) type {
+    return switch (backend) {
+        .cuda => host.requireArtifacts(host.gpu_cuda, GpuRaw(null, host.gpu_cuda)),
+        .hip => host.requireArtifacts(host.gpu_hip, GpuRaw(null, host.gpu_hip)),
+        .cpu => @compileError("kernel-by-name is device-only; use a normal Zig function on CPU"),
+    };
+}
+
+/// Load the kernel called `name`, decided at run time -- from a parsed netlist,
+/// a config file, a CLI flag. The set of kernels is closed at build time, so an
+/// unknown name is `error.KernelNotFound` rather than a panic, and only the one
+/// root that exports it is JIT'd.
+pub fn rawKernelByName(
+    comptime backend: host.Backend,
+    name: []const u8,
+    ordinal: c_int,
+) iface.Error!RawByName(backend) {
+    const gpu = switch (backend) {
+        .cuda => host.gpu_cuda,
+        .hip => host.gpu_hip,
+        .cpu => comptime unreachable, // RawByName already rejected .cpu
+    };
+    const opened = try host.openModuleByName(gpu, name, ordinal);
+    return .{ .context = opened.context, .module = opened.module, .kernel = opened.kernel };
+}
+
+/// `entry_name` is null for a handle whose kernel is chosen at run time.
+fn GpuRaw(comptime entry_name: ?[:0]const u8, comptime gpu: host.Gpu) type {
     return struct {
         const Self = @This();
         pub const Buffer = gpu.rt.Buffer;
@@ -24,7 +53,10 @@ fn GpuRaw(comptime entry_name: [:0]const u8, comptime gpu: host.Gpu) type {
         /// JIT'd copy of the artifact, so this is cheap after the first one and
         /// a `Buffer` from any handle is valid in all of them.
         pub fn init(ordinal: c_int) iface.Error!Self {
-            const opened = try host.openModule(gpu, entry_name, ordinal);
+            const name = entry_name orelse
+                @compileError("gompute: this handle came from rawKernelByName, which already " ++
+                    "loaded its kernel; there is nothing for init() to name.");
+            const opened = try host.openModule(gpu, name, ordinal);
             return .{ .context = opened.context, .module = opened.module, .kernel = opened.kernel };
         }
 

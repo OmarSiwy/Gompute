@@ -129,11 +129,15 @@ fn loadApiLocked() Error!void {
 // the device's *primary* context: refcounted by the driver, and the same one
 // the CUDA runtime API and libraries like cuBLAS use, so we interoperate.
 //
-// ponytail: fixed tables sized for one node -- 16 devices, 16 distinct module
+// ponytail: fixed tables sized for one node -- 16 devices, 64 distinct module
 // images. Overflow degrades to uncached, not to wrong. Swap in a hash map only
 // if someone ships a box past that ceiling.
+//
+// 64 rather than 16 because one artifact per kernel root means the image count
+// is now the root count times the devices in use, not 1: a 37-model consumer on
+// one GPU used to blow a 16-slot table and re-JIT on every handle.
 const max_devices = 16;
-const max_modules = 16;
+const max_modules = 64;
 
 const CtxSlot = struct { device: CUdevice = 0, ctx: CUcontext = null };
 var ctx_slots: [max_devices]CtxSlot = @splat(.{});
@@ -214,6 +218,22 @@ fn loadModuleCached(ordinal: c_int, image: [:0]const u8) Error!Module {
     const slot = free_slot orelse return .{ .module = m, .cached = false };
     slot.* = .{ .ordinal = ordinal, .image = image, .module = m };
     return .{ .module = m, .cached = true };
+}
+
+/// How many distinct (device, image) modules are currently JIT'd.
+///
+/// With one artifact per kernel root, this is the count of roots this process
+/// has actually paid to compile -- the thing a consumer with 37 device models
+/// wants to stay at 1. ponytail: CUDA only; add the HIP twin when someone has
+/// the hardware to check it on.
+pub fn loadedModuleCount() usize {
+    acquire();
+    defer lock.unlock();
+    var n: usize = 0;
+    for (&module_slots) |*s| {
+        if (s.module != null) n += 1;
+    }
+    return n;
 }
 
 /// Unload every cached module and release every retained primary context.

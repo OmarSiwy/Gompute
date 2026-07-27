@@ -1,6 +1,7 @@
 const std = @import("std");
 const g = @import("gompute");
 const k = @import("kernels");
+const k2 = @import("kernels2");
 
 const print = std.debug.print;
 
@@ -49,6 +50,9 @@ pub fn main() !void {
 
     // ── Runtime dynamic backend ─────────────────────────────────────────
     testRuntimeDynamic();
+
+    // ── Second kernel root + run-time kernel selection ──────────────────
+    testSecondRoot();
 
     // ── Comptime CPU reference (sanity baseline) ────────────────────────
     testCpuReference();
@@ -257,6 +261,71 @@ fn testAutoLarge() void {
 
 // ── Runtime dynamic: module load + buffer + kernel launch ───────────────
 
+/// The multi-root pipeline: `src/kernels2.zig` is a second, separately compiled
+/// artifact. Proves the merged name map reaches both roots, that a name decided
+/// at run time resolves into the right blob, and that an unknown one is an
+/// error rather than a panic.
+fn testSecondRoot() void {
+    print("\n[second root]\n", .{});
+    if (!g.AutoKernel(k2.add_offset).Cuda.available) {
+        print("  no CUDA artifacts, skipping\n", .{});
+        return;
+    }
+    const loaded = g.runtime.cuda.loadedModuleCount;
+    const before = loaded();
+
+    // Comptime-named, from the second root.
+    var kernel = g.Kernel(k2.add_offset, .cuda).init(0) catch |e| {
+        print("  init failed: {s}\n", .{@errorName(e)});
+        return;
+    };
+    defer kernel.deinit();
+    var data = [_]f32{ 1, 2, 3 };
+    kernel.run(&data, .{ .offset = 10 }) catch |e| {
+        print("  run failed: {s}\n", .{@errorName(e)});
+        return;
+    };
+    check("second_root_result", allApproxEq(&data, &[_]f32{ 11, 12, 13 }));
+    // One root loaded, not both: the other blob is never JIT'd.
+    check("second_root_loaded_one_blob", loaded() == before + 1);
+
+    // A name the compiler cannot see: chosen from a run-time value.
+    var buf: [16]u8 = undefined;
+    var buf2: [16]u8 = undefined;
+    const chosen = std.fmt.bufPrint(&buf, "raw_{s}", .{if (data[0] > 0) "triple" else "nope"}) catch return;
+    var by_name = g.rawKernelByName(.cuda, chosen, 0) catch |e| {
+        print("  rawKernelByName failed: {s}\n", .{@errorName(e)});
+        return;
+    };
+    defer by_name.deinit();
+    check("runtime_named_kernel_resolved", true);
+
+    var device_buf = by_name.alloc(3 * @sizeOf(f32)) catch return;
+    defer device_buf.free();
+    var host_data = [_]f32{ 1, 2, 3 };
+    device_buf.upload(@ptrCast(&host_data), @sizeOf(@TypeOf(host_data))) catch return;
+    var len: u64 = 3;
+    by_name.launch(.{ .x = 1 }, .{ .x = 256 }, 0, &.{ device_buf.argPtr(), g.interface.arg(&len) }) catch return;
+    by_name.synchronize() catch return;
+    device_buf.download(@ptrCast(&host_data), @sizeOf(@TypeOf(host_data))) catch return;
+    check("runtime_named_kernel_result", allApproxEq(&host_data, &[_]f32{ 3, 6, 9 }));
+
+    // An unknown name is an error, not a panic.
+    const bogus = std.fmt.bufPrint(&buf2, "raw_{s}", .{if (data[0] > 0) "nope" else "triple"}) catch return;
+    if (g.rawKernelByName(.cuda, bogus, 0)) |_| {
+        check("unknown_runtime_name_errors", false);
+    } else |err| {
+        check("unknown_runtime_name_errors", err == error.KernelNotFound);
+        print("  \"{s}\" -> {s}\n", .{ bogus, @errorName(err) });
+    }
+    print("  add_offset {any}, {s} {any}, blobs loaded {d}\n", .{
+        data,
+        chosen,
+        host_data,
+        loaded(),
+    });
+}
+
 fn testRuntimeDynamic() void {
     print("\n[runtime.dynamic] ", .{});
     const rt = g.runtime.dynamic;
@@ -274,14 +343,15 @@ fn testRuntimeDynamic() void {
         return;
     }
 
-    // Load compiled kernel module
+    // Load the compiled kernel module. One artifact per kernel root, so ask the
+    // generated index which blob holds the kernel we are about to launch.
     const artifacts = @import("gompute_kernels");
     const image: [:0]const u8 = switch (gpu.backend) {
-        .cuda => if (artifacts.has_cuda) artifacts.cuda else {
+        .cuda => if (artifacts.has_cuda) artifacts.cuda_images[artifacts.cuda_index.get("scale_relu").?.blob] else {
             print("  no CUDA artifacts\n", .{});
             return;
         },
-        .hip => if (artifacts.has_hip) artifacts.hip else {
+        .hip => if (artifacts.has_hip) artifacts.hip_images[artifacts.hip_index.get("scale_relu").?.blob] else {
             print("  no HIP artifacts\n", .{});
             return;
         },
