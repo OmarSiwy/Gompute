@@ -57,9 +57,16 @@ fn detectHipGpu(b: *std.Build) ?[]const u8 {
 
 /// Debug device code drags std.builtin panic globals into the module and
 /// LLVM's NVPTX backend emits invalid PTX types (.u2/.u4/.u5) for them.
-/// ReleaseSafe keeps safety checks and produces valid PTX.
+/// ReleaseFast removes the panic machinery outright rather than optimizing it,
+/// so it serves that goal strictly better than ReleaseSafe -- and far cheaper:
+/// ReleaseSafe keeps a panic edge per operation, which sends the LLVM pipeline
+/// superlinear on large straight-line kernels (32x on a 140k-line device model,
+/// 443s vs 13.6s; measured by the ARPice consumer across 37 models).
+///
+/// ponytail: no way to ask for on-device safety checks. Add an EmitOptions
+/// knob if someone wants them, but quote the compile cost above first.
 fn deviceOptimize(mode: std.builtin.OptimizeMode) std.builtin.OptimizeMode {
-    return if (mode == .Debug) .ReleaseSafe else mode;
+    return if (mode == .Debug) .ReleaseFast else mode;
 }
 
 pub const EmitOptions = struct {
