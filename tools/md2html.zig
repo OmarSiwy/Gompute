@@ -91,6 +91,63 @@ fn inlineSpans(out: *Writer, a: std.mem.Allocator, src: []const u8) void {
     }
 }
 
+/// Which stylesheet class a token gets, or null to leave it in the body colour.
+/// Six classes total -- keyword, builtin, string, number, type, comment -- which
+/// is as far as colour helps before it turns into noise.
+fn tokenClass(tag: std.zig.Token.Tag, text: []const u8) ?[]const u8 {
+    return switch (tag) {
+        .builtin => "hl-b",
+        .string_literal, .multiline_string_literal_line, .char_literal => "hl-s",
+        .number_literal => "hl-n",
+        .doc_comment, .container_doc_comment => "hl-c",
+        // Zig has no reserved type names, so this is a convention check, not a
+        // parse: primitives, plus the TitleCase names the ecosystem uses.
+        .identifier => if (std.zig.primitives.isPrimitive(text) or std.ascii.isUpper(text[0]))
+            "hl-t"
+        else
+            null,
+        else => if (std.mem.startsWith(u8, @tagName(tag), "keyword_")) "hl-k" else null,
+    };
+}
+
+fn span(out: *Writer, a: std.mem.Allocator, class: []const u8, text: []const u8) void {
+    put(out, a, "<span class=\"");
+    put(out, a, class);
+    put(out, a, "\">");
+    escape(out, a, text);
+    put(out, a, "</span>");
+}
+
+/// The text between two tokens: whitespace, and `//` comments, which the
+/// tokenizer skips rather than reporting.
+fn betweenTokens(out: *Writer, a: std.mem.Allocator, text: []const u8) void {
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, text, i, "//")) |start| {
+        escape(out, a, text[i..start]);
+        const end = std.mem.indexOfScalarPos(u8, text, start, '\n') orelse text.len;
+        span(out, a, "hl-c", text[start..end]);
+        i = end;
+    }
+    escape(out, a, text[i..]);
+}
+
+/// Colour a ```zig block with the compiler's own tokenizer, so the docs cannot
+/// disagree with the language about what a keyword is. Everything is escaped on
+/// the way out, exactly as an unhighlighted block would be.
+fn highlightZig(out: *Writer, a: std.mem.Allocator, src: []const u8) void {
+    const buf = a.dupeZ(u8, src) catch @panic("OOM");
+    var tokenizer = std.zig.Tokenizer.init(buf);
+    var prev: usize = 0;
+    while (true) {
+        const token = tokenizer.next();
+        betweenTokens(out, a, buf[prev..token.loc.start]);
+        if (token.tag == .eof) break;
+        const text = buf[token.loc.start..token.loc.end];
+        if (tokenClass(token.tag, text)) |class| span(out, a, class, text) else escape(out, a, text);
+        prev = token.loc.end;
+    }
+}
+
 fn slug(a: std.mem.Allocator, text: []const u8) []const u8 {
     var s: Writer = .empty;
     var dash = false;
@@ -154,15 +211,22 @@ pub fn render(a: std.mem.Allocator, src: []const u8) Rendered {
             continue;
         }
 
-        // Fenced code. Contents are literal: no inline processing at all.
+        // Fenced code. Contents are literal: no inline processing at all. The
+        // info string picks the highlighter; anything but `zig` stays plain.
         if (std.mem.startsWith(u8, line, "```")) {
-            put(&body, a, "<pre><code>");
+            const lang = std.mem.trim(u8, line[3..], " \t");
+            var block: Writer = .empty;
             i += 1;
             while (i < lines.items.len and !std.mem.startsWith(u8, lines.items[i], "```")) : (i += 1) {
-                escape(&body, a, lines.items[i]);
-                put(&body, a, "\n");
+                block.appendSlice(a, lines.items[i]) catch @panic("OOM");
+                block.append(a, '\n') catch @panic("OOM");
             }
             i += 1; // closing fence
+            put(&body, a, "<pre><code>");
+            if (std.mem.eql(u8, lang, "zig"))
+                highlightZig(&body, a, block.items)
+            else
+                escape(&body, a, block.items);
             put(&body, a, "</code></pre>\n");
             continue;
         }
@@ -322,10 +386,37 @@ test "headings carry slug ids and the h1 becomes the title" {
 test "fenced code is literal: markup inside it is not interpreted" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const body = renderBody(arena.allocator(), "```zig\nconst x = a[i] * *p; // **not bold**\n```\n");
+    const body = renderBody(arena.allocator(), "```\nconst x = a[i] * *p; // **not bold**\n```\n");
     try std.testing.expect(std.mem.indexOf(u8, body, "<strong>") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "<em>") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "a[i] * *p; // **not bold**") != null);
+}
+
+test "a zig fence is highlighted, and highlighting still escapes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const body = renderBody(
+        arena.allocator(),
+        "```zig\nconst n: u32 = 1; // **not bold** <b>\nconst S = @import(\"s\");\n```\n",
+    );
+    try std.testing.expect(std.mem.indexOf(u8, body, "<span class=\"hl-k\">const</span>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "<span class=\"hl-t\">u32</span>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "<span class=\"hl-n\">1</span>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "<span class=\"hl-b\">@import</span>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "<span class=\"hl-s\">&quot;s&quot;</span>") != null);
+    // The comment runs to end of line, is one span, and is still escaped.
+    try std.testing.expect(std.mem.indexOf(u8, body, "<span class=\"hl-c\">// **not bold** &lt;b&gt;</span>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "<strong>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "<b>") == null);
+}
+
+test "an unterminated string in a zig fence does not swallow the rest" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    // The tokenizer reports `.invalid` here; the block must still round-trip.
+    const body = renderBody(arena.allocator(), "```zig\nconst s = \"oops\nconst n = 2;\n```\n");
+    try std.testing.expect(std.mem.indexOf(u8, body, "oops") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "2") != null);
 }
 
 test "html in the source is escaped, not passed through" {

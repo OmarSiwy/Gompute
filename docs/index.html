@@ -15,6 +15,8 @@
   <a href="build.html">Build</a>
   <a href="reference.html">Reference</a>
   <a href="advanced.html">Advanced</a>
+  <a href="runtime.html">Runtime</a>
+  <a href="troubleshooting.html">Fixes</a>
   <a href="api/">API</a>
   <span class="spacer"></span>
   <a href="https://github.com/OmarSiwy/Gompute">GitHub</a>
@@ -46,26 +48,26 @@
     <h2>Define once</h2>
     <!-- Kept deliberately short. docs/guide.md is the source of truth; this is
          a shop window, not documentation. -->
-<pre><code><span class="c">// src/kernels.zig</span>
-<span class="k">const</span> g = @import(<span class="s">"gompute"</span>);
+<pre><code><span class="hl-c">// src/kernels.zig</span>
+<span class="hl-k">const</span> g = <span class="hl-b">@import</span>(<span class="hl-s">"gompute"</span>);
 
-<span class="k">pub const</span> Params = <span class="k">struct</span> { scale: f32 };
+<span class="hl-k">pub</span> <span class="hl-k">const</span> <span class="hl-t">Params</span> = <span class="hl-k">struct</span> { scale: <span class="hl-t">f32</span> };
 
-<span class="k">fn</span> scaleRelu(x: f32, p: Params) f32 {
-    <span class="k">const</span> y = x * p.scale;
-    <span class="k">return if</span> (y &gt; 0) y <span class="k">else</span> 0;
+<span class="hl-k">fn</span> scaleRelu(x: <span class="hl-t">f32</span>, p: <span class="hl-t">Params</span>) <span class="hl-t">f32</span> {
+    <span class="hl-k">const</span> y = x * p.scale;
+    <span class="hl-k">return</span> <span class="hl-k">if</span> (y &gt; <span class="hl-n">0</span>) y <span class="hl-k">else</span> <span class="hl-n">0</span>;
 }
 
-<span class="k">pub const</span> scale_relu = g.map(<span class="s">"scale_relu"</span>, f32, Params, scaleRelu, .{});
+<span class="hl-k">pub</span> <span class="hl-k">const</span> scale_relu = g.map(<span class="hl-s">"scale_relu"</span>, <span class="hl-t">f32</span>, <span class="hl-t">Params</span>, scaleRelu, .{});
 
-<span class="k">comptime</span> { g.exportKernels(@This()); }
+<span class="hl-k">comptime</span> { g.exportKernels(<span class="hl-b">@This</span>()); }
 </code></pre>
 
     <h2 style="margin-top:2.5rem">Run anywhere</h2>
-<pre><code><span class="c">// The backend is part of the type. This one is a direct inlined CPU loop.</span>
-<span class="k">var</span> kernel = <span class="k">try</span> g.Kernel(kernels.scale_relu, .cpu).init(0);
-<span class="k">defer</span> kernel.deinit();
-<span class="k">try</span> kernel.run(&amp;data, .{ .scale = 2 });
+<pre><code><span class="hl-c">// The backend is part of the type. This one is a direct inlined CPU loop.</span>
+<span class="hl-k">var</span> kernel = <span class="hl-k">try</span> g.<span class="hl-t">Kernel</span>(kernels.scale_relu, .cpu).init(<span class="hl-n">0</span>);
+<span class="hl-k">defer</span> kernel.deinit();
+<span class="hl-k">try</span> kernel.run(&amp;data, .{ .scale = <span class="hl-n">2</span> });
 </code></pre>
     <p style="color:var(--muted);font-size:0.94rem">
       Change <code>.cpu</code> to <code>.cuda</code> or <code>.hip</code> without touching the
@@ -107,6 +109,36 @@
         <p>Hand-written CUDA/HIP kernels ride the same artifact pipeline via
            <code>RawKernel</code>, for shared memory, barriers and custom ABIs.</p>
       </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Where to go</h2>
+    <div class="cards">
+      <a class="card" href="guide.html">
+        <h3>Guide →</h3>
+        <p>Install, define a kernel, add one build call, pick a backend.</p>
+      </a>
+      <a class="card" href="build.html">
+        <h3>Build integration →</h3>
+        <p>Pinning the device arch, multiple kernel roots, CI and Docker.</p>
+      </a>
+      <a class="card" href="reference.html">
+        <h3>Reference →</h3>
+        <p>Every operation, every error, the ABI rules, and device math accuracy.</p>
+      </a>
+      <a class="card" href="advanced.html">
+        <h3>Advanced →</h3>
+        <p>Buffer reuse, fusion, vectorized CPU kernels, raw kernels, custom ABIs.</p>
+      </a>
+      <a class="card" href="runtime.html">
+        <h3>Runtime →</h3>
+        <p>The layer under <code>Kernel</code>: modules, buffers, streams, launching by hand.</p>
+      </a>
+      <a class="card" href="troubleshooting.html">
+        <h3>Troubleshooting →</h3>
+        <p>What each error means and what to change, symptom first.</p>
+      </a>
     </div>
   </section>
 

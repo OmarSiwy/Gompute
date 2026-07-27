@@ -1,6 +1,35 @@
-/* Gompute docs. Hand-written, no framework, no build step, no web fonts.
-   Iosevka Nerd Font throughout -- proportional for prose, mono for code --
-   falling back to whatever the system has if it is not installed. */
+/* Gompute docs. Hand-written, no framework, no build step, no CDN.
+   Iosevka throughout: Aile (quasi-proportional) for prose, the monospaced
+   family for code. Subset and checked in -- see docs/fonts/README.md. */
+
+@font-face {
+  font-family: "Iosevka Aile Web";
+  src: url("fonts/iosevka-aile-400.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Iosevka Aile Web";
+  src: url("fonts/iosevka-aile-400-italic.woff2") format("woff2");
+  font-weight: 400;
+  font-style: italic;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Iosevka Aile Web";
+  src: url("fonts/iosevka-aile-600.woff2") format("woff2");
+  font-weight: 600;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Iosevka Web";
+  src: url("fonts/iosevka-400.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
 
 :root {
   --bg: #fbfbfd;
@@ -8,13 +37,22 @@
   --muted: #6c6c78;
   --line: #e6e6ec;
   --accent: #d4682a;
-  --code-bg: #f3f3f7;
+  --code-bg: #f5f5f8;
   --measure: 44rem;
 
-  --sans: "Iosevka Nerd Font Propo", "Iosevka Nerd Font", Iosevka,
+  --sans: "Iosevka Aile Web", "Iosevka Aile", "Iosevka Nerd Font Propo",
     ui-sans-serif, system-ui, sans-serif;
-  --mono: "Iosevka Nerd Font Mono", "Iosevka Nerd Font", Iosevka,
+  --mono: "Iosevka Web", Iosevka, "Iosevka Nerd Font Mono",
     ui-monospace, monospace;
+
+  /* Syntax. Warm for keywords, cool for the things keywords act on, so a
+     block reads as structure first and detail second. */
+  --hl-keyword: #b3593d;
+  --hl-builtin: #7a5bb5;
+  --hl-string: #3f7d4f;
+  --hl-number: #a8722a;
+  --hl-type: #2f6f8f;
+  --hl-comment: #8d8d99;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -25,6 +63,13 @@
     --line: #26262e;
     --accent: #f9a03f;
     --code-bg: #17171d;
+
+    --hl-keyword: #f08a63;
+    --hl-builtin: #b79ae8;
+    --hl-string: #7fbf8f;
+    --hl-number: #e0b070;
+    --hl-type: #6fb4d6;
+    --hl-comment: #6f6f7c;
   }
 }
 
@@ -53,8 +98,9 @@ h1, h2, h3 { font-weight: 600; letter-spacing: -0.01em; }
 
 .nav {
   display: flex;
+  flex-wrap: wrap;
   align-items: baseline;
-  gap: 1.25rem;
+  gap: 0.4rem 1.25rem;
   max-width: var(--measure);
   margin: 0 auto;
   padding: 1.5rem 1.5rem 0;
@@ -124,11 +170,14 @@ pre code { background: none; padding: 0; font-size: 0.85rem; }
   padding: 0.1em 0.35em;
 }
 
-/* Minimal hand-applied highlighting for the landing snippet only. */
-.k { color: var(--accent); }
-.c { color: var(--muted); font-style: italic; }
-.s { color: #3f8f5f; }
-@media (prefers-color-scheme: dark) { .s { color: #7fbf8f; } }
+/* Token classes. tools/md2html.zig emits these from the Zig tokenizer for
+   ```zig blocks; the landing page applies the same names by hand. */
+.hl-k { color: var(--hl-keyword); }
+.hl-b { color: var(--hl-builtin); }
+.hl-s { color: var(--hl-string); }
+.hl-n { color: var(--hl-number); }
+.hl-t { color: var(--hl-type); }
+.hl-c { color: var(--hl-comment); font-style: italic; }
 
 /* ---- cards ---- */
 

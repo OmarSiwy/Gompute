@@ -204,3 +204,16 @@ nix build        # documentation site
 nix flake check  # zig build test
 nix develop      # Zig + ROCm/CUDA library paths
 ```
+
+## Where to go next
+
+- [Build integration](build.html) — pinning the device arch (do this before you
+  ship anything), multiple kernel roots, what `.auto` gets wrong in CI.
+- [Reference](reference.html) — the full operation set, the error set, the ABI
+  rules, device math accuracy.
+- [Advanced](advanced.html) — hoisting the allocation out of `run`, fusion,
+  vectorized CPU kernels, hand-written raw kernels.
+- [Runtime](runtime.html) — the layer underneath `Kernel`: modules, buffers,
+  streams, launching by hand.
+- [Troubleshooting](troubleshooting.html) — when something fails at run time,
+  start here.

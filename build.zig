@@ -297,7 +297,16 @@ fn buildDocs(b: *std.Build, host_mod: *std.Build.Module, test_step: *std.Build.S
         .install_subdir = "docs/api",
     }).step);
 
-    for ([_][]const u8{ "index.html", "style.css" }) |asset| {
+    for ([_][]const u8{
+        "index.html",
+        "style.css",
+        // Subset Iosevka, checked in: see docs/fonts/README.md. 36 KB total,
+        // so the site needs no network and no font on the reader's machine.
+        "fonts/iosevka-400.woff2",
+        "fonts/iosevka-aile-400.woff2",
+        "fonts/iosevka-aile-400-italic.woff2",
+        "fonts/iosevka-aile-600.woff2",
+    }) |asset| {
         site.dependOn(&b.addInstallFileWithDir(
             b.path(b.fmt("docs/{s}", .{asset})),
             .prefix,

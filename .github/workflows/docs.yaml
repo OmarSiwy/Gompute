@@ -48,9 +48,16 @@ jobs:
               echo "template not substituted: $page"; exit 1
             fi
           done
-          for link in guide build reference advanced; do
-            grep -q "href=\"$link.html\"" zig-out/docs/index.html \
-              || { echo "index.html does not link to $link.html"; exit 1; }
+          # Derived from docs/, not hardcoded, so adding a page cannot leave
+          # the landing page silently unlinked.
+          for md in docs/*.md; do
+            link="$(basename "$md" .md).html"
+            grep -q "href=\"$link\"" zig-out/docs/index.html \
+              || { echo "index.html does not link to $link"; exit 1; }
+          done
+          # Every font the stylesheet asks for must actually be installed.
+          for font in $(grep -o 'fonts/[a-z0-9.-]*\.woff2' docs/style.css | sort -u); do
+            test -s "zig-out/docs/$font" || { echo "missing font: $font"; exit 1; }
           done
 
       - uses: actions/upload-pages-artifact@v3

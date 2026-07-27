@@ -25,6 +25,12 @@ try buffer.download(&data, bytes);
 `launch` creates only three stack-resident argument values: device pointer,
 length, and the generated extern parameter struct.
 
+`kernel.alloc` takes a count of **elements**; `Buffer` methods take **bytes**.
+`kernel.context` is the underlying `runtime.cuda.Context` / `runtime.hip.Context`,
+which is how you wait for a bare `launch` — it does not synchronize, and a
+device-side fault will not surface until you do. For partial transfers,
+device-to-device copies and streams, see [Runtime](runtime.html).
+
 ## Compile-time fusion
 
 Each operation type exposes `eval`. `Fused` expands an `inline for`, keeping
@@ -114,7 +120,20 @@ ignores the argument, while AMDGCN uses it — so the same code can be correct o
 CUDA and silently wrong on HIP.
 
 For shared memory, barriers, multidimensional indexing, textures, or a custom
-ABI, use a raw kernel and the low-level runtime modules under `g.runtime`.
+ABI, use a raw kernel and the low-level [runtime](runtime.html) modules under
+`g.runtime`.
+
+Inside a raw kernel, `g.builtins` has the rest of the device intrinsics:
+`localIdX()` for the thread's index within its block, `blockIdX()`, and
+`barrier()` for a block-wide execution barrier and shared-memory fence — every
+thread in the block must reach it, or NVIDIA hangs and AMD is undefined.
+`gridDimX()` exists on NVPTX only, since AMDGCN has no portable way to read it;
+pass the stride as a kernel argument instead, which is what the generated
+`reduce` kernels do. `g.builtins` is only present in the device compilation.
+
+If the kernel to launch is named by a config file rather than by your source,
+`g.rawKernelByName(.cuda, name, 0)` resolves it against the same compiled set
+and returns `error.KernelNotFound` for a name that is not there.
 
 ## Custom ABI boundaries
 

@@ -45,9 +45,66 @@ Things that are easy to get wrong because nothing in the API says them out loud.
 | Contexts and modules | Shared process-wide, per device. Two `Kernel`s on one GPU share one CUDA primary context and JIT the artifact once, so buffers allocated through one are usable by the other. `runtime.cuda.shutdown()` is the only real teardown. |
 | Threads | Safe. A context is made current per thread on first use. |
 | `Buffer` | `free()` is idempotent. Use-after-free is not checked. `upload`/`download` do not bounds-check against `Buffer.bytes` — the driver catches the overrun and you get `error.CopyFailed`. |
-| Errors | `Error` has 12 members. `lastDriverError()` returns the raw CUDA/HIP code behind the last failure, which is the only way to tell "no driver" from "out of memory". It is cleared on success. |
+| Errors | One flat set of 12, listed [below](#errors). `lastDriverError()` returns the raw CUDA/HIP code behind the last failure, which is the only way to tell "no driver" from "out of memory". It is cleared on success. |
 | `block_size` | Must be 1…1024. Not required to be a multiple of the warp/wave size, but anything else wastes part of every warp. |
 | Empty input | `run` on a zero-length slice returns without launching. |
+
+## Errors
+
+Every fallible call in the library returns from one set, `g.Error`. It is
+closed and flat on purpose: a caller that wants to distinguish "the machine has
+no GPU" from "this build shipped no PTX" should not have to match on a nested
+union.
+
+| Error | Raised when |
+| --- | --- |
+| `error.InitFailed` | The driver library is absent, or `cuInit`/`hipInit` failed. This is the *no GPU here* error. |
+| `error.NoDevice` | The ordinal passed to `init` names no device (`< 0`, or past the last one), or a device attribute query failed. |
+| `error.ContextFailed` | Retaining or making current the device's primary context failed. |
+| `error.SyncFailed` | `synchronize` on a context or stream failed, or a stream could not be created. Usually the *previous* launch faulted. |
+| `error.AllocFailed` | Device allocation failed — out of memory, or a zero-byte request. Also returned by `runtime.dynamic` `alloc` on the `.cpu` backend, which has no device memory. |
+| `error.ModuleLoadFailed` | The PTX/HSACO image was rejected by the driver. Almost always an arch mismatch: `sm_89` code on an `sm_75` card. |
+| `error.KernelNotFound` | The image loaded but holds no symbol by that name — a kernel missing from `exportKernels`, or a bad name passed to `rawKernelByName`. |
+| `error.LaunchFailed` | The driver refused the launch: block size over the device limit, a grid past `gridDim.x`, or bad arguments. |
+| `error.CopyFailed` | A host↔device or device↔device copy failed. An overrun past `Buffer.bytes` lands here, since the copy is not bounds-checked in-process. |
+| `error.InvalidArgument` | Caller-side validation: a null or freed `Buffer`, or a launch geometry `Dim3.linearChecked` will not express. |
+| `error.BackendUnavailable` | `Kernel(spec, .cuda)` was instantiated in a build that emitted no CUDA artifact. The type still compiles; `init` refuses. |
+| `error.UnsupportedBackend` | Reserved. Nothing returns it today. |
+
+The error tells you *which step* failed; `lastDriverError()` tells you *why*.
+
+```zig
+var kernel = g.Kernel(kernels.scale_relu, .cuda).init(0) catch |err| {
+    const drv = g.lastDriverError();
+    std.debug.print("{t}: {t} code {d}\n", .{ err, drv.backend, drv.code });
+    return err;
+};
+```
+
+`DriverError` is `struct { code: i64 = 0, backend: enum { none, cuda, hip } = .none }`.
+It is thread-local, and it is cleared on every *successful* driver call — so it
+describes the failure you just saw, not one from three calls ago. Codes are the
+vendor's own: `CUDA_ERROR_*` and `hipError_t`.
+
+See [Troubleshooting](troubleshooting.html) for what to do about each.
+
+## Launch geometry
+
+`Dim3` is the `extern struct { x: u32 = 1, y: u32 = 1, z: u32 = 1 }` both
+drivers expect. Generated kernels compute their own grid; you need this only
+for [`RawKernel`](advanced.html).
+
+| | |
+| --- | --- |
+| `Dim3.linear(n, block_x)` | The grid of `block_x`-wide blocks covering `n` elements. `n == 0` gives a zero grid — an empty range is not a fault. |
+| `Dim3.linearChecked(n, block_x)` | Same, as `Error!Dim3`. Rejects `n == 0`, `block_x == 0`, and any grid past `max_grid_x`. |
+| `Dim3.max_grid_x` | `2^31 - 1`, the cap both vendors put on `gridDim.x`. |
+
+`linear` **panics** where `linearChecked` returns `error.InvalidArgument`.
+That is deliberate: clamping would launch fewer blocks than there are elements
+and silently leave the tail of the buffer unprocessed, which is a wrong answer
+with no signal. Use `linearChecked` whenever the count comes from outside the
+program — a file header, a socket, argv.
 
 ## Naming
 
@@ -65,6 +122,59 @@ Two pairs are easy to confuse:
 
 `Unary` is `Fused` with a single operation; it exists so a bare `fn (T, Params) T`
 can be dropped into a `Fused` pipeline alongside op structs.
+
+## Kernel handles
+
+Three ways to hold a compiled spec. All of them expose the same `run`; they
+differ in when the backend is decided.
+
+| | Backend decided | |
+| --- | --- | --- |
+| `g.Kernel(spec, .cpu)` | Compile time | A direct inlined loop. `init` cannot fail; `deinit` is a no-op. |
+| `g.Kernel(spec, .cuda)` / `(spec, .hip)` | Compile time | `init(ordinal)` retains the device's primary context and loads the artifact. |
+| `g.AutoKernel(spec)` | First `init` call | Probes CUDA, then HIP, then falls back to the CPU. |
+
+`Kernel(spec, backend)` gives you:
+
+| | |
+| --- | --- |
+| `init(ordinal: c_int) Error!Self` | `ordinal` is the device index; `.cpu` ignores it. |
+| `deinit(self) void` | Releases your handle. Safe twice. Not device teardown — see `shutdown()`. |
+| `run(...) Error!...` | The whole operation, buffers included. Arguments per the [operation table](#operations). |
+| `backend: Backend` | Comptime constant. |
+| `available: bool` | Comptime constant: false if this build emitted no artifact for the backend, in which case `init` returns `error.BackendUnavailable`. |
+
+GPU instantiations add the pieces `run` is built out of, for when you want to
+hoist the allocation and the copies — see [Advanced](advanced.html):
+
+| | |
+| --- | --- |
+| `alloc(count: usize) Error!Buffer` | `count` **elements**, not bytes. (`RawKernel.alloc` takes bytes.) |
+| `launch(...) Error!void` | Launch only: no allocation, no copy, no synchronize. |
+| `context` | The underlying `runtime.cuda.Context` / `runtime.hip.Context`. `context.synchronize()` is how you wait for a bare `launch`. |
+| `Buffer` | The backend's buffer type. `void` on `.cpu`. |
+| `reduceBlocks(count: usize) u32` | Block count for a `reduce` launch, so you can size the partials buffer. |
+
+`AutoKernel(spec)` adds:
+
+| | |
+| --- | --- |
+| `init() Self` | Infallible. Cannot fail because the CPU path always exists. |
+| `initStrict() Error!Self` | Same probe, but a *broken* GPU artifact is fatal instead of a warning. |
+| `selected() Backend` | Which backend the probe actually chose. |
+| `Cpu` / `Cuda` / `Hip` | The three underlying handle types. |
+
+The distinction `initStrict` exists for: a missing driver means *no GPU on this
+machine*, and falling back to the CPU is correct. An artifact that is present
+and still fails to load means *this build is wrong* — wrong device arch, or a
+kernel left out of `exportKernels` — and quietly running 100× slower is not a
+service. `init` warns in that case; `initStrict` returns the error.
+
+```zig
+var kernel = g.AutoKernel(kernels.scale_relu).init();
+defer kernel.deinit();
+std.debug.assert(kernel.selected() == .cuda);
+```
 
 ## Operations
 
@@ -158,7 +268,26 @@ boundary. This is the escape hatch for manually decomposing a higher-level
 host value into a stable wire representation. All three must be declared
 together, and `gpu_layout` must be an `extern` or `packed` struct — a
 default-layout struct guarantees nothing about field order or padding across
-two separate compilations.
+two separate compilations. [Advanced](advanced.html) has a worked example.
+
+Generated `map` kernels do all of this for you. `g.abi` is exposed for the
+cases where you are building the launch yourself — a [`RawKernel`](advanced.html)
+that wants the same parameter struct, or a
+[low-level launch](runtime.html):
+
+| | |
+| --- | --- |
+| `g.abi.Boundary(T)` | The wire type derived from `T`. A compile error if `T` cannot cross, naming the offending field by its full path. |
+| `g.abi.pack(T, value)` | Host value → `Boundary(T)`. |
+| `g.abi.unpack(T, wire)` | `Boundary(T)` → host value. |
+| `g.abi.assertStable(T)` | Comptime-only check. Put it in a `comptime` block to fail the build the moment a field is added that cannot cross. |
+
+```zig
+comptime { g.abi.assertStable(Params); }
+
+var wire = g.abi.pack(Params, .{ .scale = 2 });
+var args = [_]g.interface.Arg{ buffer.argPtr(), g.interface.arg(&wire) };
+```
 
 ## Device math
 
@@ -167,13 +296,37 @@ targets emit no libcalls, so the backend fails with `no libcall available for
 fexp` or `Cannot select: fsin`. `g.math` provides device-safe replacements that
 forward to libm on the host:
 
-`exp exp2 log log2 log10 sin cos tan tanh sinh cosh pow sqrt rsqrt`
+Every one is `inline fn (x: anytype) @TypeOf(x)`, except `pow(x, y)`. They take
+`f16`, `f32`, `f64`, and vectors of those.
 
 Device `f32` uses the hardware approximation instructions; device `f64` uses
-software implementations; the host uses libm. Accuracy is documented per
-function — note that `log`/`sin` and friends are bounded *absolutely* by the
-hardware on device `f32`, so relative error is unbounded near their zeros.
-Compute in `f64` and cast if that matters.
+software implementations ported from musl; the host forwards to `std.math`.
+Measured on `sm_89`:
+
+| | Device `f32` | Device `f64` | Notes |
+| --- | --- | --- | --- |
+| `exp` | ≤3.7 ulp | ≤1 ulp | |
+| `exp2` | ≤1 ulp | ≤1 ulp | Exact for integer `x`. |
+| `log` | ≤3 ulp | ≤1 ulp | See the near-1 caveat below. |
+| `log2` | ≤4 ulp | ≤1 ulp | Same caveat. |
+| `log10` | ≤2 ulp | ≤1.1 ulp | Same caveat. |
+| `sin` | ~1e-6 **absolute** | ≤1 ulp | f64 matches glibc bit-for-bit over (0, 8]. |
+| `cos` | ~1e-6 **absolute** | ≤1 ulp | |
+| `tan` | sin/cos | sin/cos | 0.16 absolute at 3π/2 in f32; error blows up at the poles. |
+| `tanh` | ≤1.8 ulp | ≤1 ulp | |
+| `sinh` | ≤3.7 ulp | ≤1.4 ulp | |
+| `cosh` | ≤3.7 ulp | similar | Overflows to infinity just under x = ±710 in f64. |
+| `pow` | ≤3 ulp | ≤4 ulp | Integer y in ±64 is square-and-multiply, so exact. |
+| `sqrt` | exact | exact | Native instruction on both backends. |
+| `rsqrt` | exact | exact | `1/sqrt`, two IEEE ops — not the hardware approximation. |
+
+**The absolute-error caveat.** `sin`, `cos`, and the `log` family are bounded
+*absolutely* by the f32 hardware, not relatively. `lg2.approx.f32` is good to
+about 2^-21 of absolute error, which is fine for `log(1000)` and is pure noise
+for `log(1.0000001)`. Relative accuracy therefore collapses near each
+function's zeros: `log` near 1, `sin` near multiples of π, `cos` near π/2 + kπ.
+If you are doing `log1p`-style work in that neighbourhood, compute in `f64` and
+cast the result.
 
 ## Backend status
 
