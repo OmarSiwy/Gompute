@@ -283,15 +283,22 @@ pub fn build(b: *std.Build) void {
 fn buildDocs(b: *std.Build, host_mod: *std.Build.Module, test_step: *std.Build.Step) void {
     const docs_step = b.step("docs", "Build the documentation site into zig-out/docs");
 
+    // Everything the site is made of hangs off `site`, not off `docs` directly,
+    // so that `-Dopen` can be sequenced *after* the site without `docs`
+    // depending on the opener and the opener depending on `docs`.
+    const site = b.allocator.create(std.Build.Step) catch @panic("OOM");
+    site.* = std.Build.Step.init(.{ .id = .custom, .name = "docs site", .owner = b });
+    docs_step.dependOn(site);
+
     const api = b.addObject(.{ .name = "gompute", .root_module = host_mod });
-    docs_step.dependOn(&b.addInstallDirectory(.{
+    site.dependOn(&b.addInstallDirectory(.{
         .source_dir = api.getEmittedDocs(),
         .install_dir = .prefix,
         .install_subdir = "docs/api",
     }).step);
 
     for ([_][]const u8{ "index.html", "style.css" }) |asset| {
-        docs_step.dependOn(&b.addInstallFileWithDir(
+        site.dependOn(&b.addInstallFileWithDir(
             b.path(b.fmt("docs/{s}", .{asset})),
             .prefix,
             b.fmt("docs/{s}", .{asset}),
@@ -322,7 +329,7 @@ fn buildDocs(b: *std.Build, host_mod: *std.Build.Module, test_step: *std.Build.S
         run.addFileArg(b.path(b.fmt("docs/{s}", .{entry.name})));
         run.addFileArg(b.path("docs/page.template.html"));
         const out = run.addOutputFileArg(b.fmt("{s}.html", .{stem}));
-        docs_step.dependOn(&b.addInstallFileWithDir(
+        site.dependOn(&b.addInstallFileWithDir(
             out,
             .prefix,
             b.fmt("docs/{s}.html", .{stem}),
@@ -332,7 +339,7 @@ fn buildDocs(b: *std.Build, host_mod: *std.Build.Module, test_step: *std.Build.S
     // The renderer's own tests belong to `test`, not just `docs`, so
     // `nix flake check` covers them too.
     const md_tests = b.addRunArtifact(b.addTest(.{ .root_module = md2html.root_module }));
-    docs_step.dependOn(&md_tests.step);
+    site.dependOn(&md_tests.step);
     test_step.dependOn(&md_tests.step);
 
     // `zig build docs -Dopen` previews it. Opt-in, so CI can build the site
@@ -343,8 +350,10 @@ fn buildDocs(b: *std.Build, host_mod: *std.Build.Module, test_step: *std.Build.S
             else => "xdg-open",
         };
         const open = b.addSystemCommand(&.{opener});
-        open.addFileArg(b.path("zig-out/docs/index.html"));
-        open.step.dependOn(docs_step);
+        // The install path, not `b.path`: the file only exists once `site` ran.
+        open.addArg(b.getInstallPath(.prefix, "docs/index.html"));
+        open.has_side_effects = true;
+        open.step.dependOn(site);
         docs_step.dependOn(&open.step);
     }
 }
