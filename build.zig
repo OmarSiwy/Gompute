@@ -224,10 +224,28 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    // The probe used to be compiled and then never read, so the README's claim
+    // that the generated CPU kernel matches the hand-written loop was enforced
+    // by nobody. Compare the emitted assembly instead.
+    const codegen_check = b.addExecutable(.{
+        .name = "gompute-codegen-check",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/codegen_check.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    const run_codegen_check = b.addRunArtifact(codegen_check);
+    run_codegen_check.addFileArg(codegen_probe.getEmittedAsm());
+
+    const check_tests = b.addTest(.{ .root_module = codegen_check.root_module });
+    const run_check_tests = b.addRunArtifact(check_tests);
+
     const test_step = b.step("test", "Run Gompute unit tests");
     test_step.dependOn(&run_unit_tests.step);
     test_step.dependOn(&run_tool_tests.step);
-    test_step.dependOn(&codegen_probe.step);
+    test_step.dependOn(&run_check_tests.step);
+    test_step.dependOn(&run_codegen_check.step);
 
     const docs_obj = b.addObject(.{ .name = "gompute", .root_module = host_mod });
     const docs_step = b.step("docs", "Emit API documentation to zig-out/docs");
