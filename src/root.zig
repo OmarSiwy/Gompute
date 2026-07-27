@@ -6,6 +6,8 @@ pub const abi = @import("core/abi.zig");
 pub const fusion = @import("core/fusion.zig");
 pub const spec = @import("core/spec.zig");
 pub const interface = @import("core/interface.zig");
+/// Device-safe libm. Same source compiles host-side, forwarding to `std.math`.
+pub const math = @import("device/math.zig");
 
 const host = @import("host/kernel.zig");
 
@@ -69,6 +71,7 @@ pub fn lastDriverError() interface.DriverError {
 
 test {
     _ = abi;
+    _ = math;
     _ = fusion;
     _ = spec;
     _ = host;

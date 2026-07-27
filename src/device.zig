@@ -6,6 +6,7 @@ pub const abi = @import("core/abi.zig");
 pub const fusion = @import("core/fusion.zig");
 pub const spec = @import("core/spec.zig");
 pub const builtins = @import("device/builtins.zig");
+pub const math = @import("device/math.zig");
 
 pub const MapOptions = spec.MapOptions;
 pub const is_device = true;
