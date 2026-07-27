@@ -91,8 +91,9 @@ fn resolveGpu(
             if (detect(b)) |n| return n;
             std.log.warn(
                 "gompute: .auto found no " ++ backend ++ " GPU on this BUILD machine, so the " ++
-                    backend ++ " backend is compiled out: Kernel(spec, ." ++ backend ++
-                    ") returns error.BackendUnavailable at run time, on every deploy machine. " ++
+                    backend ++ " backend is compiled out. Kernel(spec, ." ++ backend ++
+                    ") is now a compile error, and AutoKernel will fall back to the CPU on " ++
+                    "every deploy machine no matter what hardware it has. " ++
                     "Pin it with ." ++ backend ++ " = .{{ .gpu = .{{ .name = \"" ++ example ++
                     "\" }} }}, or silence this with ." ++ backend ++ " = .{{ .enabled = false }}.",
                 .{},
