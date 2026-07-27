@@ -62,14 +62,18 @@ pub const Gpu = struct {
     /// Field names in the generated `gompute_kernels` module.
     has: []const u8,
     image: []const u8,
-    /// HIP entry points keep their mangled Zig name; look it up in `hip_names`.
+    /// HIP entry points keep their mangled Zig name; look it up in the name map.
     mangled: bool,
+    /// The generated name map. Both backends consult it -- only HIP needs the
+    /// result, but the lookup is what turns a missing kernel into a compile
+    /// error instead of a runtime KernelNotFound. See `openModule`.
+    names: []const u8,
     /// A device arch to name in diagnostics, so the fix is copy-pasteable.
     example_cpu: []const u8,
 };
 
-pub const gpu_cuda: Gpu = .{ .backend = .cuda, .rt = cuda, .has = "has_cuda", .image = "cuda", .mangled = false, .example_cpu = "sm_89" };
-pub const gpu_hip: Gpu = .{ .backend = .hip, .rt = hip, .has = "has_hip", .image = "hip", .mangled = true, .example_cpu = "gfx1100" };
+pub const gpu_cuda: Gpu = .{ .backend = .cuda, .rt = cuda, .has = "has_cuda", .image = "cuda", .names = "cuda_names", .mangled = false, .example_cpu = "sm_89" };
+pub const gpu_hip: Gpu = .{ .backend = .hip, .rt = hip, .has = "has_hip", .image = "hip", .names = "hip_names", .mangled = true, .example_cpu = "gfx1100" };
 
 /// Whether this build actually carries a device artifact for `gpu`.
 ///
@@ -140,10 +144,15 @@ pub fn openModule(comptime gpu: Gpu, comptime entry_name: [:0]const u8, ordinal:
         return err;
     };
     errdefer module.deinit();
-    const internal_name = comptime if (gpu.mangled)
-        artifacts.hip_names.resolve(entry_name)
-    else
-        entry_name;
+    // Resolve on BOTH backends. HIP needs the mangled symbol; CUDA launches the
+    // public name and throws the result away -- but the lookup itself is the
+    // check: a kernel missing from the artifact is a @compileError naming it,
+    // rather than a runtime KernelNotFound discovered on a customer's machine.
+    // Nothing else in the pipeline verified that a requested kernel was emitted.
+    const internal_name = comptime blk: {
+        const resolved = @field(artifacts, gpu.names).resolve(entry_name);
+        break :blk if (gpu.mangled) resolved else entry_name;
+    };
     const kernel = module.getKernel(internal_name.ptr) catch |err| {
         std.log.err(
             "gompute: " ++ tag ++ " kernel \"" ++ entry_name ++ "\" is not in the emitted " ++

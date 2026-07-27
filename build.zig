@@ -188,6 +188,11 @@ pub fn build(b: *std.Build) void {
             \\pub const has_hip = false;
             \\pub const cuda: [:0]const u8 = "";
             \\pub const hip: [:0]const u8 = "";
+            \\pub const cuda_names = struct {
+            \\    pub fn resolve(comptime name: []const u8) [:0]const u8 {
+            \\        @compileError("no GPU artifacts were emitted for: " ++ name);
+            \\    }
+            \\};
             \\pub const hip_names = struct {
             \\    pub fn resolve(comptime name: []const u8) [:0]const u8 {
             \\        @compileError("no GPU artifacts were emitted for: " ++ name);
@@ -275,6 +280,7 @@ fn buildArtifacts(
     var cuda_ptx: ?std.Build.LazyPath = null;
     var hip_hsaco: ?std.Build.LazyPath = null;
     var hip_names: ?std.Build.LazyPath = null;
+    var cuda_names: ?std.Build.LazyPath = null;
 
     const optimize = deviceOptimize(host_optimize);
     // CUDA/HIP drivers do not exist on the web; skip the native backends there.
@@ -313,7 +319,7 @@ fn buildArtifacts(
         const rewrite = b.addRunArtifact(tool);
         rewrite.addFileArg(object.getEmittedLlvmIr());
         const rewritten_ir = rewrite.addOutputFileArg("gompute_cuda.ll");
-        _ = rewrite.addOutputFileArg("gompute_cuda_names.zig");
+        cuda_names = rewrite.addOutputFileArg("gompute_cuda_names.zig");
 
         const assemble = b.addSystemCommand(&.{
             b.graph.zig_exe,
@@ -367,6 +373,11 @@ fn buildArtifacts(
         \\pub const has_hip = {};
         \\pub const cuda: [:0]const u8 = if (has_cuda) @embedFile("cuda_blob") else "";
         \\pub const hip: [:0]const u8 = if (has_hip) @embedFile("hip_blob") else "";
+        \\pub const cuda_names = if (has_cuda) @import("cuda_names") else struct {{
+        \\    pub fn resolve(comptime name: []const u8) [:0]const u8 {{
+        \\        @compileError("no CUDA artifacts were emitted for: " ++ name);
+        \\    }}
+        \\}};
         \\pub const hip_names = if (has_hip) @import("hip_names") else struct {{
         \\    pub fn resolve(comptime _: []const u8) [:0]const u8 {{
         \\        @compileError("HIP artifacts were not emitted");
@@ -379,6 +390,7 @@ fn buildArtifacts(
     if (cuda_ptx) |path| artifacts_mod.addAnonymousImport("cuda_blob", .{ .root_source_file = path });
     if (hip_hsaco) |path| artifacts_mod.addAnonymousImport("hip_blob", .{ .root_source_file = path });
     if (hip_names) |path| artifacts_mod.addAnonymousImport("hip_names", .{ .root_source_file = path });
+    if (cuda_names) |path| artifacts_mod.addAnonymousImport("cuda_names", .{ .root_source_file = path });
     return artifacts_mod;
 }
 
