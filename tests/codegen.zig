@@ -38,3 +38,61 @@ export fn gompute_inferred(data: [*]f32, len: usize, scale: f32) void {
     var kernel = g.Kernel(InferredSpec, .cpu).init(0) catch unreachable;
     kernel.run(data[0..len], .{ .scale = scale }) catch unreachable;
 }
+
+// ── The rest of the operation set, same test: `Kernel(Spec, .cpu)` has to
+// come out as the loop next to it, with no dispatch left over. ──────────────
+
+fn axpy(a: f32, b: f32, p: Params) f32 {
+    return a + b * p.scale;
+}
+const ZipSpec = g.zip("codegen_zip", f32, f32, f32, Params, axpy, .{});
+
+export fn gompute_zip(a: [*]const f32, b: [*]const f32, out: [*]f32, len: usize, scale: f32) void {
+    var kernel = g.Kernel(ZipSpec, .cpu).init(0) catch unreachable;
+    kernel.run(a[0..len], b[0..len], out[0..len], .{ .scale = scale }) catch unreachable;
+}
+
+export fn manual_zip(a: [*]const f32, b: [*]const f32, out: [*]f32, len: usize, scale: f32) void {
+    for (a[0..len], b[0..len], out[0..len]) |x, y, *o| o.* = x + y * scale;
+}
+
+const SumSpec = g.sum("codegen_sum", f32, Params, .{});
+
+export fn gompute_sum(data: [*]const f32, len: usize) f32 {
+    var kernel = g.Kernel(SumSpec, .cpu).init(0) catch unreachable;
+    return kernel.run(data[0..len], .{ .scale = 0 }) catch unreachable;
+}
+
+fn toU32(x: f32, p: Params) u32 {
+    return @intFromFloat(@max(x * p.scale, 0));
+}
+const MapToSpec = g.mapTo("codegen_map_to", f32, u32, Params, toU32, .{});
+
+export fn gompute_map_to(in: [*]const f32, out: [*]u32, len: usize, scale: f32) void {
+    var kernel = g.Kernel(MapToSpec, .cpu).init(0) catch unreachable;
+    kernel.run(in[0..len], out[0..len], .{ .scale = scale }) catch unreachable;
+}
+
+fn stripe(x: f32, i: u64, p: Params) f32 {
+    return x + @as(f32, @floatFromInt(i)) * p.scale;
+}
+const IndexedSpec = g.mapIndexed("codegen_indexed", f32, Params, stripe, .{});
+
+export fn gompute_indexed(data: [*]f32, len: usize, scale: f32) void {
+    var kernel = g.Kernel(IndexedSpec, .cpu).init(0) catch unreachable;
+    kernel.run(data[0..len], .{ .scale = scale }) catch unreachable;
+}
+
+const GatherSpec = g.gather("codegen_gather", f32, u32, .{});
+
+export fn gompute_gather(src: [*]const f32, idx: [*]const u32, out: [*]f32, n: usize, src_len: usize) void {
+    var kernel = g.Kernel(GatherSpec, .cpu).init(0) catch unreachable;
+    kernel.run(src[0..src_len], idx[0..n], out[0..n]) catch unreachable;
+}
+
+const ScatterSpec = g.scatter("codegen_scatter", f32, u32, .{});
+
+export fn gompute_scatter(src: [*]const f32, idx: [*]const u32, out: [*]f32, n: usize, out_len: usize) void {
+    var kernel = g.Kernel(ScatterSpec, .cpu).init(0) catch unreachable;
+    kernel.run(src[0..n], idx[0..n], out[0..out_len]) catch unreachable;
+}

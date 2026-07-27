@@ -344,6 +344,70 @@ try buffer.download(&data, bytes);
 `launch` creates only three stack-resident argument values: device pointer,
 length, and the generated extern parameter struct.
 
+## Operations
+
+Every constructor below returns a spec; `g.Kernel(spec, backend)` /
+`g.AutoKernel(spec)` give it a `run` whose arguments are the operation's
+buffers, positionally. All of them take `.{ .block_size = 256 }`-style options.
+
+| Constructor | `run` | Body |
+| --- | --- | --- |
+| `g.map(name, T, P, fn (T, P) T, o)` | `run(data: []T, p)` | in place |
+| `g.mapTo(name, In, Out, P, fn (In, P) Out, o)` | `run(in: []const In, out: []Out, p)` | out of place, type may change |
+| `g.zip(name, A, B, Out, P, fn (A, B, P) Out, o)` | `run(a: []const A, b: []const B, out: []Out, p)` | two inputs, separate buffers |
+| `g.mapIndexed(name, T, P, fn (T, u64, P) T, o)` | `run(data: []T, p)` | value plus linear index |
+| `g.reduce(name, T, P, combine, identity, o)` | `run(data: []const T, p) !T` | whole-buffer fold |
+| `g.sum` / `g.min` / `g.max` / `g.any` / `g.all` `(name, T, P, o)` | `run(data: []const T, p) !T` | `reduce` presets |
+| `g.gather(name, T, Idx, o)` | `run(src, idx, out)` | `out[i] = src[idx[i]]` |
+| `g.scatter(name, T, Idx, o)` | `run(src, idx, out)` | `out[idx[i]] = src[i]` |
+
+`zip` exists so `c = a + b` does not force you to pack the operands into one
+`[]struct { a: f32, b: f32 }`. That is array-of-structs, and it interleaves two
+streams that each want to be coalesced on their own.
+
+### Reduce
+
+`combine` must be associative and `identity` must be its neutral element: the
+device reassociates across threads and blocks, so the answer to a
+non-associative op changes with the launch geometry. Float addition is only
+approximately associative — expect the last bits to differ from a strict
+left-to-right CPU sum.
+
+`.pre` turns a reduce into Thrust's `transform_reduce` — sum of squares, L2
+norm, "how many match", "does any exceed k", each in one launch:
+
+```zig
+fn square(x: f64, _: Params) f64 { return x * x; }
+pub const l2sq = g.sum("l2sq", f64, Params, .{ .pre = &square });
+```
+
+The presets also set the `@reduce` op their CPU path uses. A custom `combine`
+stays scalar on the CPU: a generic `fn (T, T) T` cannot be lane-widened.
+
+### Gather and scatter
+
+Fixed bodies, no user function — reading `src` at an arbitrary offset needs a
+raw device pointer, and handing one to user code breaks the pure-scalar-function
+model that lets the same source run on the CPU.
+
+**Scatter with duplicate indices is nondeterministic.** Two threads writing one
+slot race, and which lands is unspecified on both vendors. There is no
+`scatterAdd`: combining duplicates needs a device float atomic, and
+`global_atomic_add_f32` is gfx9+/`--unsafe-fp-atomics` on AMD.
+
+An index at or past the end of the buffer it subscripts is skipped rather than
+written — it can never corrupt memory, but the two backends do not agree on
+what the untouched slot then holds. For `gather` that slot is unspecified; for
+`scatter`, elements no index selects keep their prior value.
+
+### Not provided
+
+Scan/prefix-sum, sort, 2-D/3-D launches, dynamic shared memory, and warp
+shuffles are deliberately absent. A correct decoupled-lookback scan needs
+memory-ordering guarantees this API cannot express; `shfl.sync` versus
+`ds_bpermute`/DPP with wave32-vs-wave64 has no portable spelling. Write those
+against [`RawKernel`](#hand-written-raw-kernels).
+
 ## Compile-time fusion
 
 Each operation type exposes `eval`. `Fused` expands an `inline for`, keeping
