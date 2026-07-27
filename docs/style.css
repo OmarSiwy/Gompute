@@ -1,0 +1,240 @@
+/* Gompute docs. Hand-written, no framework, no build step.
+   Styles both the landing page and the pandoc-rendered guide. */
+
+:root {
+  --bg: #fbfbfd;
+  --panel: #ffffff;
+  --fg: #1c1c22;
+  --muted: #61616b;
+  --line: #e5e5ec;
+  --accent: #d4682a;
+  --accent-soft: #fdf0e7;
+  --code-bg: #f5f5f8;
+  --radius: 12px;
+  --measure: 46rem;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #131317;
+    --panel: #1a1a20;
+    --fg: #e8e8ee;
+    --muted: #9a9aa6;
+    --line: #2b2b34;
+    --accent: #f9a03f;
+    --accent-soft: #2a2119;
+    --code-bg: #101015;
+  }
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+  font-size: 17px;
+  line-height: 1.65;
+  -webkit-font-smoothing: antialiased;
+}
+
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+code, pre, kbd {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+    "Liberation Mono", monospace;
+  font-size: 0.875em;
+}
+
+/* ---- chrome ---- */
+
+.nav {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+  padding: 0.85rem 1.5rem;
+  background: color-mix(in srgb, var(--bg) 88%, transparent);
+  backdrop-filter: saturate(1.6) blur(10px);
+  border-bottom: 1px solid var(--line);
+}
+
+.nav strong { font-weight: 650; letter-spacing: -0.01em; }
+.nav a { color: var(--muted); font-size: 0.95rem; }
+.nav a:hover { color: var(--fg); text-decoration: none; }
+.nav .spacer { flex: 1; }
+
+.wrap { max-width: var(--measure); margin: 0 auto; padding: 0 1.5rem 6rem; }
+.wide { max-width: 62rem; }
+
+/* ---- hero ---- */
+
+.hero { padding: 5rem 0 3rem; }
+
+.hero h1 {
+  margin: 0;
+  font-size: clamp(2.6rem, 7vw, 4rem);
+  font-weight: 700;
+  letter-spacing: -0.035em;
+  line-height: 1.05;
+}
+
+.hero .tagline {
+  margin: 1.1rem 0 0;
+  font-size: clamp(1.05rem, 2.4vw, 1.3rem);
+  color: var(--muted);
+  max-width: 34rem;
+}
+
+.pills { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 1.75rem 0 0; }
+
+.pill {
+  padding: 0.25rem 0.7rem;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  font-size: 0.8rem;
+  color: var(--muted);
+  background: var(--panel);
+}
+
+.pill.on { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
+
+.cta { display: flex; flex-wrap: wrap; gap: 0.75rem; margin-top: 2rem; }
+
+.btn {
+  display: inline-block;
+  padding: 0.6rem 1.15rem;
+  border-radius: var(--radius);
+  border: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--fg);
+  font-size: 0.95rem;
+  font-weight: 500;
+}
+.btn:hover { border-color: var(--accent); text-decoration: none; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.btn.primary:hover { filter: brightness(1.07); }
+
+/* ---- code ---- */
+
+pre {
+  background: var(--code-bg);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 1.1rem 1.25rem;
+  overflow-x: auto;
+  line-height: 1.55;
+}
+
+pre code { background: none; padding: 0; font-size: 0.85rem; }
+
+:not(pre) > code {
+  background: var(--code-bg);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 0.1em 0.38em;
+}
+
+/* Minimal hand-applied highlighting for the landing snippet only. */
+.k { color: var(--accent); }
+.c { color: var(--muted); font-style: italic; }
+.s { color: #3f8f5f; }
+@media (prefers-color-scheme: dark) { .s { color: #7fbf8f; } }
+
+/* ---- cards ---- */
+
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+  gap: 1rem;
+  margin: 2rem 0;
+}
+
+.card {
+  display: block;
+  padding: 1.25rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel);
+  color: inherit;
+}
+.card:hover { border-color: var(--accent); text-decoration: none; }
+.card h3 { margin: 0 0 0.4rem; font-size: 1rem; font-weight: 620; }
+.card p { margin: 0; color: var(--muted); font-size: 0.9rem; line-height: 1.5; }
+
+section { margin-top: 3.5rem; }
+section > h2 {
+  font-size: 1.45rem;
+  letter-spacing: -0.02em;
+  margin: 0 0 1rem;
+}
+
+.note {
+  border-left: 3px solid var(--accent);
+  background: var(--accent-soft);
+  padding: 0.85rem 1.1rem;
+  border-radius: 0 var(--radius) var(--radius) 0;
+  color: var(--fg);
+  font-size: 0.94rem;
+}
+
+footer {
+  border-top: 1px solid var(--line);
+  margin-top: 5rem;
+  padding-top: 1.5rem;
+  color: var(--muted);
+  font-size: 0.875rem;
+}
+
+/* ---- rendered markdown (pandoc guide) ---- */
+
+.guide h1 { font-size: 2.1rem; letter-spacing: -0.03em; margin: 0 0 0.5rem; }
+.guide h2 {
+  font-size: 1.5rem;
+  letter-spacing: -0.02em;
+  margin: 3rem 0 0.9rem;
+  padding-top: 0.6rem;
+  border-top: 1px solid var(--line);
+}
+.guide h3 { font-size: 1.15rem; margin: 2rem 0 0.6rem; }
+.guide table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1.25rem 0;
+  font-size: 0.9rem;
+  display: block;
+  overflow-x: auto;
+}
+.guide th, .guide td {
+  border: 1px solid var(--line);
+  padding: 0.5rem 0.7rem;
+  text-align: left;
+  vertical-align: top;
+}
+.guide th { background: var(--code-bg); font-weight: 600; }
+.guide blockquote {
+  margin: 1.25rem 0;
+  padding: 0.1rem 1.1rem;
+  border-left: 3px solid var(--line);
+  color: var(--muted);
+}
+.guide li { margin: 0.3rem 0; }
+
+#TOC {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 1rem 1.25rem;
+  margin: 1.5rem 0 2.5rem;
+  font-size: 0.9rem;
+}
+#TOC ul { margin: 0.3rem 0; padding-left: 1.1rem; }
+#TOC > ul { padding-left: 0; list-style: none; }
+#TOC a { color: var(--fg); }

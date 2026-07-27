@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>$title$</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<nav class="nav">
+  <strong><a href="index.html" style="color:inherit">Gompute</a></strong>
+  <a href="guide.html">Guide</a>
+  <a href="build.html">Build</a>
+  <a href="reference.html">Reference</a>
+  <a href="advanced.html">Advanced</a>
+  <a href="api/">API</a>
+  <span class="spacer"></span>
+  <a href="https://github.com/OmarSiwy/Gompute">GitHub</a>
+</nav>
+
+<div class="wrap guide">
+$if(toc)$
+<nav id="TOC" role="doc-toc">
+$toc$
+</nav>
+$endif$
+
+$body$
+
+<footer>
+  Source for this page lives in <code>docs/</code> in the repository. See the
+  <a href="api/">API reference</a> for generated signatures.
+</footer>
+</div>
+</body>
+</html>

@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gompute — one kernel, CPU or GPU, specialized at compile time</title>
+<meta name="description" content="A Zig 0.16 library for defining a one-dimensional GPU/CPU kernel once and specializing the whole abstraction at compile time. CUDA, HIP and native CPU backends.">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<nav class="nav">
+  <strong>Gompute</strong>
+  <a href="guide.html">Guide</a>
+  <a href="build.html">Build</a>
+  <a href="reference.html">Reference</a>
+  <a href="advanced.html">Advanced</a>
+  <a href="api/">API</a>
+  <span class="spacer"></span>
+  <a href="https://github.com/OmarSiwy/Gompute">GitHub</a>
+</nav>
+
+<div class="wrap">
+
+  <header class="hero">
+    <h1>One kernel.<br>CPU or GPU.</h1>
+    <p class="tagline">
+      Write a one-dimensional kernel once in Zig. Gompute specializes the whole
+      abstraction at compile time — the backend is part of the type, and the
+      CPU path compiles down to the loop you would have written by hand.
+    </p>
+    <div class="pills">
+      <span class="pill on">Zig 0.16</span>
+      <span class="pill">CUDA / PTX</span>
+      <span class="pill">HIP / HSACO</span>
+      <span class="pill">Native CPU</span>
+    </div>
+    <div class="cta">
+      <a class="btn primary" href="guide.html">Read the guide</a>
+      <a class="btn" href="api/">API reference</a>
+      <a class="btn" href="https://github.com/OmarSiwy/Gompute">Source</a>
+    </div>
+  </header>
+
+  <section>
+    <h2>Define once</h2>
+    <!-- Kept deliberately short. docs/guide.md is the source of truth; this is
+         a shop window, not documentation. -->
+<pre><code><span class="c">// src/kernels.zig</span>
+<span class="k">const</span> g = @import(<span class="s">"gompute"</span>);
+
+<span class="k">pub const</span> Params = <span class="k">struct</span> { scale: f32 };
+
+<span class="k">fn</span> scaleRelu(x: f32, p: Params) f32 {
+    <span class="k">const</span> y = x * p.scale;
+    <span class="k">return if</span> (y &gt; 0) y <span class="k">else</span> 0;
+}
+
+<span class="k">pub const</span> scale_relu = g.map(<span class="s">"scale_relu"</span>, f32, Params, scaleRelu, .{});
+
+<span class="k">comptime</span> { g.exportKernels(@This()); }
+</code></pre>
+
+    <h2 style="margin-top:2.5rem">Run anywhere</h2>
+<pre><code><span class="c">// The backend is part of the type. This one is a direct inlined CPU loop.</span>
+<span class="k">var</span> kernel = <span class="k">try</span> g.Kernel(kernels.scale_relu, .cpu).init(0);
+<span class="k">defer</span> kernel.deinit();
+<span class="k">try</span> kernel.run(&amp;data, .{ .scale = 2 });
+</code></pre>
+    <p style="color:var(--muted);font-size:0.94rem">
+      Change <code>.cpu</code> to <code>.cuda</code> or <code>.hip</code> without touching the
+      call site. Or use <code>AutoKernel</code> to probe at run time and fall back.
+    </p>
+  </section>
+
+  <section>
+    <h2>What you get</h2>
+    <div class="cards">
+      <div class="card">
+        <h3>No runtime residue</h3>
+        <p>The CPU backend monomorphizes to the hand-written loop. Enforced, not
+           claimed: the build compares the emitted assembly and fails on a diff.</p>
+      </div>
+      <div class="card">
+        <h3>One source, two compilations</h3>
+        <p>Your kernel file is compiled once for the host and once per GPU target.
+           Address spaces and thread indexing stay inside the generated entry point.</p>
+      </div>
+      <div class="card">
+        <h3>A derived, checked ABI</h3>
+        <p>Plain Zig structs become <code>extern</code> boundary types at compile time.
+           Anything without a stable representation is a compile error naming the field.</p>
+      </div>
+      <div class="card">
+        <h3>Compile-time fusion</h3>
+        <p><code>Fused</code> expands an <code>inline for</code>, keeping intermediates in
+           registers — one kernel launch, no intermediate buffer.</p>
+      </div>
+      <div class="card">
+        <h3>Device-safe math</h3>
+        <p><code>g.math</code> gives you <code>exp</code>, <code>log</code>, <code>sin</code>,
+           <code>tanh</code> and friends on NVPTX and AMDGCN, where the builtins simply
+           do not compile.</p>
+      </div>
+      <div class="card">
+        <h3>An escape hatch</h3>
+        <p>Hand-written CUDA/HIP kernels ride the same artifact pipeline via
+           <code>RawKernel</code>, for shared memory, barriers and custom ABIs.</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Install</h2>
+<pre><code>zig fetch --save git+https://github.com/OmarSiwy/Gompute.git</code></pre>
+    <p class="note">
+      Linux and macOS. The CUDA and HIP backends need
+      <code>linkSystemLibrary("c", .{})</code> on your executable — the drivers are
+      <code>dlopen</code>'d, and without libc Zig cannot resolve symbols out of them.
+    </p>
+  </section>
+
+  <footer>
+    Gompute is MIT licensed. This page and the
+    <a href="api/">API reference</a> are generated from the repository on every
+    push to <code>main</code>.
+  </footer>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,90 @@
+name: docs
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Least privilege plus what Pages deployment needs.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Never let two deploys race; queue instead of cancelling a half-finished one.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Install pandoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pandoc
+
+      # `zig build docs` only touches the library's own modules. It never calls
+      # emitKernels, so it needs no GPU and no driver on the runner.
+      - name: Build API reference
+        run: zig build docs
+
+      - name: Assemble site
+        run: |
+          set -euo pipefail
+          mkdir -p _site
+          cp docs/index.html docs/style.css _site/
+          cp -r zig-out/docs _site/api
+
+          # Pages are authored as Markdown under docs/ and rendered here, so the
+          # documentation stays as easy to edit as the README used to be.
+          for md in docs/*.md; do
+            name=$(basename "$md" .md)
+            title=$(head -n 1 "$md" | sed 's/^#\+[[:space:]]*//')
+            pandoc "$md" \
+              --from=gfm \
+              --to=html5 \
+              --standalone \
+              --toc --toc-depth=2 \
+              --template=docs/page.template.html \
+              --metadata title="Gompute — $title" \
+              --output "_site/$name.html"
+          done
+
+      # A silently empty or half-assembled site is worse than a failed build.
+      - name: Sanity-check the output
+        run: |
+          set -euo pipefail
+          for f in _site/index.html _site/style.css _site/api/index.html \
+                   _site/guide.html _site/build.html _site/reference.html _site/advanced.html; do
+            test -s "$f" || { echo "missing or empty: $f"; exit 1; }
+          done
+          # Every docs/*.md must have produced a page, and every nav link must resolve.
+          for md in docs/*.md; do
+            test -s "_site/$(basename "$md" .md).html" || { echo "unrendered: $md"; exit 1; }
+          done
+          for link in guide build reference advanced; do
+            grep -q "href=\"$link.html\"" _site/index.html \
+              || { echo "index.html does not link to $link.html"; exit 1; }
+          done
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
