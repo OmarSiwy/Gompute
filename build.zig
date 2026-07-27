@@ -224,6 +224,15 @@ pub fn build(b: *std.Build) void {
         ),
     }));
 
+    // The two modules and the stub above are the product; everything below is
+    // dev-only. A consumer's `b.dependency("gompute", ...)` runs this build()
+    // too, and `docs/` is deliberately absent from `.paths` (same reasoning as
+    // `examples`), so buildDocs panicked on a perfectly good dependency —
+    // "gompute: docs/ is missing", pointing at gompute's own build.zig from a
+    // consumer that did nothing wrong. pkg_hash is "" only for the root
+    // project, so this also spares consumers the test artifacts at configure.
+    if (b.pkg_hash.len != 0) return;
+
     const unit_tests = b.addTest(.{ .root_module = host_mod });
     const run_unit_tests = b.addRunArtifact(unit_tests);
 
