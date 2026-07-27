@@ -55,6 +55,22 @@ pub fn mapFn(
 
 pub const splat = spec.splat;
 
+/// The rest of the operation set. Aliases, not wrappers: repeating these
+/// signatures in both roots is two places to get them wrong.
+pub const mapTo = spec.MapTo;
+pub const zip = spec.Zip;
+pub const mapIndexed = spec.MapIndexed;
+pub const reduce = spec.Reduce;
+pub const sum = spec.Sum;
+pub const min = spec.Min;
+pub const max = spec.Max;
+pub const any = spec.Any;
+pub const all = spec.All;
+pub const gather = spec.Gather;
+pub const scatter = spec.Scatter;
+pub const ReduceOptions = spec.ReduceOptions;
+pub const Kind = spec.Kind;
+
 pub const Fused = fusion.Fused;
 pub const Unary = fusion.Unary;
 
