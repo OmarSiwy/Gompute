@@ -95,11 +95,19 @@ fn GpuKernel(comptime Spec: type, comptime gpu: Gpu) type {
         module: gpu.rt.Module,
         kernel: gpu.rt.Kernel,
 
+        /// (#3) Handles on the same device share one primary context and one
+        /// JIT'd copy of the artifact, so this is cheap after the first one and
+        /// a `Buffer` from any handle is valid in all of them.
         pub fn init(ordinal: c_int) iface.Error!Self {
             const opened = try openModule(gpu, Spec.entry_name, ordinal);
             return .{ .context = opened.context, .module = opened.module, .kernel = opened.kernel };
         }
 
+        /// (#3) Drops this handle only. The device context and the loaded module
+        /// are process-wide and shared with every other handle on the device, so
+        /// this no longer tears them down; call `gompute.runtime.<backend>
+        /// .shutdown()` if you genuinely want that. Still safe to call, still
+        /// safe to call on a handle nobody else shares.
         pub fn deinit(self: *Self) void {
             self.module.deinit();
             self.context.deinit();
@@ -117,6 +125,9 @@ fn GpuKernel(comptime Spec: type, comptime gpu: Gpu) type {
             params: Spec.Parameters,
         ) iface.Error!void {
             if (count == 0) return;
+            // A worker thread that has not touched this device yet has no current
+            // context; without this every launch off the main thread fails.
+            try self.context.makeCurrent();
             var len: u64 = @intCast(count);
             var packed_params = abi.pack(Spec.Parameters, params);
             var args = [_]iface.Arg{

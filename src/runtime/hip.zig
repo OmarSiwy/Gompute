@@ -19,6 +19,11 @@ const Api = struct {
     hipDeviceGet: *const fn (*hipDevice_t, c_int) callconv(.c) hipError_t,
     hipCtxCreate: *const fn (*hipCtx_t, c_uint, hipDevice_t) callconv(.c) hipError_t,
     hipCtxDestroy: *const fn (hipCtx_t) callconv(.c) hipError_t,
+    // Optional: present on ROCm >= 4.2, and the fields above are the fallback.
+    // An absent symbol must not sink the whole dlopen.
+    hipDevicePrimaryCtxRetain: ?*const fn (*hipCtx_t, hipDevice_t) callconv(.c) hipError_t,
+    hipDevicePrimaryCtxRelease: ?*const fn (hipDevice_t) callconv(.c) hipError_t,
+    hipCtxSetCurrent: ?*const fn (hipCtx_t) callconv(.c) hipError_t,
     hipDeviceSynchronize: *const fn () callconv(.c) hipError_t,
     hipModuleLoadData: *const fn (*hipModule_t, *const anyopaque) callconv(.c) hipError_t,
     hipModuleUnload: *const fn (hipModule_t) callconv(.c) hipError_t,
@@ -40,9 +45,17 @@ const Api = struct {
 var g: Api = undefined;
 var loaded = false;
 
+/// ponytail: see cuda.zig -- one spin-and-yield lock for dlopen plus both
+/// tables, taken on init-time paths only.
+var lock: std.atomic.Mutex = .unlocked;
+
+fn acquire() void {
+    while (!lock.tryLock()) std.Thread.yield() catch std.atomic.spinLoopHint();
+}
+
 const lib_names = switch (builtin.os.tag) {
     .windows => &[_][]const u8{"amdhip64.dll"},
-    else => &[_][]const u8{ "libamdhip64.so", "libamdhip64.so.6", "libamdhip64.so.5" },
+    else => &[_][]const u8{ "libamdhip64.so", "libamdhip64.so.7", "libamdhip64.so.6", "libamdhip64.so.5" },
 };
 
 fn openFirst(names: []const []const u8) ?std.DynLib {
@@ -52,13 +65,21 @@ fn openFirst(names: []const []const u8) ?std.DynLib {
     return null;
 }
 
-fn loadApi() Error!void {
+/// Caller holds `lock`.
+fn loadApiLocked() Error!void {
     if (loaded) return;
     var lib = openFirst(lib_names) orelse return error.InitFailed;
     errdefer lib.close();
     inline for (@typeInfo(Api).@"struct".fields) |field| {
         if (comptime std.mem.eql(u8, field.name, "lib")) continue;
-        @field(g, field.name) = lib.lookup(@TypeOf(@field(g, field.name)), field.name) orelse return error.InitFailed;
+        // An optional field is one we can live without; anything else is fatal.
+        const optional = comptime @typeInfo(field.type) == .optional;
+        const Fn = comptime if (optional) @typeInfo(field.type).optional.child else field.type;
+        if (lib.lookup(Fn, field.name)) |sym| {
+            @field(g, field.name) = sym;
+        } else if (optional) {
+            @field(g, field.name) = null;
+        } else return error.InitFailed;
     }
     g.lib = lib;
     loaded = true;
@@ -71,36 +92,159 @@ inline fn check(rc: hipError_t, err: Error) Error!void {
     }
 }
 
+// ---- Process-wide device state ----
+//
+// Mirrors cuda.zig: device pointers are context-scoped, so every handle on a
+// device shares one retained primary context and one JIT'd copy of the image.
+//
+// ponytail: fixed tables sized for one node -- 16 devices, 16 distinct images.
+// Overflow degrades to uncached, not to wrong.
+const max_devices = 16;
+const max_modules = 16;
+
+const CtxSlot = struct {
+    device: hipDevice_t = 0,
+    ctx: hipCtx_t = null,
+    /// False when we had to fall back to `hipCtxCreate`, so teardown differs.
+    primary: bool = false,
+};
+var ctx_slots: [max_devices]CtxSlot = @splat(.{});
+
+/// First ordinal anyone retained, for handles that carry no ordinal of their own.
+var default_ordinal: std.atomic.Value(c_int) = .init(-1);
+
+/// Contexts are current *per thread*: a worker that never made one current has
+/// none, and every launch from it fails.
+threadlocal var current_ordinal: ?c_int = null;
+
+fn retainPrimary(ordinal: c_int) Error!CtxSlot {
+    if (ordinal < 0 or ordinal >= max_devices) return error.NoDevice;
+    acquire();
+    defer lock.unlock();
+    const slot = &ctx_slots[@intCast(ordinal)];
+    if (slot.ctx != null) return slot.*;
+
+    try loadApiLocked();
+    try check(g.hipInit(0), error.InitFailed);
+    var found: CtxSlot = .{};
+    try check(g.hipDeviceGet(&found.device, ordinal), error.NoDevice);
+    if (g.hipDevicePrimaryCtxRetain) |retain| {
+        try check(retain(&found.ctx, found.device), error.ContextFailed);
+        found.primary = true;
+    } else {
+        // ponytail: pre-4.2 ROCm. One shared private context per device still
+        // fixes the cross-handle buffer bug, it just is not shared with cuBLAS.
+        try check(g.hipCtxCreate(&found.ctx, 0, found.device), error.ContextFailed);
+    }
+    slot.* = found;
+    _ = default_ordinal.cmpxchgStrong(-1, ordinal, .monotonic, .monotonic);
+    return found;
+}
+
+fn setCurrent(ordinal: c_int) Error!void {
+    if (current_ordinal) |o| if (o == ordinal) return;
+    const slot = try retainPrimary(ordinal);
+    if (g.hipCtxSetCurrent) |set| try check(set(slot.ctx), error.ContextFailed);
+    current_ordinal = ordinal;
+}
+
+/// Handles that carry no ordinal still need *a* context current on this thread.
+inline fn ensureCurrent() void {
+    if (current_ordinal != null) return;
+    const d = default_ordinal.load(.monotonic);
+    if (d >= 0) setCurrent(d) catch {};
+}
+
+const ModuleSlot = struct {
+    ordinal: c_int = -1,
+    image: []const u8 = &.{},
+    module: hipModule_t = null,
+};
+var module_slots: [max_modules]ModuleSlot = @splat(.{});
+
+/// ponytail: keyed on image identity (ptr + len), not contents -- artifacts come
+/// from `@embedFile` and live for the process.
+fn loadModuleCached(ordinal: c_int, image: []const u8) Error!Module {
+    acquire();
+    defer lock.unlock();
+    var free_slot: ?*ModuleSlot = null;
+    for (&module_slots) |*s| {
+        if (s.module == null) {
+            if (free_slot == null) free_slot = s;
+        } else if (s.ordinal == ordinal and s.image.ptr == image.ptr and s.image.len == image.len) {
+            return .{ .module = s.module, .cached = true };
+        }
+    }
+    var m: hipModule_t = null;
+    try check(g.hipModuleLoadData(&m, image.ptr), error.ModuleLoadFailed);
+    const slot = free_slot orelse return .{ .module = m, .cached = false };
+    slot.* = .{ .ordinal = ordinal, .image = image, .module = m };
+    return .{ .module = m, .cached = true };
+}
+
+/// Unload every cached module and release every retained context. Nothing calls
+/// this for you: `Context.deinit` and `Module.deinit` deliberately leave shared
+/// state alone. Only call it once every handle in the process is done.
+pub fn shutdown() void {
+    acquire();
+    defer lock.unlock();
+    if (!loaded) return;
+    for (&module_slots) |*s| {
+        if (s.module != null) _ = g.hipModuleUnload(s.module);
+        s.* = .{};
+    }
+    for (&ctx_slots) |*s| {
+        if (s.ctx != null) {
+            if (s.primary) {
+                if (g.hipDevicePrimaryCtxRelease) |release| _ = release(s.device);
+            } else _ = g.hipCtxDestroy(s.ctx);
+        }
+        s.* = .{};
+    }
+    current_ordinal = null;
+    default_ordinal.store(-1, .monotonic);
+}
+
 pub const Context = struct {
     device: hipDevice_t = 0,
     ctx: hipCtx_t = null,
+    ordinal: c_int = 0,
 
+    /// (#3) Retains the device's primary context rather than creating a private
+    /// one, so buffers allocated through one handle are valid in all the others.
     pub fn init(ordinal: c_int) Error!Context {
-        try loadApi();
-        try check(g.hipInit(0), error.InitFailed);
-        var self: Context = .{};
-        try check(g.hipDeviceGet(&self.device, ordinal), error.NoDevice);
-        try check(g.hipCtxCreate(&self.ctx, 0, self.device), error.ContextFailed);
+        const slot = try retainPrimary(ordinal);
+        var self: Context = .{ .device = slot.device, .ctx = slot.ctx, .ordinal = ordinal };
+        try self.makeCurrent();
         return self;
     }
+    /// (#3) Releases this handle only. The context is shared and stays retained
+    /// for the process; use `shutdown()` for real teardown. Safe to repeat.
     pub fn deinit(self: *Context) void {
-        _ = g.hipCtxDestroy(self.ctx);
         self.* = .{};
     }
-    pub fn synchronize(_: *Context) Error!void {
+    /// Make this device's context current on the calling thread. Idempotent and
+    /// near-free after the first call on a given thread.
+    pub fn makeCurrent(self: *Context) Error!void {
+        return setCurrent(self.ordinal);
+    }
+    pub fn synchronize(self: *Context) Error!void {
+        try self.makeCurrent();
         try check(g.hipDeviceSynchronize(), error.SyncFailed);
     }
-    pub fn alloc(_: *Context, bytes: usize) Error!Buffer {
+    pub fn alloc(self: *Context, bytes: usize) Error!Buffer {
+        try self.makeCurrent();
         var b: Buffer = .{ .bytes = bytes };
         try check(g.hipMalloc(&b.handle, bytes), error.AllocFailed);
         return b;
     }
-    pub fn loadModuleFromMemory(_: *Context, image: []const u8) Error!Module {
-        var m: Module = .{};
-        try check(g.hipModuleLoadData(&m.module, image.ptr), error.ModuleLoadFailed);
-        return m;
+    /// (#3) Cached per (device, image): JITs once per process, not per handle.
+    pub fn loadModuleFromMemory(self: *Context, image: []const u8) Error!Module {
+        try self.makeCurrent();
+        return loadModuleCached(self.ordinal, image);
     }
-    pub fn createStream(_: *Context) Error!Stream {
+    pub fn createStream(self: *Context) Error!Stream {
+        try self.makeCurrent();
         var s: Stream = .{};
         try check(g.hipStreamCreate(&s.stream, 0), error.SyncFailed);
         return s;
@@ -108,6 +252,7 @@ pub const Context = struct {
     pub const attr_multiprocessor_count: c_int = 16;
     pub const attr_cooperative_launch: c_int = 97;
     pub fn deviceAttribute(self: *Context, attrib: c_int) Error!c_int {
+        try self.makeCurrent();
         var v: c_int = 0;
         try check(g.hipDeviceGetAttribute(&v, attrib, self.device), error.NoDevice);
         return v;
@@ -127,12 +272,15 @@ pub const Buffer = struct {
     bytes: usize = 0,
 
     pub fn upload(self: *Buffer, host: *const anyopaque, n: usize) Error!void {
+        ensureCurrent();
         try check(g.hipMemcpyHtoD(self.handle, host, n), error.CopyFailed);
     }
     pub fn download(self: *Buffer, host: *anyopaque, n: usize) Error!void {
+        ensureCurrent();
         try check(g.hipMemcpyDtoH(host, self.handle, n), error.CopyFailed);
     }
     pub fn free(self: *Buffer) void {
+        ensureCurrent();
         _ = g.hipFree(self.handle);
         self.* = .{};
     }
@@ -140,15 +288,18 @@ pub const Buffer = struct {
         return @ptrCast(&self.handle);
     }
     pub fn copyFrom(self: *Buffer, src: *const Buffer, src_offset: usize, dst_offset: usize, n: usize) Error!void {
+        ensureCurrent();
         const sp: usize = @intFromPtr(src.handle.?) + src_offset;
         const dp: usize = @intFromPtr(self.handle.?) + dst_offset;
         try check(g.hipMemcpyDtoD(@ptrFromInt(dp), @ptrFromInt(sp), n), error.CopyFailed);
     }
     pub fn downloadAt(self: *Buffer, host: *anyopaque, offset: usize, n: usize) Error!void {
+        ensureCurrent();
         const src: usize = @intFromPtr(self.handle.?) + offset;
         try check(g.hipMemcpyDtoH(host, @ptrFromInt(src), n), error.CopyFailed);
     }
     pub fn uploadAt(self: *Buffer, host: *const anyopaque, offset: usize, n: usize) Error!void {
+        ensureCurrent();
         const dst: usize = @intFromPtr(self.handle.?) + offset;
         try check(g.hipMemcpyHtoD(@ptrFromInt(dst), host, n), error.CopyFailed);
     }
@@ -156,13 +307,22 @@ pub const Buffer = struct {
 
 pub const Module = struct {
     module: hipModule_t = null,
+    /// Owned by the process-wide cache; `deinit` must leave it alone.
+    cached: bool = false,
+
     pub fn getKernel(self: *Module, name: [*:0]const u8) Error!Kernel {
+        ensureCurrent();
         var k: Kernel = .{};
         try check(g.hipModuleGetFunction(&k.func, self.module, name), error.KernelNotFound);
         return k;
     }
+    /// (#3) Drops this handle. A cached module stays loaded for the process;
+    /// `shutdown()` unloads it.
     pub fn deinit(self: *Module) void {
-        _ = g.hipModuleUnload(self.module);
+        if (!self.cached and self.module != null) {
+            ensureCurrent();
+            _ = g.hipModuleUnload(self.module);
+        }
         self.* = .{};
     }
 };
@@ -173,9 +333,11 @@ pub const Kernel = struct {
         try self.launchOnStream(grid, block, shared_bytes, args, null);
     }
     pub fn launchOnStream(self: Kernel, grid: Dim3, block: Dim3, shared_bytes: u32, args: []const iface.Arg, stream: hipStream_t) Error!void {
+        ensureCurrent();
         try check(g.hipModuleLaunchKernel(self.func, grid.x, grid.y, grid.z, block.x, block.y, block.z, shared_bytes, stream, @constCast(args.ptr), null), error.LaunchFailed);
     }
     pub fn launchCooperative(self: Kernel, grid: Dim3, block: Dim3, shared_bytes: u32, args: []const iface.Arg, stream: hipStream_t) Error!void {
+        ensureCurrent();
         try check(g.hipLaunchCooperativeKernel(self.func, grid.x, grid.y, grid.z, block.x, block.y, block.z, shared_bytes, stream, @constCast(args.ptr)), error.LaunchFailed);
     }
 };
@@ -183,9 +345,11 @@ pub const Kernel = struct {
 pub const Stream = struct {
     stream: hipStream_t = null,
     pub fn synchronize(self: *Stream) Error!void {
+        ensureCurrent();
         try check(g.hipStreamSynchronize(self.stream), error.SyncFailed);
     }
     pub fn deinit(self: *Stream) void {
+        ensureCurrent();
         _ = g.hipStreamDestroy(self.stream);
         self.* = .{};
     }

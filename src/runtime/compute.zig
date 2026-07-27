@@ -44,6 +44,9 @@ pub const Compute = struct {
         };
     }
 
+    /// (#3) Drops this handle only; the device's primary context is shared with
+    /// every other handle in the process and stays retained. Use `shutdown()`
+    /// for real teardown.
     pub fn deinit(self: *Compute) void {
         switch (self.backend) {
             .cuda => self.cuda_ctx.deinit(),
@@ -84,6 +87,14 @@ pub const Compute = struct {
         };
     }
 };
+
+/// Tear down every shared context and cached module on both backends. Nothing
+/// calls this for you; `deinit` deliberately leaves shared state alone. Only
+/// call it once every handle in the process is done.
+pub fn shutdown() void {
+    cuda.shutdown();
+    hip.shutdown();
+}
 
 pub const Buffer = union(Backend) {
     cpu: void,
