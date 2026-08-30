@@ -35,6 +35,11 @@ const Api = struct {
     cuMemcpyDtoD_v2: *const fn (CUdeviceptr, CUdeviceptr, usize) callconv(.c) CUresult,
     cuMemcpyHtoDAsync_v2: *const fn (CUdeviceptr, *const anyopaque, usize, CUstream) callconv(.c) CUresult,
     cuMemcpyDtoHAsync_v2: *const fn (*anyopaque, CUdeviceptr, usize, CUstream) callconv(.c) CUresult,
+    cuMemsetD8Async: *const fn (CUdeviceptr, u8, usize, CUstream) callconv(.c) CUresult,
+    // Page-locked host memory. Neither is `_v2`-remapped in cuda.h, unlike the
+    // copies above -- `cuMemAllocHost` is the one that got a version suffix.
+    cuMemHostAlloc: *const fn (*?*anyopaque, usize, c_uint) callconv(.c) CUresult,
+    cuMemFreeHost: *const fn (*anyopaque) callconv(.c) CUresult,
     // Launch
     cuLaunchKernel: *const fn (CUfunction, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, CUstream, ?[*]iface.Arg, ?[*]iface.Arg) callconv(.c) CUresult,
     // Device attributes
@@ -315,6 +320,32 @@ pub const Context = struct {
         try check(g.cuMemAlloc_v2(&b.handle, bytes), error.AllocFailed);
         return b;
     }
+
+    /// Page-locked host memory, which is what makes an async copy against it
+    /// actually asynchronous: on ordinary pageable memory the driver stages the
+    /// transfer through an internal pinned buffer and blocks, so
+    /// `uploadAtAsync`/`downloadAtAsync` are asynchronous in name only.
+    ///
+    /// Driver memory, not the caller's allocator's -- release it with
+    /// `freePinned` and nothing else.
+    pub fn allocPinned(self: *Context, bytes: usize) Error![]u8 {
+        try self.makeCurrent();
+        var p: ?*anyopaque = null;
+        // Flags 0: plain page-locked. Not WRITECOMBINED -- these blocks are the
+        // landing area for downloads, and write-combined memory reads back at
+        // uncached speed on the host.
+        try check(g.cuMemHostAlloc(&p, bytes, 0), error.AllocFailed);
+        return @as([*]u8, @ptrCast(p.?))[0..bytes];
+    }
+
+    /// Counterpart to `allocPinned`. Like `Buffer.free`, a no-op before the
+    /// driver has ever loaded, so a hand-built slice cannot call through `g`
+    /// while it is still `undefined`.
+    pub fn freePinned(self: *Context, mem: []u8) void {
+        if (!loaded or mem.len == 0) return;
+        self.makeCurrent() catch return;
+        _ = g.cuMemFreeHost(mem.ptr);
+    }
     /// (#3) Cached per (device, image): the artifact holds every kernel, so this
     /// JITs once per process instead of once per handle.
     pub fn loadModuleFromMemory(self: *Context, image: [:0]const u8) Error!Module {
@@ -372,13 +403,22 @@ pub const Buffer = struct {
         ensureCurrent();
         try check(g.cuMemcpyDtoD_v2(self.handle + dst_offset, src.handle + src_offset, n), error.CopyFailed);
     }
-    pub fn downloadAtAsync(self: *Buffer, host: *anyopaque, offset: usize, n: usize, stream: CUstream) Error!void {
+    /// Enqueued on `stream` and not waited on; `host` must be `allocPinned`
+    /// memory and must stay put until `stream.synchronize()` returns.
+    pub fn downloadAtAsync(self: *Buffer, host: *anyopaque, offset: usize, n: usize, stream: *Stream) Error!void {
         ensureCurrent();
-        try check(g.cuMemcpyDtoHAsync_v2(host, self.handle + offset, n, stream), error.CopyFailed);
+        try check(g.cuMemcpyDtoHAsync_v2(host, self.handle + offset, n, stream.stream), error.CopyFailed);
     }
-    pub fn uploadAtAsync(self: *Buffer, host: *const anyopaque, offset: usize, n: usize, stream: CUstream) Error!void {
+    pub fn uploadAtAsync(self: *Buffer, host: *const anyopaque, offset: usize, n: usize, stream: *Stream) Error!void {
         ensureCurrent();
-        try check(g.cuMemcpyHtoDAsync_v2(self.handle + offset, host, n, stream), error.CopyFailed);
+        try check(g.cuMemcpyHtoDAsync_v2(self.handle + offset, host, n, stream.stream), error.CopyFailed);
+    }
+    /// Set the first `n` bytes to `value`, on the device and on `stream`. The
+    /// memory controller does it in place: zeroing this way costs no bus
+    /// traffic, where copying a resident block of zeros over it does.
+    pub fn fillAsync(self: *Buffer, value: u8, n: usize, stream: *Stream) Error!void {
+        ensureCurrent();
+        try check(g.cuMemsetD8Async(self.handle, value, n, stream.stream), error.CopyFailed);
     }
 
     pub fn deviceAddr(self: *const Buffer) u64 {

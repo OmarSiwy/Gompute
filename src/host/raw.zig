@@ -44,6 +44,7 @@ fn GpuRaw(comptime entry_name: ?[:0]const u8, comptime gpu: host.Gpu) type {
     return struct {
         const Self = @This();
         pub const Buffer = gpu.rt.Buffer;
+        pub const Stream = gpu.rt.Stream;
 
         context: gpu.rt.Context = .{},
         module: gpu.rt.Module = .{},
@@ -75,6 +76,24 @@ fn GpuRaw(comptime entry_name: ?[:0]const u8, comptime gpu: host.Gpu) type {
             return self.context.alloc(bytes);
         }
 
+        /// Page-locked host memory. Driver memory, not a Zig allocator's, so it
+        /// is released with `freePinned`; see `Context.allocPinned` for why the
+        /// async copies need it.
+        pub fn allocPinned(self: *Self, bytes: usize) iface.Error![]u8 {
+            return self.context.allocPinned(bytes);
+        }
+
+        pub fn freePinned(self: *Self, bytes: []u8) void {
+            self.context.freePinned(bytes);
+        }
+
+        /// A stream to order copies and launches on. Anything issued here stays
+        /// off the NULL stream, which implicitly synchronizes against every
+        /// other blocking stream on the device.
+        pub fn createStream(self: *Self) iface.Error!Stream {
+            return self.context.createStream();
+        }
+
         pub fn launch(
             self: *Self,
             grid: iface.Dim3,
@@ -85,6 +104,22 @@ fn GpuRaw(comptime entry_name: ?[:0]const u8, comptime gpu: host.Gpu) type {
             // Worker threads start with no current context; see GpuKernel.launch.
             try self.context.makeCurrent();
             return self.kernel.launch(grid, block, shared_bytes, args);
+        }
+
+        /// `launch`, ordered on `stream` instead of the NULL stream. Returns as
+        /// soon as the launch is queued, so `args` -- which are pointers to the
+        /// caller's argument storage -- must outlive the call.
+        pub fn launchOn(
+            self: *Self,
+            stream: *Stream,
+            grid: iface.Dim3,
+            block: iface.Dim3,
+            shared_bytes: u32,
+            args: []const iface.Arg,
+        ) iface.Error!void {
+            // Same reason as `launch`: a worker thread has no current context.
+            try self.context.makeCurrent();
+            return self.kernel.launchOnStream(grid, block, shared_bytes, args, stream.stream);
         }
 
         pub fn synchronize(self: *Self) iface.Error!void {

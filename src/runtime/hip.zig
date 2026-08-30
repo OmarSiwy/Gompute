@@ -34,6 +34,12 @@ const Api = struct {
     hipMemcpyDtoH: *const fn (*anyopaque, hipDeviceptr_t, usize) callconv(.c) hipError_t,
     hipModuleLaunchKernel: *const fn (hipFunction_t, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, hipStream_t, ?[*]iface.Arg, ?[*]iface.Arg) callconv(.c) hipError_t,
     hipMemcpyDtoD: *const fn (hipDeviceptr_t, hipDeviceptr_t, usize) callconv(.c) hipError_t,
+    hipMemcpyHtoDAsync: *const fn (hipDeviceptr_t, *const anyopaque, usize, hipStream_t) callconv(.c) hipError_t,
+    hipMemcpyDtoHAsync: *const fn (*anyopaque, hipDeviceptr_t, usize, hipStream_t) callconv(.c) hipError_t,
+    // `int` value, not `u8`: hipMemsetAsync follows memset(3), not cuMemsetD8Async.
+    hipMemsetAsync: *const fn (hipDeviceptr_t, c_int, usize, hipStream_t) callconv(.c) hipError_t,
+    hipHostMalloc: *const fn (*?*anyopaque, usize, c_uint) callconv(.c) hipError_t,
+    hipHostFree: *const fn (*anyopaque) callconv(.c) hipError_t,
     hipLaunchCooperativeKernel: *const fn (hipFunction_t, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, hipStream_t, ?[*]iface.Arg) callconv(.c) hipError_t,
     hipOccupancyMaxActiveBlocksPerMultiprocessor: *const fn (*c_int, hipFunction_t, c_int, usize) callconv(.c) hipError_t,
     hipDeviceGetAttribute: *const fn (*c_int, c_int, hipDevice_t) callconv(.c) hipError_t,
@@ -238,6 +244,30 @@ pub const Context = struct {
         try check(g.hipMalloc(&b.handle, bytes), error.AllocFailed);
         return b;
     }
+    /// Page-locked host memory, which is what makes an async copy against it
+    /// actually asynchronous: on ordinary pageable memory the runtime stages the
+    /// transfer through an internal pinned buffer and blocks, so
+    /// `uploadAtAsync`/`downloadAtAsync` are asynchronous in name only.
+    ///
+    /// Runtime memory, not the caller's allocator's -- release it with
+    /// `freePinned` and nothing else.
+    pub fn allocPinned(self: *Context, bytes: usize) Error![]u8 {
+        try self.makeCurrent();
+        var p: ?*anyopaque = null;
+        // Flags 0 (hipHostMallocDefault): plain page-locked. Not
+        // `WriteCombined` -- these blocks are the landing area for downloads,
+        // and write-combined memory reads back at uncached speed on the host.
+        try check(g.hipHostMalloc(&p, bytes, 0), error.AllocFailed);
+        return @as([*]u8, @ptrCast(p.?))[0..bytes];
+    }
+    /// Counterpart to `allocPinned`. Like `Buffer.free`, a no-op before the
+    /// runtime has ever loaded, so a hand-built slice cannot call through `g`
+    /// while it is still `undefined`.
+    pub fn freePinned(self: *Context, mem: []u8) void {
+        if (!loaded or mem.len == 0) return;
+        self.makeCurrent() catch return;
+        _ = g.hipHostFree(mem.ptr);
+    }
     /// (#3) Cached per (device, image): JITs once per process, not per handle.
     pub fn loadModuleFromMemory(self: *Context, image: []const u8) Error!Module {
         try self.makeCurrent();
@@ -325,6 +355,23 @@ pub const Buffer = struct {
         ensureCurrent();
         try check(g.hipMemcpyHtoD(try self.offsetPtr(offset), host, n), error.CopyFailed);
     }
+    /// Enqueued on `stream` and not waited on; `host` must be `allocPinned`
+    /// memory and must stay put until `stream.synchronize()` returns.
+    pub fn downloadAtAsync(self: *Buffer, host: *anyopaque, offset: usize, n: usize, stream: *Stream) Error!void {
+        ensureCurrent();
+        try check(g.hipMemcpyDtoHAsync(host, try self.offsetPtr(offset), n, stream.stream), error.CopyFailed);
+    }
+    pub fn uploadAtAsync(self: *Buffer, host: *const anyopaque, offset: usize, n: usize, stream: *Stream) Error!void {
+        ensureCurrent();
+        try check(g.hipMemcpyHtoDAsync(try self.offsetPtr(offset), host, n, stream.stream), error.CopyFailed);
+    }
+    /// Set the first `n` bytes to `value`, on the device and on `stream`. The
+    /// memory controller does it in place: zeroing this way costs no bus
+    /// traffic, where copying a resident block of zeros over it does.
+    pub fn fillAsync(self: *Buffer, value: u8, n: usize, stream: *Stream) Error!void {
+        ensureCurrent();
+        try check(g.hipMemsetAsync(try self.devicePtr(), value, n, stream.stream), error.CopyFailed);
+    }
 };
 
 pub const Module = struct {
@@ -387,6 +434,13 @@ test "a handle-less Buffer errors instead of panicking, and free is idempotent" 
     try std.testing.expectError(error.InvalidArgument, buffer.uploadAt(&byte, 4, 1));
     try std.testing.expectError(error.InvalidArgument, buffer.downloadAt(&byte, 4, 1));
     try std.testing.expectError(error.InvalidArgument, buffer.copyFrom(&buffer, 0, 0, 1));
+    // Same for the stream-ordered forms: they resolve the device pointer before
+    // they reach the runtime, so a null handle is an error and not a copy from
+    // address `offset`.
+    var stream: Stream = .{};
+    try std.testing.expectError(error.InvalidArgument, buffer.uploadAtAsync(&byte, 4, 1, &stream));
+    try std.testing.expectError(error.InvalidArgument, buffer.downloadAtAsync(&byte, 4, 1, &stream));
+    try std.testing.expectError(error.InvalidArgument, buffer.fillAsync(0, 1, &stream));
     buffer.free();
     buffer.free();
 }
