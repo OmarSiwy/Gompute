@@ -392,21 +392,37 @@ fn GpuKernel(comptime Spec: type, comptime gpu: Gpu) type {
             .scatter => scatterRun,
         };
 
-        fn mapLaunch(
+        /// `map`, `map_to` and `zip` differ only in how many buffers precede
+        /// `len` and the packed parameters, so they share one body. The three
+        /// signatures below stay positional and explicit: `docs/reference.md`
+        /// documents them that way, and they are public API.
+        ///
+        /// `len` and `packed_params` are locals the driver reads through
+        /// `args`, so they have to outlive the call -- which they do, because
+        /// `dispatch` is synchronous.
+        fn packedLaunch(
             self: *Self,
-            buffer: *Buffer,
+            bufs: anytype,
             count: usize,
             params: Spec.Parameters,
         ) iface.Error!void {
             if (count == 0) return;
             var len: u64 = @intCast(count);
             var packed_params = abi.pack(Spec.Parameters, params);
-            var args = [_]iface.Arg{
-                buffer.argPtr(),
-                iface.arg(&len),
-                iface.arg(&packed_params),
-            };
+            var args: [bufs.len + 2]iface.Arg = undefined;
+            inline for (bufs, 0..) |buffer, i| args[i] = buffer.argPtr();
+            args[bufs.len] = iface.arg(&len);
+            args[bufs.len + 1] = iface.arg(&packed_params);
             try self.dispatch(iface.Dim3.linear(count, Spec.block_size), &args);
+        }
+
+        fn mapLaunch(
+            self: *Self,
+            buffer: *Buffer,
+            count: usize,
+            params: Spec.Parameters,
+        ) iface.Error!void {
+            return self.packedLaunch(.{buffer}, count, params);
         }
 
         fn mapRun(self: *Self, data: []Spec.Value, params: Spec.Parameters) iface.Error!void {
@@ -425,16 +441,7 @@ fn GpuKernel(comptime Spec: type, comptime gpu: Gpu) type {
             count: usize,
             params: Spec.Parameters,
         ) iface.Error!void {
-            if (count == 0) return;
-            var len: u64 = @intCast(count);
-            var packed_params = abi.pack(Spec.Parameters, params);
-            var args = [_]iface.Arg{
-                in.argPtr(),
-                out.argPtr(),
-                iface.arg(&len),
-                iface.arg(&packed_params),
-            };
-            try self.dispatch(iface.Dim3.linear(count, Spec.block_size), &args);
+            return self.packedLaunch(.{ in, out }, count, params);
         }
 
         fn mapToRun(
@@ -462,17 +469,7 @@ fn GpuKernel(comptime Spec: type, comptime gpu: Gpu) type {
             count: usize,
             params: Spec.Parameters,
         ) iface.Error!void {
-            if (count == 0) return;
-            var len: u64 = @intCast(count);
-            var packed_params = abi.pack(Spec.Parameters, params);
-            var args = [_]iface.Arg{
-                a.argPtr(),
-                b.argPtr(),
-                out.argPtr(),
-                iface.arg(&len),
-                iface.arg(&packed_params),
-            };
-            try self.dispatch(iface.Dim3.linear(count, Spec.block_size), &args);
+            return self.packedLaunch(.{ a, b, out }, count, params);
         }
 
         fn zipRun(
