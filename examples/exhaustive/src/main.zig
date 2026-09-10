@@ -224,6 +224,14 @@ fn testSecondRoot() void {
     });
 }
 
+/// The generated index is built from the same kernel roots as the artifacts, so
+/// a name that is missing while the artifacts exist means a renamed spec or a
+/// mismatched root -- a regression to report, not a `.?` panic. `docs/runtime.md`
+/// shows the same shape as `orelse return error.KernelNotFound`.
+fn notInIndex() void {
+    print("  \"scale_relu\" is not in the generated kernel index\n", .{});
+}
+
 fn testRuntimeDynamic() void {
     print("\n[runtime.dynamic] ", .{});
     const rt = g.runtime.dynamic;
@@ -238,8 +246,14 @@ fn testRuntimeDynamic() void {
     // generated index which blob holds the kernel we are about to launch.
     const artifacts = @import("gompute_kernels");
     const image: [:0]const u8 = switch (gpu.backend) {
-        .cuda => if (artifacts.has_cuda) artifacts.cuda_images[artifacts.cuda_index.get("scale_relu").?.blob] else return skip("this build emitted no CUDA artifacts"),
-        .hip => if (artifacts.has_hip) artifacts.hip_images[artifacts.hip_index.get("scale_relu").?.blob] else return skip("this build emitted no HIP artifacts"),
+        .cuda => if (artifacts.has_cuda)
+            artifacts.cuda_images[(artifacts.cuda_index.get("scale_relu") orelse return notInIndex()).blob]
+        else
+            return skip("this build emitted no CUDA artifacts"),
+        .hip => if (artifacts.has_hip)
+            artifacts.hip_images[(artifacts.hip_index.get("scale_relu") orelse return notInIndex()).blob]
+        else
+            return skip("this build emitted no HIP artifacts"),
         .cpu => unreachable,
     };
 
