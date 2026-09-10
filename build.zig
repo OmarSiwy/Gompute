@@ -228,7 +228,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    _ = b.addModule("gompute_device", .{
+    const device_mod = b.addModule("gompute_device", .{
         .root_source_file = b.path("src/device.zig"),
     });
 
@@ -326,12 +326,42 @@ pub fn build(b: *std.Build) void {
     const check_tests = b.addTest(.{ .root_module = codegen_check.root_module });
     const run_check_tests = b.addRunArtifact(check_tests);
 
+    // `src/device.zig` is reachable from no other test artifact -- they all root
+    // at `src/root.zig` or `tools/`. Worse, every kernels root in the repo and in
+    // both examples uses `g.map` and nothing else, so five of the six entry
+    // generators in `src/device/export.zig` had never been through the frontend
+    // for a GPU target at all. This compiles one spec of every `Kind`.
+    //
+    // LLVM IR, not PTX: `@export` on a `callconv(.kernel)` function emits an
+    // LLVM alias, and the NVPTX backend rejects an alias to a kernel
+    // ("NVPTX aliasee must be a non-kernel function definition"). Rewriting
+    // those aliases away is what `tools/kernel_ir_tool.zig` is for, and the real
+    // pipeline runs it between the two -- see `emitKernels`. Stopping at IR
+    // keeps this a frontend check, which is the part that was missing.
+    const device_probe = b.addObject(.{
+        .name = "gompute-device-probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/device_entries.zig"),
+            .target = b.resolveTargetQuery(std.Target.Query.parse(.{
+                .arch_os_abi = "nvptx64-cuda",
+                .cpu_features = "sm_70",
+            }) catch unreachable),
+            .optimize = .ReleaseFast,
+            .strip = true,
+            .imports = &.{.{ .name = "gompute", .module = device_mod }},
+        }),
+    });
+    // Requests the emit; without a consumer of the file nothing is produced.
+    // Deliberately NOT `getEmittedBin` -- nvptx64 has no object writer.
+    _ = device_probe.getEmittedLlvmIr();
+
     const test_step = b.step("test", "Run Gompute unit tests");
     test_step.dependOn(&run_unit_tests.step);
     test_step.dependOn(&run_tool_tests.step);
     test_step.dependOn(&run_build_tests.step);
     test_step.dependOn(&run_check_tests.step);
     test_step.dependOn(&run_codegen_check.step);
+    test_step.dependOn(&device_probe.step);
 
     buildDocs(b, host_mod, test_step);
 }
