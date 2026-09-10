@@ -77,26 +77,6 @@ fn decodeLlvmName(arena: std.mem.Allocator, llvm_name: []const u8) ![]const u8 {
     return out.items;
 }
 
-fn appendZigString(out: *std.ArrayList(u8), arena: std.mem.Allocator, text: []const u8) !void {
-    try out.append(arena, '"');
-    for (text) |c| {
-        switch (c) {
-            '"' => try out.appendSlice(arena, "\\\""),
-            '\\' => try out.appendSlice(arena, "\\\\"),
-            '\n' => try out.appendSlice(arena, "\\n"),
-            '\r' => try out.appendSlice(arena, "\\r"),
-            '\t' => try out.appendSlice(arena, "\\t"),
-            else => if (c >= 0x20 and c <= 0x7e) {
-                try out.append(arena, c);
-            } else {
-                const escaped = try std.fmt.allocPrint(arena, "\\x{x:0>2}", .{c});
-                try out.appendSlice(arena, escaped);
-            },
-        }
-    }
-    try out.append(arena, '"');
-}
-
 /// Drop the alias lines and rename each aliased definition to its public name.
 fn rewriteIr(arena: std.mem.Allocator, input: []const u8, aliases: []const Alias) ![]const u8 {
     var rewritten: std.ArrayList(u8) = .empty;
@@ -192,8 +172,8 @@ fn rewriteIr(arena: std.mem.Allocator, input: []const u8, aliases: []const Alias
 /// these per kernel root into a single comptime name -> (blob, symbol) map, and
 /// a chain of comptime `if`s cannot be merged.
 fn emitMap(arena: std.mem.Allocator, aliases: []const Alias) ![]const u8 {
-    var map_source: std.ArrayList(u8) = .empty;
-    try map_source.appendSlice(arena,
+    var out: std.Io.Writer.Allocating = .init(arena);
+    try out.writer.writeAll(
         \\//! Generated from LLVM aliases. Do not edit.
         \\//!
         \\//! `internal` is the symbol name in the HIP artifact. In the CUDA
@@ -203,15 +183,12 @@ fn emitMap(arena: std.mem.Allocator, aliases: []const Alias) ![]const u8 {
         \\pub const entries = [_]Entry{
         \\
     );
-    for (aliases) |alias| {
-        try map_source.appendSlice(arena, "    .{ .exported = ");
-        try appendZigString(&map_source, arena, alias.name);
-        try map_source.appendSlice(arena, ", .internal = ");
-        try appendZigString(&map_source, arena, try decodeLlvmName(arena, alias.aliasee));
-        try map_source.appendSlice(arena, " },\n");
-    }
-    try map_source.appendSlice(arena, "};\n");
-    return map_source.items;
+    for (aliases) |alias| try out.writer.print("    .{{ .exported = \"{f}\", .internal = \"{f}\" }},\n", .{
+        std.zig.fmtString(alias.name),
+        std.zig.fmtString(try decodeLlvmName(arena, alias.aliasee)),
+    });
+    try out.writer.writeAll("};\n");
+    return out.written();
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -310,6 +287,22 @@ test "string constants survive the rewrite and stay out of the name map" {
         u8,
         map,
         ".{ .exported = \"add\", .internal = \"kernels.add\" },",
+    ) != null);
+}
+
+test emitMap {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    // The emitted file is compiled by build.zig, so anything LLVM allows in a
+    // name has to come back out as a valid Zig string literal: quotes and
+    // backslashes escaped, non-printables as \xNN, `\22` in the aliasee decoded
+    // to the byte it names first.
+    const map = try emitMap(arena_state.allocator(), &.{.{ .name = "a\"b\\c\x01", .aliasee = "\"k\\22x\"" }});
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        map,
+        ".{ .exported = \"a\\\"b\\\\c\\x01\", .internal = \"k\\\"x\" },",
     ) != null);
 }
 
