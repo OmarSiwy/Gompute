@@ -2,6 +2,14 @@
 
 const std = @import("std");
 
+/// The wire type `T` becomes when it crosses to the GPU: an `extern struct`
+/// mirroring `T` field by field, with `bool` as `u8`, an enum as its tag type,
+/// and arrays and vectors mapped elementwise.
+///
+/// A type with no stable GPU representation is a `@compileError` naming the
+/// field path that reached it, never a silently different layout. A struct may
+/// override the derivation by declaring `gpu_layout`/`toGpu`/`fromGpu`, in
+/// which case `gpu_layout` is the wire type and must be `extern` or `packed`.
 pub fn Boundary(comptime T: type) type {
     return BoundaryAt(T, @typeName(T));
 }
@@ -141,10 +149,21 @@ fn hasFixedLayout(comptime U: type) bool {
     };
 }
 
+/// Fail the build now if `T` cannot cross the boundary, with the same
+/// diagnostic the first kernel taking `T` would have produced later.
+///
+/// Comptime-only and emits nothing. The point is to put the error on the params
+/// struct where it is declared rather than on whichever kernel happens to use
+/// it first: `comptime { abi.assertStable(Params); }`.
 pub fn assertStable(comptime T: type) void {
     _ = Boundary(T);
 }
 
+/// Host value to wire value, ready to hand the driver as a kernel argument.
+///
+/// Calls `T.toGpu` at every depth that declares one, so a nested type with a
+/// custom boundary converts itself. Runs once per launch on the host; `unpack`
+/// is the inverse and runs once per thread on the device.
 pub fn pack(comptime T: type, value: T) Boundary(T) {
     return switch (@typeInfo(T)) {
         .bool => @intFromBool(value),
@@ -170,6 +189,15 @@ pub fn pack(comptime T: type, value: T) Boundary(T) {
     };
 }
 
+/// Wire value back to host or device value; the inverse of `pack`.
+///
+/// Calls `T.fromGpu` at every depth that declares one. Every generated kernel
+/// entry begins with this call, so on the device it runs once per thread.
+///
+/// Asserts that every enum anywhere in `T` receives a wire integer naming a
+/// real tag. Anything that came from `pack` does. A buffer you filled yourself
+/// may not, and the device is compiled ReleaseFast, where that is undefined
+/// behaviour rather than a safety panic.
 pub fn unpack(comptime T: type, value: Boundary(T)) T {
     return switch (@typeInfo(T)) {
         .bool => value != 0,

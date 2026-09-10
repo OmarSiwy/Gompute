@@ -1,8 +1,22 @@
 //! A map specification is metadata plus one pure scalar function.
+//!
+//! Every constructor here returns a zero-sized type whose `pub` decls are the
+//! contract that `src/host/kernel.zig` and `src/device/export.zig` both read:
+//! `kind`, `entry_name`, `block_size`, `Value`, `Parameters`,
+//! `BoundaryParameters`, `eval`, and, per kind, `is_generic`, `In`, `Out`, `A`,
+//! `B`, `Index`, `identity`, `simd_op`, `combine` and `pre`. Rather than
+//! restate each on all seven constructors, they are documented once here.
+//!
+//! The coupling is by `@hasDecl`/`@field`, so renaming or dropping one of these
+//! is not a compile error in this file -- it silently changes behaviour in the
+//! other two. A missing `kind`, in particular, makes `kindOf` answer `.map`.
 
 const std = @import("std");
 const abi = @import("abi.zig");
 
+/// Shared by every elementwise constructor here. 256 threads per block is the
+/// occupancy sweet spot on both vendors and rarely wants changing; 1024 is the
+/// hard ceiling everywhere gompute targets.
 pub const MapOptions = struct {
     block_size: u32 = 256,
 };
@@ -13,6 +27,9 @@ pub const MapOptions = struct {
 /// no `kind` decl at all and mean `.map`.
 pub const Kind = enum { map, map_to, zip, reduce, map_indexed, gather, scatter };
 
+/// The `Kind` a spec asks for; `.map` for a hand-written spec that declares no
+/// `kind`. Read a spec's kind through this and never as `Spec.kind`, which does
+/// not exist on every accepted spec.
 pub fn kindOf(comptime Spec: type) Kind {
     return if (@hasDecl(Spec, "kind")) Spec.kind else .map;
 }
@@ -23,6 +40,12 @@ pub inline fn splat(comptime T: type, value: anytype) T {
     return if (@typeInfo(T) == .vector) @splat(value) else value;
 }
 
+/// In-place elementwise map: `data[i] = func(data[i], params)`.
+///
+/// `func` may be `fn (x: anytype, p: Params)`, which sets `is_generic` and lets
+/// the CPU path instantiate the same body at `@Vector` width -- use `splat` for
+/// the scalars inside it. A concrete `fn (T, Params) T` also works and stays
+/// scalar on the CPU.
 pub fn Map(
     comptime name: [:0]const u8,
     comptime T: type,
@@ -160,6 +183,9 @@ pub fn MapIndexed(
     };
 }
 
+/// A type constructor rather than a type: `pre` is a `fn (T, Params) T`, so the
+/// options struct cannot be spelled until both are known. Every reduction below
+/// takes a `ReduceOptions(T, Params)`.
 pub fn ReduceOptions(comptime T: type, comptime Params: type) type {
     return struct {
         block_size: u32 = 256,
@@ -306,6 +332,10 @@ pub fn MapFn(
 // sum-of-squares, L2 norm, "how many match", "does any exceed k".
 // ---------------------------------------------------------------------------
 
+/// Addition, identity `0` -- an empty buffer sums to 0, not to an error.
+///
+/// Integer addition wraps. The device runs ReleaseFast and would wrap silently
+/// anyway, so the CPU path must not disagree by panicking on overflow.
 pub fn Sum(
     comptime name: [:0]const u8,
     comptime T: type,
@@ -315,6 +345,8 @@ pub fn Sum(
     return Reduce(name, T, Params, Arith(T).add, 0, withOp(options, .Add));
 }
 
+/// `@min`, identity `maxInt(T)` for an integer and `+inf` for a float -- an
+/// empty buffer reduces to that identity, not to an error.
 pub fn Min(
     comptime name: [:0]const u8,
     comptime T: type,
@@ -324,6 +356,8 @@ pub fn Min(
     return Reduce(name, T, Params, Arith(T).min, Arith(T).largest, withOp(options, .Min));
 }
 
+/// `@max`, identity `minInt(T)` for an integer and `-inf` for a float -- an
+/// empty buffer reduces to that identity, not to an error.
 pub fn Max(
     comptime name: [:0]const u8,
     comptime T: type,
@@ -474,7 +508,7 @@ fn validateFunction(comptime T: type, comptime P: type, comptime func: anytype) 
     return false;
 }
 
-test "map spec validates and evaluates" {
+test Map {
     const P = struct { scale: f32 };
     const op = struct {
         fn call(x: f32, p: P) f32 {
@@ -491,7 +525,7 @@ test "map spec validates and evaluates" {
     try std.testing.expectEqual(@as(u32, 1024), Map("b", f32, P, op, .{ .block_size = 1024 }).block_size);
 }
 
-test "kernel names must be C identifiers" {
+test isCIdentifier {
     for ([_][]const u8{ "scale", "_x", "a0", "MAP_9" }) |ok|
         try std.testing.expect(isCIdentifier(ok));
     // Leading digit, separators, namespacing, and anything a linker would choke
@@ -500,7 +534,7 @@ test "kernel names must be C identifiers" {
         try std.testing.expect(!isCIdentifier(bad));
 }
 
-test "block_size bounds" {
+test blockSizeValid {
     try std.testing.expect(!blockSizeValid(0));
     try std.testing.expect(blockSizeValid(1));
     try std.testing.expect(blockSizeValid(256));

@@ -2,13 +2,23 @@
 
 const std = @import("std");
 
+/// Which vendor driver produced the code in `last_driver_error`. `.none` means
+/// no failure has been recorded on this thread, not "no backend selected".
 pub const DriverBackend = enum { none, cuda, hip };
 
+/// The last raw driver status this thread saw. `code` is the vendor's own value
+/// -- a `CUresult` or a `hipError_t` -- so it is only meaningful read together
+/// with `backend`. The default `.{}` means no failure.
 pub const DriverError = struct {
     code: i64 = 0,
     backend: DriverBackend = .none,
 };
 
+/// Written by every backend `check()`, read through `gompute.lastDriverError()`.
+///
+/// `threadlocal` is load-bearing, not defensive: host threads submit work
+/// independently, so a plain global would race and would report another
+/// thread's failure as yours.
 pub threadlocal var last_driver_error: DriverError = .{};
 
 /// Every backend `check()` reports its raw result here, success included.
@@ -19,6 +29,9 @@ pub inline fn recordDriverResult(backend: DriverBackend, code: i64) void {
     last_driver_error = if (code == 0) .{} else .{ .code = code, .backend = backend };
 }
 
+/// Every error gompute itself returns. Deliberately small and vendor-neutral:
+/// the driver's own status code is not a member, it goes to
+/// `last_driver_error`, so one error set covers both CUDA and HIP.
 pub const Error = error{
     InitFailed,
     NoDevice,
@@ -34,6 +47,12 @@ pub const Error = error{
     UnsupportedBackend,
 };
 
+/// A launch geometry: a grid measured in blocks, or a block measured in
+/// threads, depending on which argument it is.
+///
+/// `extern`, and in this field order, because it is handed straight to
+/// `cuLaunchKernel`/`hipModuleLaunchKernel`. The defaults of 1 make
+/// `.{ .x = n }` a 1-D launch.
 pub const Dim3 = extern struct {
     x: u32 = 1,
     y: u32 = 1,
@@ -81,6 +100,11 @@ pub const Dim3 = extern struct {
 /// storage holding one kernel argument.
 pub const Arg = *anyopaque;
 
+/// Wrap a pointer to one argument's storage for the `kernelParams` array.
+///
+/// Does not copy. The driver reads through the pointer when the launch is
+/// submitted, so the pointee must stay alive and unmoved until then -- passing
+/// a pointer to a temporary is how a kernel receives a garbage argument.
 pub inline fn arg(value_ptr: anytype) Arg {
     return @ptrCast(@constCast(value_ptr));
 }
@@ -117,7 +141,7 @@ test "Dim3.linearChecked rejects the launches no driver accepts" {
     try std.testing.expectError(error.InvalidArgument, Dim3.linearChecked(1 << 40, 256));
 }
 
-test "recordDriverResult clears on success" {
+test recordDriverResult {
     recordDriverResult(.cuda, 700);
     try std.testing.expectEqual(DriverBackend.cuda, last_driver_error.backend);
     try std.testing.expectEqual(@as(i64, 700), last_driver_error.code);

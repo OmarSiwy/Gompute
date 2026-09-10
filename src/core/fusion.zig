@@ -1,6 +1,15 @@
 //! Compile-time operation fusion. Each operation type exposes:
 //! `pub inline fn eval(x: T, params: Params) T`.
 
+/// Compose operations into one, applied left to right: `Fused(T, P, .{ A, B })`
+/// evaluates `B.eval(A.eval(x, p), p)`.
+///
+/// `ops` is a tuple of types, each exposing `pub inline fn eval(T, Params) T`.
+/// A `Fused` is itself such a type, so pipelines nest.
+///
+/// The result is not a kernel spec -- it has no `entry_name`, so kernel export
+/// will not pick it up. Hand it to `g.map` as the map function, or call `eval`
+/// on it directly.
 pub fn Fused(comptime T: type, comptime Params: type, comptime ops: anytype) type {
     if (ops.len == 0) @compileError("a fused pipeline needs at least one operation");
     return struct {
@@ -12,6 +21,8 @@ pub fn Fused(comptime T: type, comptime Params: type, comptime ops: anytype) typ
     };
 }
 
+/// Lift a plain `fn (T, Params) T` into the op shape `Fused` expects, so an
+/// ordinary function can sit in a pipeline beside op structs.
 pub fn Unary(comptime T: type, comptime Params: type, comptime func: anytype) type {
     return struct {
         pub inline fn eval(x: T, params: Params) T {
@@ -20,7 +31,7 @@ pub fn Unary(comptime T: type, comptime Params: type, comptime func: anytype) ty
     };
 }
 
-test "fused operations are straight-line comptime composition" {
+test Fused {
     const P = struct { gain: f32 };
     const Scale = struct {
         pub inline fn eval(x: f32, p: P) f32 {
