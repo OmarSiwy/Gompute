@@ -131,19 +131,8 @@ comptime {
         g.exportRaw("raw_increment", &rawIncrement);
         g.exportRaw("raw_scale", &rawScale);
     }
-    g.exportKernels(.{
-        scale_relu,
-        affine_transform,
-        clamp,
-        neg,
-        sq,
-        weighted,
-        nested,
-        double_f64,
-        shift_mask,
-        saturate_i16,
-        scale_square,
-        triple_fused,
-        abs_then_scale,
-    });
+    // Every pub map spec in this file; no second list to keep in sync. The
+    // pub Fused/Unary types and the param structs have no `entry_name`, so
+    // they are not specs and are skipped.
+    g.exportKernels(@This());
 }
