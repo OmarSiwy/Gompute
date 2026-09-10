@@ -42,8 +42,6 @@ const Api = struct {
     cuMemFreeHost: *const fn (*anyopaque) callconv(.c) CUresult,
     // Launch
     cuLaunchKernel: *const fn (CUfunction, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, CUstream, ?[*]iface.Arg, ?[*]iface.Arg) callconv(.c) CUresult,
-    // Device attributes
-    cuDeviceGetAttribute: *const fn (*c_int, c_int, CUdevice) callconv(.c) CUresult,
     // Streams
     cuStreamCreate: *const fn (*CUstream, c_uint) callconv(.c) CUresult,
     cuStreamDestroy_v2: *const fn (CUstream) callconv(.c) CUresult,

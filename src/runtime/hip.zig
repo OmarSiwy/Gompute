@@ -40,7 +40,6 @@ const Api = struct {
     hipMemsetAsync: *const fn (hipDeviceptr_t, c_int, usize, hipStream_t) callconv(.c) hipError_t,
     hipHostMalloc: *const fn (*?*anyopaque, usize, c_uint) callconv(.c) hipError_t,
     hipHostFree: *const fn (*anyopaque) callconv(.c) hipError_t,
-    hipDeviceGetAttribute: *const fn (*c_int, c_int, hipDevice_t) callconv(.c) hipError_t,
     hipStreamCreate: *const fn (*hipStream_t, c_uint) callconv(.c) hipError_t,
     hipStreamDestroy: *const fn (hipStream_t) callconv(.c) hipError_t,
     hipStreamSynchronize: *const fn (hipStream_t) callconv(.c) hipError_t,
@@ -276,25 +275,6 @@ pub const Context = struct {
         var s: Stream = .{};
         try check(g.hipStreamCreate(&s.stream, 0), error.SyncFailed);
         return s;
-    }
-    // hipDeviceAttribute_t, NOT CUdevice_attribute: the two enums are unrelated
-    // and these were copy-pasted from cuda.zig (16 and 95/97). Values taken from
-    // hip/hip_runtime_api.h, ROCm 7.2.3, read out with the preprocessor rather
-    // than counted by eye -- the enum opens with an alias
-    // (hipDeviceAttributeEccEnabled = hipDeviceAttributeCudaCompatibleBegin = 0),
-    // which makes hand-counting land one too high. Cross-check:
-    // hipDeviceAttributeWarpSize == 87.
-    //
-    // The old 97 matched no attribute at all, so hipDeviceGetAttribute returned
-    // hipErrorInvalidValue, `catch 0` ate it, and maxCoopBlocks always answered
-    // 0. Invisible on NVIDIA, where cuda.zig's constants happen to be right.
-    pub const attr_multiprocessor_count: c_int = 63;
-    pub const attr_cooperative_launch: c_int = 10;
-    pub fn deviceAttribute(self: *Context, attrib: c_int) Error!c_int {
-        try self.makeCurrent();
-        var v: c_int = 0;
-        try check(g.hipDeviceGetAttribute(&v, attrib, self.device), error.NoDevice);
-        return v;
     }
 };
 
