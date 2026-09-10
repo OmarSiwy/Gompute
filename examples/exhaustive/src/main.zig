@@ -46,13 +46,20 @@ fn skip(reason: []const u8) void {
     print("  skipped: {s}\n", .{reason});
 }
 
-fn approxEq(a: f32, b: f32) bool {
-    return @abs(a - b) < 1e-4;
+/// Floats compare with an absolute tolerance, everything else exactly. The
+/// tolerance is deliberately loose: these check that the kernel ran the right
+/// operation, not how it rounded. Scaling it off `floatEps` keeps f64 from
+/// silently inheriting a tolerance picked for f32.
+fn same(comptime T: type, a: T, b: T) bool {
+    return switch (@typeInfo(T)) {
+        .float => std.math.approxEqAbs(T, a, b, 1024 * std.math.floatEps(T)),
+        else => a == b,
+    };
 }
 
-fn allApproxEq(actual: []const f32, expected: []const f32) bool {
+fn allSame(comptime T: type, actual: []const T, expected: []const T) bool {
     if (actual.len != expected.len) return false;
-    for (actual, expected) |a, e| if (!approxEq(a, e)) return false;
+    for (actual, expected) |a, e| if (!same(T, a, e)) return false;
     return true;
 }
 
@@ -60,21 +67,25 @@ pub fn main() !void {
     print("=== Gompute exhaustive GPU test ===\n\n", .{});
 
     // ── AutoKernel tests (CUDA → HIP → CPU) ────────────────────────────
-    testAutoScaleRelu();
-    testAutoAffine();
-    testAutoClamp();
-    testAutoNegate();
-    testAutoSquare();
-    testAutoWeighted();
-    testAutoNested();
-    testAutoFusedScaleSquare();
-    testAutoTripleFused();
-    testAutoAbsThenScale();
-    testAutoF64();
-    testAutoU32();
-    testAutoI16();
-    testAutoEmpty();
-    testAutoSingle();
+    // Spec, label, input, params, expected. The axes worth covering are the
+    // element type (f32/f64/u32/i16), the param shape (scalar/multi/array/
+    // nested), fusion depth, and the length edges 0 and 1.
+    autoCase(k.scale_relu, "scale_relu", &.{ -3, -1, 0, 1, 3 }, .{ .scale = 2 }, &.{ 0, 0, 0, 2, 6 });
+    autoCase(k.affine_transform, "affine", &.{ 0, 1, -1, 10 }, .{ .scale = 3, .bias = 1, .enabled = true }, &.{ 1, 4, -2, 31 });
+    autoCase(k.clamp, "clamp", &.{ -5, 0, 0.5, 1, 2 }, .{ .scale = 0 }, &.{ 0, 0, 0.5, 1, 1 });
+    // -0.0, not 0: negating a zero keeps the sign, and the printed output says so.
+    autoCase(k.neg, "negate", &.{ -3, 0, 7 }, .{ .scale = 0 }, &.{ 3, -0.0, -7 });
+    autoCase(k.sq, "square", &.{ -2, 0, 3, 0.5 }, .{ .scale = 0 }, &.{ 4, 0, 9, 0.25 });
+    autoCase(k.weighted, "weighted", &.{ 5, 0 }, .{ .weights = .{ 2, 3, 4, 1 } }, &.{ 23, 13 });
+    autoCase(k.nested, "nested", &.{ 2, -1 }, .{ .inner = .{ .scale = 3 }, .offset = 10 }, &.{ 16, 7 });
+    autoCase(k.scale_square, "fused_scale_sq", &.{ 3, -2 }, .{ .scale = 2 }, &.{ 36, 16 });
+    autoCase(k.triple_fused, "triple_fused", &.{ -3, 2 }, .{ .scale = -2 }, &.{ 36, 16 });
+    autoCase(k.abs_then_scale, "abs_then_scale", &.{ -5, 3 }, .{ .scale = 10 }, &.{ 50, 30 });
+    autoCase(k.double_f64, "f64", &.{ 1.5, -2.25, 0 }, .{ .scale = 0 }, &.{ 3, -4.5, 0 });
+    autoCase(k.shift_mask, "u32_shift_mask", &.{ 0xFF00, 0xABCD, 0 }, .{ .shift = 8, .mask = 0xFF }, &.{ 0xFF, 0xAB, 0 });
+    autoCase(k.saturate_i16, "i16_saturate", &.{ -200, -50, 0, 50, 200 }, .{ .scale = 0 }, &.{ -100, -50, 0, 50, 100 });
+    autoCase(k.scale_relu, "empty", &.{}, .{ .scale = 2 }, &.{});
+    autoCase(k.sq, "single", &.{42}, .{ .scale = 0 }, &.{1764});
     testAutoLarge();
 
     // ── Runtime dynamic backend ─────────────────────────────────────────
@@ -100,173 +111,31 @@ pub fn main() !void {
 
 // ── AutoKernel: runs on GPU when available ──────────────────────────────
 
-fn testAutoScaleRelu() void {
-    print("[auto scale_relu] ", .{});
-    var kern = g.AutoKernel(k.scale_relu).init();
+/// Every auto test is the same seven lines: pick a backend, run the spec over a
+/// literal input, compare against a literal expectation. Only `testAutoLarge`
+/// differs, because it generates its input rather than listing it.
+///
+/// `input` is copied into scratch storage so the caller can pass a literal.
+/// Asserts `input.len <= 8` -- these are shape probes, not workloads.
+fn autoCase(
+    comptime Spec: type,
+    label: []const u8,
+    input: []const Spec.Value,
+    params: Spec.Parameters,
+    expected: []const Spec.Value,
+) void {
+    std.debug.assert(input.len <= 8);
+    print("[auto {s}] ", .{label});
+    var kern = g.AutoKernel(Spec).init();
     defer kern.deinit();
     print("({s}) ", .{@tagName(kern.selected())});
-    var data = [_]f32{ -3, -1, 0, 1, 3 };
-    kern.run(&data, .{ .scale = 2 }) catch unreachable;
-    check("scale_relu", allApproxEq(&data, &.{ 0, 0, 0, 2, 6 }));
-    print("{any}\n", .{data});
-}
 
-fn testAutoAffine() void {
-    print("[auto affine] ", .{});
-    var kern = g.AutoKernel(k.affine_transform).init();
-    defer kern.deinit();
-    print("({s}) ", .{@tagName(kern.selected())});
-    var data = [_]f32{ 0, 1, -1, 10 };
-    kern.run(&data, .{ .scale = 3, .bias = 1, .enabled = true }) catch unreachable;
-    check("affine", allApproxEq(&data, &.{ 1, 4, -2, 31 }));
-    print("{any}\n", .{data});
-}
+    var storage: [8]Spec.Value = undefined;
+    const data = storage[0..input.len];
+    @memcpy(data, input);
+    kern.run(data, params) catch unreachable;
 
-fn testAutoClamp() void {
-    print("[auto clamp] ", .{});
-    var kern = g.AutoKernel(k.clamp).init();
-    defer kern.deinit();
-    print("({s}) ", .{@tagName(kern.selected())});
-    var data = [_]f32{ -5, 0, 0.5, 1, 2 };
-    kern.run(&data, .{ .scale = 0 }) catch unreachable;
-    check("clamp", allApproxEq(&data, &.{ 0, 0, 0.5, 1, 1 }));
-    print("{any}\n", .{data});
-}
-
-fn testAutoNegate() void {
-    print("[auto negate] ", .{});
-    var kern = g.AutoKernel(k.neg).init();
-    defer kern.deinit();
-    print("({s}) ", .{@tagName(kern.selected())});
-    var data = [_]f32{ -3, 0, 7 };
-    kern.run(&data, .{ .scale = 0 }) catch unreachable;
-    check("negate", allApproxEq(&data, &.{ 3, 0, -7 }));
-    print("{any}\n", .{data});
-}
-
-fn testAutoSquare() void {
-    print("[auto square] ", .{});
-    var kern = g.AutoKernel(k.sq).init();
-    defer kern.deinit();
-    print("({s}) ", .{@tagName(kern.selected())});
-    var data = [_]f32{ -2, 0, 3, 0.5 };
-    kern.run(&data, .{ .scale = 0 }) catch unreachable;
-    check("square", allApproxEq(&data, &.{ 4, 0, 9, 0.25 }));
-    print("{any}\n", .{data});
-}
-
-fn testAutoWeighted() void {
-    print("[auto weighted] ", .{});
-    var kern = g.AutoKernel(k.weighted).init();
-    defer kern.deinit();
-    print("({s}) ", .{@tagName(kern.selected())});
-    var data = [_]f32{ 5, 0 };
-    kern.run(&data, .{ .weights = .{ 2, 3, 4, 1 } }) catch unreachable;
-    check("weighted[0]", approxEq(data[0], 23));
-    check("weighted[1]", approxEq(data[1], 13));
-    print("{any}\n", .{data});
-}
-
-fn testAutoNested() void {
-    print("[auto nested] ", .{});
-    var kern = g.AutoKernel(k.nested).init();
-    defer kern.deinit();
-    print("({s}) ", .{@tagName(kern.selected())});
-    var data = [_]f32{ 2, -1 };
-    kern.run(&data, .{ .inner = .{ .scale = 3 }, .offset = 10 }) catch unreachable;
-    check("nested", allApproxEq(&data, &.{ 16, 7 }));
-    print("{any}\n", .{data});
-}
-
-fn testAutoFusedScaleSquare() void {
-    print("[auto fused scale*sq] ", .{});
-    var kern = g.AutoKernel(k.scale_square).init();
-    defer kern.deinit();
-    print("({s}) ", .{@tagName(kern.selected())});
-    var data = [_]f32{ 3, -2 };
-    kern.run(&data, .{ .scale = 2 }) catch unreachable;
-    check("fused_scale_sq", allApproxEq(&data, &.{ 36, 16 }));
-    print("{any}\n", .{data});
-}
-
-fn testAutoTripleFused() void {
-    print("[auto triple fused] ", .{});
-    var kern = g.AutoKernel(k.triple_fused).init();
-    defer kern.deinit();
-    print("({s}) ", .{@tagName(kern.selected())});
-    var data = [_]f32{ -3, 2 };
-    kern.run(&data, .{ .scale = -2 }) catch unreachable;
-    check("triple_fused", allApproxEq(&data, &.{ 36, 16 }));
-    print("{any}\n", .{data});
-}
-
-fn testAutoAbsThenScale() void {
-    print("[auto abs->scale] ", .{});
-    var kern = g.AutoKernel(k.abs_then_scale).init();
-    defer kern.deinit();
-    print("({s}) ", .{@tagName(kern.selected())});
-    var data = [_]f32{ -5, 3 };
-    kern.run(&data, .{ .scale = 10 }) catch unreachable;
-    check("abs_then_scale", allApproxEq(&data, &.{ 50, 30 }));
-    print("{any}\n", .{data});
-}
-
-fn testAutoF64() void {
-    print("[auto f64] ", .{});
-    var kern = g.AutoKernel(k.double_f64).init();
-    defer kern.deinit();
-    print("({s}) ", .{@tagName(kern.selected())});
-    var data = [_]f64{ 1.5, -2.25, 0 };
-    kern.run(&data, .{ .scale = 0 }) catch unreachable;
-    check("f64[0]", @abs(data[0] - 3.0) < 1e-10);
-    check("f64[1]", @abs(data[1] - -4.5) < 1e-10);
-    check("f64[2]", data[2] == 0);
-    print("{any}\n", .{data});
-}
-
-fn testAutoU32() void {
-    print("[auto u32 shift_mask] ", .{});
-    var kern = g.AutoKernel(k.shift_mask).init();
-    defer kern.deinit();
-    print("({s}) ", .{@tagName(kern.selected())});
-    var data = [_]u32{ 0xFF00, 0xABCD, 0 };
-    kern.run(&data, .{ .shift = 8, .mask = 0xFF }) catch unreachable;
-    check("u32[0]", data[0] == 0xFF);
-    check("u32[1]", data[1] == 0xAB);
-    check("u32[2]", data[2] == 0);
-    print("{any}\n", .{data});
-}
-
-fn testAutoI16() void {
-    print("[auto i16 saturate] ", .{});
-    var kern = g.AutoKernel(k.saturate_i16).init();
-    defer kern.deinit();
-    print("({s}) ", .{@tagName(kern.selected())});
-    var data = [_]i16{ -200, -50, 0, 50, 200 };
-    kern.run(&data, .{ .scale = 0 }) catch unreachable;
-    check("i16_sat", data[0] == -100 and data[1] == -50 and data[2] == 0 and data[3] == 50 and data[4] == 100);
-    print("{any}\n", .{data});
-}
-
-fn testAutoEmpty() void {
-    print("[auto empty] ", .{});
-    var kern = g.AutoKernel(k.scale_relu).init();
-    defer kern.deinit();
-    print("({s}) ", .{@tagName(kern.selected())});
-    var data = [_]f32{};
-    kern.run(&data, .{ .scale = 2 }) catch unreachable;
-    check("empty", data.len == 0);
-    print("ok\n", .{});
-}
-
-fn testAutoSingle() void {
-    print("[auto single] ", .{});
-    var kern = g.AutoKernel(k.sq).init();
-    defer kern.deinit();
-    print("({s}) ", .{@tagName(kern.selected())});
-    var data = [_]f32{42};
-    kern.run(&data, .{ .scale = 0 }) catch unreachable;
-    check("single", approxEq(data[0], 1764));
+    check(label, allSame(Spec.Value, data, expected));
     print("{any}\n", .{data});
 }
 
@@ -282,7 +151,7 @@ fn testAutoLarge() void {
     for (buf, 0..) |v, i| {
         const orig: f32 = @as(f32, @floatFromInt(i)) - 5000;
         const expected: f32 = if (orig > 0) orig else 0;
-        if (!approxEq(v, expected)) {
+        if (!same(f32, v, expected)) {
             ok = false;
             break;
         }
@@ -314,7 +183,7 @@ fn testSecondRoot() void {
         print("  run failed: {s}\n", .{@errorName(e)});
         return;
     };
-    check("second_root_result", allApproxEq(&data, &[_]f32{ 11, 12, 13 }));
+    check("second_root_result", allSame(f32, &data, &[_]f32{ 11, 12, 13 }));
     // One root loaded, not both: the other blob is never JIT'd.
     check("second_root_loaded_one_blob", loaded() == before + 1);
 
@@ -337,7 +206,7 @@ fn testSecondRoot() void {
     by_name.launch(.{ .x = 1 }, .{ .x = 256 }, 0, &.{ device_buf.argPtr(), g.interface.arg(&len) }) catch return;
     by_name.synchronize() catch return;
     device_buf.download(@ptrCast(&host_data), @sizeOf(@TypeOf(host_data))) catch return;
-    check("runtime_named_kernel_result", allApproxEq(&host_data, &[_]f32{ 3, 6, 9 }));
+    check("runtime_named_kernel_result", allSame(f32, &host_data, &[_]f32{ 3, 6, 9 }));
 
     // An unknown name is an error, not a panic.
     const bogus = std.fmt.bufPrint(&buf2, "raw_{s}", .{if (data[0] > 0) "nope" else "triple"}) catch return;
@@ -438,7 +307,7 @@ fn testRuntimeDynamic() void {
         const orig: f32 = @as(f32, @floatFromInt(i)) - 512;
         const y = orig * 2.0;
         const expected: f32 = if (y > 0) y else 0;
-        if (!approxEq(v, expected)) {
+        if (!same(f32, v, expected)) {
             ok = false;
             break;
         }
@@ -454,7 +323,7 @@ fn testRuntimeDynamic() void {
     };
     var copy_result: [N]f32 = undefined;
     buf2.download(@ptrCast(&copy_result), byte_size) catch return;
-    check("runtime_copy", allApproxEq(&copy_result, &result));
+    check("runtime_copy", allSame(f32, &copy_result, &result));
 
     // Partial upload/download (uploadAt/downloadAt)
     var partial = [_]f32{ 99, 88, 77 };
@@ -468,7 +337,7 @@ fn testRuntimeDynamic() void {
         print("  downloadAt failed: {s}\n", .{@errorName(e)});
         return;
     };
-    check("runtime_partial_xfer", allApproxEq(&readback, &.{ 99, 88, 77 }));
+    check("runtime_partial_xfer", allSame(f32, &readback, &.{ 99, 88, 77 }));
 
     // Stream
     var stream = gpu.createStream() catch |e| {
@@ -496,7 +365,7 @@ fn testCpuReference() void {
     var data = [_]f32{ -3, -1, 0, 1, 3 };
     var kern = g.Kernel(k.scale_relu, .cpu).init(0) catch unreachable;
     kern.run(&data, .{ .scale = 2 }) catch unreachable;
-    check("cpu_ref", allApproxEq(&data, &.{ 0, 0, 0, 2, 6 }));
+    check("cpu_ref", allSame(f32, &data, &.{ 0, 0, 0, 2, 6 }));
     print("ok\n", .{});
 }
 
@@ -550,7 +419,7 @@ fn testRawKernel() void {
         return;
     };
 
-    check("raw_increment", allApproxEq(&data, &.{ 2, 3, 4, 5, 6 }));
+    check("raw_increment", allSame(f32, &data, &.{ 2, 3, 4, 5, 6 }));
     print("{any}\n", .{data});
 }
 
@@ -560,12 +429,12 @@ fn testAbiPack() void {
 
     const packed_scalar = abi.pack(k.ScalarParams, .{ .scale = 3.14 });
     const unpacked_scalar = abi.unpack(k.ScalarParams, packed_scalar);
-    check("abi_scalar", approxEq(unpacked_scalar.scale, 3.14));
+    check("abi_scalar", same(f32, unpacked_scalar.scale, 3.14));
 
     const packed_multi = abi.pack(k.MultiParams, .{ .scale = 2, .bias = -1, .enabled = true });
     const unpacked_multi = abi.unpack(k.MultiParams, packed_multi);
-    check("abi_multi_scale", approxEq(unpacked_multi.scale, 2));
-    check("abi_multi_bias", approxEq(unpacked_multi.bias, -1));
+    check("abi_multi_scale", same(f32, unpacked_multi.scale, 2));
+    check("abi_multi_bias", same(f32, unpacked_multi.bias, -1));
     check("abi_multi_bool", unpacked_multi.enabled == true);
 
     const packed_false = abi.pack(k.MultiParams, .{ .scale = 0, .bias = 0, .enabled = false });
@@ -578,7 +447,7 @@ fn testAbiPack() void {
 
     const packed_nested = abi.pack(k.NestedParams, .{ .inner = .{ .scale = 7 }, .offset = -3 });
     const unpacked_nested = abi.unpack(k.NestedParams, packed_nested);
-    check("abi_nested", approxEq(unpacked_nested.inner.scale, 7) and approxEq(unpacked_nested.offset, -3));
+    check("abi_nested", same(f32, unpacked_nested.inner.scale, 7) and same(f32, unpacked_nested.offset, -3));
 
     const B = abi.Boundary(k.MultiParams);
     check("abi_extern_layout", @typeInfo(B).@"struct".layout == .@"extern");
@@ -590,10 +459,10 @@ fn testAbiPack() void {
 
 fn testFusionDirect() void {
     print("[fusion direct] ", .{});
-    check("fused_scale_sq", approxEq(k.ScaleSquare.eval(3, .{ .scale = 2 }), 36));
-    check("fused_abs_relu", approxEq(k.AbsRelu.eval(-5, .{ .scale = 0 }), 5));
-    check("fused_triple", approxEq(k.ScaleAbsSquare.eval(-3, .{ .scale = -2 }), 36));
-    check("fused_abs_scale", approxEq(k.AbsThenScale.eval(-4, .{ .scale = 3 }), 12));
+    check("fused_scale_sq", same(f32, k.ScaleSquare.eval(3, .{ .scale = 2 }), 36));
+    check("fused_abs_relu", same(f32, k.AbsRelu.eval(-5, .{ .scale = 0 }), 5));
+    check("fused_triple", same(f32, k.ScaleAbsSquare.eval(-3, .{ .scale = -2 }), 36));
+    check("fused_abs_scale", same(f32, k.AbsThenScale.eval(-4, .{ .scale = 3 }), 12));
     print("ok\n", .{});
 }
 
