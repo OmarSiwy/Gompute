@@ -16,9 +16,9 @@ pub fn GlobalPtr(comptime T: type) type {
     return [*]addrspace(.global) T;
 }
 
-pub inline fn globalIdX(comptime block_size: u32) usize {
-    return builtins.globalIdX(block_size);
-}
+/// Alias, not a wrapper, so `g.globalIdX` carries `builtins.globalIdX`'s
+/// `block_size` hazard doc at the name users actually type.
+pub const globalIdX = builtins.globalIdX;
 
 pub fn exportRaw(comptime name: []const u8, comptime function: anytype) void {
     @export(function, .{ .name = name });
