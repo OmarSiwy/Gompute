@@ -559,6 +559,10 @@ fn GpuKernel(comptime Spec: type, comptime gpu: Gpu) type {
             try self.dispatch(iface.Dim3.linear(count, Spec.block_size), &args);
         }
 
+        /// An out-of-range index selects nothing, so that slot of `out` keeps
+        /// the value the caller put there -- same contract as the CPU arm, and
+        /// as `scatterRun`. `src.len == 0` puts every index out of range, which
+        /// is why the early return is allowed to skip the round trip entirely.
         fn gatherRun(
             self: *Self,
             src: []const Spec.Value,
@@ -571,7 +575,9 @@ fn GpuKernel(comptime Spec: type, comptime gpu: Gpu) type {
             defer src_buf.free();
             var idx_buf = try self.staged(Spec.Index, idx);
             defer idx_buf.free();
-            var out_buf = try self.context.alloc(out.len * @sizeOf(Spec.Value));
+            // Uploaded, not just allocated: allocating alone would download
+            // uninitialized device memory into every unselected slot.
+            var out_buf = try self.staged(Spec.Value, out);
             defer out_buf.free();
             try self.launch(&src_buf, &idx_buf, &out_buf, out.len, src.len);
             try self.context.synchronize();
@@ -990,9 +996,12 @@ test "an index past the end is skipped, never a write outside the buffer" {
     const idx = [_]u32{ 2, 99, 0 };
     var out = [_]f32{ -1, -1, -1 };
     try gather_k.run(&src, &idx, &out);
-    // Slot 1's index is out of range: unspecified by contract, and on the CPU
-    // that means untouched. The neighbours must still be right.
+    // Slot 1's index is out of range, so nothing wrote it and it keeps what the
+    // caller left there. Not "unspecified": the GPU arm has to upload `out` to
+    // honour this, and without that the download hands back uninitialized
+    // device memory. The neighbours must still be right.
     try std.testing.expectEqual(@as(f32, 30), out[0]);
+    try std.testing.expectEqual(@as(f32, -1), out[1]);
     try std.testing.expectEqual(@as(f32, 10), out[2]);
 
     out = .{ -1, -1, -1 };
