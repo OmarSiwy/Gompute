@@ -642,7 +642,10 @@ fn reportSkip(comptime tag: []const u8, err: iface.Error, strict: bool) iface.Er
 }
 
 pub fn AutoKernel(comptime Spec: type) type {
-    return union(enum) {
+    // Tagged by `Backend` itself, not by an inferred enum: the tag *is* the
+    // answer `selected` returns, and the two cannot drift. Same shape the four
+    // unions in runtime/compute.zig already use.
+    return union(Backend) {
         cpu: Cpu,
         cuda: Cuda,
         hip: Hip,
@@ -681,11 +684,11 @@ pub fn AutoKernel(comptime Spec: type) type {
             return .{ .cpu = Cpu.init(0) catch unreachable };
         }
 
+        /// Drops whichever handle `init` picked. Same reset-not-teardown
+        /// contract as the handle's own `deinit`.
         pub fn deinit(self: *Self) void {
             switch (self.*) {
-                .cpu => |*k| k.deinit(),
-                .cuda => |*k| k.deinit(),
-                .hip => |*k| k.deinit(),
+                inline else => |*k| k.deinit(),
             }
         }
 
@@ -750,12 +753,9 @@ pub fn AutoKernel(comptime Spec: type) type {
             }.run,
         };
 
+        /// Which backend `init` actually picked.
         pub fn selected(self: *const Self) Backend {
-            return switch (self.*) {
-                .cpu => .cpu,
-                .cuda => .cuda,
-                .hip => .hip,
-            };
+            return self.*;
         }
     };
 }
