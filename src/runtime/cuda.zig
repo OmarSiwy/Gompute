@@ -352,19 +352,6 @@ pub const Context = struct {
         try self.makeCurrent();
         return loadModuleCached(self.ordinal, image);
     }
-
-    pub const attr_multiprocessor_count: c_int = 16;
-    pub const attr_cooperative_launch: c_int = 95;
-    pub const attr_max_threads_per_block: c_int = 1;
-    pub const attr_max_shared_memory_per_block: c_int = 8;
-    pub const attr_warp_size: c_int = 10;
-
-    pub fn deviceAttribute(self: *Context, attrib: c_int) Error!c_int {
-        try self.makeCurrent();
-        var v: c_int = 0;
-        try check(g.cuDeviceGetAttribute(&v, attrib, self.device), error.NoDevice);
-        return v;
-    }
 };
 
 pub const Buffer = struct {

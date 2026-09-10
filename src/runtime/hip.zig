@@ -40,8 +40,6 @@ const Api = struct {
     hipMemsetAsync: *const fn (hipDeviceptr_t, c_int, usize, hipStream_t) callconv(.c) hipError_t,
     hipHostMalloc: *const fn (*?*anyopaque, usize, c_uint) callconv(.c) hipError_t,
     hipHostFree: *const fn (*anyopaque) callconv(.c) hipError_t,
-    hipLaunchCooperativeKernel: *const fn (hipFunction_t, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, hipStream_t, ?[*]iface.Arg) callconv(.c) hipError_t,
-    hipOccupancyMaxActiveBlocksPerMultiprocessor: *const fn (*c_int, hipFunction_t, c_int, usize) callconv(.c) hipError_t,
     hipDeviceGetAttribute: *const fn (*c_int, c_int, hipDevice_t) callconv(.c) hipError_t,
     hipStreamCreate: *const fn (*hipStream_t, c_uint) callconv(.c) hipError_t,
     hipStreamDestroy: *const fn (hipStream_t) callconv(.c) hipError_t,
@@ -298,14 +296,6 @@ pub const Context = struct {
         try check(g.hipDeviceGetAttribute(&v, attrib, self.device), error.NoDevice);
         return v;
     }
-    pub fn maxCoopBlocks(self: *Context, k: Kernel, block_dim: u32, shared_bytes: usize) Error!u32 {
-        const coop = self.deviceAttribute(attr_cooperative_launch) catch 0;
-        if (coop == 0) return 0;
-        var per_sm: c_int = 0;
-        try check(g.hipOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, k.func, @intCast(block_dim), shared_bytes), error.LaunchFailed);
-        const sms = try self.deviceAttribute(attr_multiprocessor_count);
-        return @intCast(per_sm * sms);
-    }
 };
 
 pub const Buffer = struct {
@@ -404,10 +394,6 @@ pub const Kernel = struct {
     pub fn launchOnStream(self: Kernel, grid: Dim3, block: Dim3, shared_bytes: u32, args: []const iface.Arg, stream: hipStream_t) Error!void {
         ensureCurrent();
         try check(g.hipModuleLaunchKernel(self.func, grid.x, grid.y, grid.z, block.x, block.y, block.z, shared_bytes, stream, @constCast(args.ptr), null), error.LaunchFailed);
-    }
-    pub fn launchCooperative(self: Kernel, grid: Dim3, block: Dim3, shared_bytes: u32, args: []const iface.Arg, stream: hipStream_t) Error!void {
-        ensureCurrent();
-        try check(g.hipLaunchCooperativeKernel(self.func, grid.x, grid.y, grid.z, block.x, block.y, block.z, shared_bytes, stream, @constCast(args.ptr)), error.LaunchFailed);
     }
 };
 
