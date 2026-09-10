@@ -233,6 +233,12 @@ pub fn build(b: *std.Build) void {
     // project, so this also spares consumers the test artifacts at configure.
     if (b.pkg_hash.len != 0) return;
 
+    // device/math.zig checks `pow` against libm at 1 ulp, and libm is the only
+    // oracle precise enough to see that. Set here, past the early return, so
+    // only gompute's own build gets it -- a consumer's `gompute` module stays
+    // freestanding, which is the whole point of that file.
+    host_mod.link_libc = true;
+
     const unit_tests = b.addTest(.{ .root_module = host_mod });
     const run_unit_tests = b.addRunArtifact(unit_tests);
 

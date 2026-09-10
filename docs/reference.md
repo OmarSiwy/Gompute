@@ -293,40 +293,63 @@ var args = [_]g.interface.Arg{ buffer.argPtr(), g.interface.arg(&wire) };
 
 `@exp`, `@log`, `@sin` and friends do not compile for NVPTX or AMDGCN: those
 targets emit no libcalls, so the backend fails with `no libcall available for
-fexp` or `Cannot select: fsin`. `g.math` provides device-safe replacements that
-forward to libm on the host:
+fexp` or `Cannot select: fsin`. `g.math` provides device-safe replacements, and
+they compile on the host too, so one kernel source builds both ways.
 
 Every one is `inline fn (x: anytype) @TypeOf(x)`, except `pow(x, y)`. They take
-`f16`, `f32`, `f64`, and vectors of those.
+`f32` and `f64`; anything else is a compile error telling you to cast first.
 
-Device `f32` uses the hardware approximation instructions; device `f64` uses
-software implementations ported from musl; the host forwards to `std.math`.
-Measured on `sm_89`:
+`exp`, `exp2`, `log`, `log2`, `log10` and `pow` are ports of [ARM
+optimized-routines][aor] — ONE body each, used unchanged on the host, on NVPTX
+and on AMDGCN, for both widths (only `f32` `exp2` still uses the hardware
+instruction). Everything else is a musl port for device `f64` and a hardware
+approximation for device `f32`.
 
-| | Device `f32` | Device `f64` | Notes |
+[aor]: https://github.com/ARM-software/optimized-routines
+
+That is a correctness decision before it is a speed one: glibc ≥ 2.28 *is* ARM
+optimized-routines for exactly those functions, so a simulator scored against a
+glibc-linked reference now shares its arithmetic. Zig's own `@exp`/`@log` —
+and `extern "c" fn exp` too, because compiler_rt's static definition wins over
+the shared `libm` — are musl, a different algorithm that disagrees in the low
+bits.
+
+Ulp figures below are measured against the real glibc (`dlsym`'d past
+compiler_rt), ≥1e6 points per function over the full domain including
+subnormals, the saturation thresholds and the near-1 window; `sin`/`cos`/`tanh`
+and friends are measured on `sm_89` over x in (0, 8].
+
+| | `f32` | `f64` | Notes |
 | --- | --- | --- | --- |
-| `exp` | ≤3.7 ulp | ≤1 ulp | |
-| `exp2` | ≤1 ulp | ≤1 ulp | Exact for integer `x`. |
-| `log` | ≤3 ulp | ≤1 ulp | See the near-1 caveat below. |
-| `log2` | ≤4 ulp | ≤1 ulp | Same caveat. |
-| `log10` | ≤2 ulp | ≤1.1 ulp | Same caveat. |
+| `exp` | ≤1 ulp | ≤1 ulp | One body, host and device. |
+| `exp2` | ≤1 ulp | ≤1 ulp | Exact for integer `x`. `f32` is the hardware `exp2`. |
+| `log` | ≤1 ulp | ≤1 ulp | One body. Relative, not absolute — see below. |
+| `log2` | ≤1 ulp | ≤1 ulp | Own table; powers of two exact. |
+| `log10` | ≤1 ulp | ≤2 ulp vs glibc | 0.52 ulp against a 60-digit reference: the slack is glibc's, whose `log10` is not optimized-routines. |
+| `pow` | ≤1 ulp | ≤1 ulp | Integer y in ±64 is square-and-multiply, so exact. |
 | `sin` | ~1e-6 **absolute** | ≤1 ulp | f64 matches glibc bit-for-bit over (0, 8]. |
 | `cos` | ~1e-6 **absolute** | ≤1 ulp | |
 | `tan` | sin/cos | sin/cos | 0.16 absolute at 3π/2 in f32; error blows up at the poles. |
 | `tanh` | ≤1.8 ulp | ≤1 ulp | |
 | `sinh` | ≤3.7 ulp | ≤1.4 ulp | |
 | `cosh` | ≤3.7 ulp | similar | Overflows to infinity just under x = ±710 in f64. |
-| `pow` | ≤3 ulp | ≤4 ulp | Integer y in ±64 is square-and-multiply, so exact. |
 | `sqrt` | exact | exact | Native instruction on both backends. |
 | `rsqrt` | exact | exact | `1/sqrt`, two IEEE ops — not the hardware approximation. |
 
-**The absolute-error caveat.** `sin`, `cos`, and the `log` family are bounded
-*absolutely* by the f32 hardware, not relatively. `lg2.approx.f32` is good to
-about 2^-21 of absolute error, which is fine for `log(1000)` and is pure noise
-for `log(1.0000001)`. Relative accuracy therefore collapses near each
-function's zeros: `log` near 1, `sin` near multiples of π, `cos` near π/2 + kπ.
-If you are doing `log1p`-style work in that neighbourhood, compute in `f64` and
-cast the result.
+**The absolute-error caveat.** `sin` and `cos` are bounded *absolutely* by the
+f32 hardware, not relatively. `sin.approx.f32` is good to about 2^-20 of
+absolute error, which is fine at x = 3 and is pure noise at x = π. Relative
+accuracy therefore collapses near each function's zeros: `sin` near multiples
+of π, `cos` near π/2 + kπ. If you are working in that neighbourhood, compute in
+`f64` and cast the result.
+
+The `log` family used to have the same problem — `lg2.approx.f32` bounds its
+error absolutely at ~2^-21, so `log(1.0000001)` was noise — which is what the
+`logf`/`log2f`/`log10f` ports fixed. They accumulate in binary64 and round
+once, so device `f32` `log` now costs about ten `f64` operations (1/64 rate on
+consumer NVIDIA) and is worth it only because it is otherwise wrong where it
+matters. A throughput-bound `f32` kernel that genuinely never goes near x = 1
+should call `@log2` directly.
 
 ## Backend status
 
