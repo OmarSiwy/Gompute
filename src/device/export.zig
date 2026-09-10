@@ -6,7 +6,10 @@ const abi = @import("../core/abi.zig");
 const spec = @import("../core/spec.zig");
 const builtins = @import("builtins.zig");
 
-fn Entry(comptime Spec: type) type {
+/// `map` and `map_indexed` share one entry shape: same in-place signature, same
+/// bounds guard, and `eval` differs only by the extra index argument. The host
+/// already treats them as one case (`.map, .map_indexed => mapLaunch`).
+fn Entry(comptime Spec: type, comptime indexed: bool) type {
     return struct {
         pub fn run(
             data: [*]addrspace(.global) Spec.Value,
@@ -16,22 +19,10 @@ fn Entry(comptime Spec: type) type {
             const i = builtins.globalIdX(Spec.block_size);
             if (i >= len) return;
             const params = abi.unpack(Spec.Parameters, packed_params);
-            data[i] = Spec.eval(data[i], params);
-        }
-    };
-}
-
-fn IndexedEntry(comptime Spec: type) type {
-    return struct {
-        pub fn run(
-            data: [*]addrspace(.global) Spec.Value,
-            len: u64,
-            packed_params: Spec.BoundaryParameters,
-        ) callconv(.kernel) void {
-            const i = builtins.globalIdX(Spec.block_size);
-            if (i >= len) return;
-            const params = abi.unpack(Spec.Parameters, packed_params);
-            data[i] = Spec.eval(data[i], @as(u64, i), params);
+            data[i] = if (indexed)
+                Spec.eval(data[i], @as(u64, i), params)
+            else
+                Spec.eval(data[i], params);
         }
     };
 }
@@ -177,8 +168,8 @@ fn isSpec(comptime Spec: anytype) bool {
 
 fn exportOne(comptime Spec: type) void {
     const E = switch (comptime spec.kindOf(Spec)) {
-        .map => Entry(Spec),
-        .map_indexed => IndexedEntry(Spec),
+        .map => Entry(Spec, false),
+        .map_indexed => Entry(Spec, true),
         .map_to => MapToEntry(Spec),
         .zip => ZipEntry(Spec),
         .reduce => ReduceEntry(Spec),
