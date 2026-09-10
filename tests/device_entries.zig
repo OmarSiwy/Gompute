@@ -52,3 +52,16 @@ pub const empty_params_entry = g.map("t_no_params", f32, NoParams, negate, .{ .b
 comptime {
     g.exportKernels(@This());
 }
+
+// The device half of the host/device mirror: `GlobalPtr`, `kernel_callconv`,
+// `globalIdX` and `exportRaw` all resolve to something different in
+// `src/root.zig`, and only a device compilation sees these versions.
+fn rawDouble(data: g.GlobalPtr(f32), len: u64) callconv(g.kernel_callconv) void {
+    const i = g.globalIdX(256);
+    if (i >= len) return;
+    data[i] *= 2;
+}
+
+comptime {
+    if (g.is_device) g.exportRaw("t_raw_double", &rawDouble);
+}
