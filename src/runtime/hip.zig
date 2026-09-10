@@ -387,6 +387,9 @@ pub const Stream = struct {
         try check(g.hipStreamSynchronize(self.stream), error.SyncFailed);
     }
     pub fn deinit(self: *Stream) void {
+        // Same reason as `Buffer.free`: `Stream{}` is a value any caller can
+        // build, and `g` is undefined until something dlopen'd the runtime.
+        if (!loaded) return;
         ensureCurrent();
         _ = g.hipStreamDestroy(self.stream);
         self.* = .{};
@@ -412,6 +415,9 @@ test "a handle-less Buffer errors instead of panicking, and free is idempotent" 
     try std.testing.expectError(error.InvalidArgument, buffer.fillAsync(0, 1, &stream));
     buffer.free();
     buffer.free();
+    // And the same again for the Stream, which used to reach hipStreamDestroy
+    // through an undefined `g` on a machine with no ROCm.
+    if (!loaded) stream.deinit();
 }
 
 test "a successful call clears the last driver error" {
