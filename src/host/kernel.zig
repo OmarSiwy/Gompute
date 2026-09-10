@@ -188,6 +188,17 @@ pub const Gpu = struct {
 pub const gpu_cuda: Gpu = .{ .backend = .cuda, .rt = cuda, .has = "has_cuda", .images = "cuda_images", .index = "cuda_index", .example_cpu = "sm_89" };
 pub const gpu_hip: Gpu = .{ .backend = .hip, .rt = hip, .has = "has_hip", .images = "hip_images", .index = "hip_index", .example_cpu = "gfx1100" };
 
+/// The descriptor for a backend tag, for the device-only entry points in
+/// raw.zig. `what` names the caller so the `.cpu` diagnostic can say which one
+/// was device-only, rather than just that the tag was wrong.
+pub fn gpuOf(comptime backend: Backend, comptime what: []const u8) Gpu {
+    return switch (backend) {
+        .cuda => gpu_cuda,
+        .hip => gpu_hip,
+        .cpu => @compileError(what ++ " is device-only; use a normal Zig function on CPU"),
+    };
+}
+
 /// Whether this build actually carries a device artifact for `gpu`.
 ///
 /// The only public way to ask before writing `Kernel(Spec, .cuda)`, which is a

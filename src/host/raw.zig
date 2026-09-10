@@ -4,22 +4,19 @@ const std = @import("std");
 const iface = @import("../core/interface.zig");
 const host = @import("kernel.zig");
 
+/// A hand-written device entry point, loaded by the name it was exported under.
+/// Device-only: naming `.cpu` is a compile error, because there is nothing for
+/// this to load and a plain Zig function is what you want instead.
 pub fn RawKernel(comptime entry_name: [:0]const u8, comptime backend: host.Backend) type {
-    return switch (backend) {
-        .cuda => host.requireArtifacts(host.gpu_cuda, GpuRaw(entry_name, host.gpu_cuda)),
-        .hip => host.requireArtifacts(host.gpu_hip, GpuRaw(entry_name, host.gpu_hip)),
-        .cpu => @compileError("RawKernel is device-only; use a normal Zig function on CPU"),
-    };
+    const gpu = host.gpuOf(backend, "RawKernel");
+    return host.requireArtifacts(gpu, GpuRaw(entry_name, gpu));
 }
 
 /// The handle `rawKernelByName` returns: a `RawKernel` whose kernel was picked
 /// at run time, so it has no comptime `init` of its own.
 pub fn RawByName(comptime backend: host.Backend) type {
-    return switch (backend) {
-        .cuda => host.requireArtifacts(host.gpu_cuda, GpuRaw(null, host.gpu_cuda)),
-        .hip => host.requireArtifacts(host.gpu_hip, GpuRaw(null, host.gpu_hip)),
-        .cpu => @compileError("kernel-by-name is device-only; use a normal Zig function on CPU"),
-    };
+    const gpu = host.gpuOf(backend, "kernel-by-name");
+    return host.requireArtifacts(gpu, GpuRaw(null, gpu));
 }
 
 /// Load the kernel called `name`, decided at run time -- from a parsed netlist,
@@ -31,11 +28,7 @@ pub fn rawKernelByName(
     name: []const u8,
     ordinal: c_int,
 ) iface.Error!RawByName(backend) {
-    const gpu = switch (backend) {
-        .cuda => host.gpu_cuda,
-        .hip => host.gpu_hip,
-        .cpu => comptime unreachable, // RawByName already rejected .cpu
-    };
+    const gpu = comptime host.gpuOf(backend, "kernel-by-name");
     const opened = try host.openModuleByName(gpu, name, ordinal);
     return .{ .context = opened.context, .module = opened.module, .kernel = opened.kernel };
 }
