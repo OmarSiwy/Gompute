@@ -34,29 +34,12 @@ pub fn exportRaw(comptime _: []const u8, comptime _: anytype) void {}
 pub const Dim3 = interface.Dim3;
 pub const Error = interface.Error;
 
-pub fn map(
-    comptime name: [:0]const u8,
-    comptime T: type,
-    comptime Params: type,
-    comptime func: anytype,
-    comptime options: MapOptions,
-) type {
-    return spec.Map(name, T, Params, func, options);
-}
-
+/// The operation set. Aliases, not wrappers: repeating these signatures in both
+/// roots is two places to get them wrong.
+pub const map = spec.Map;
 /// `map` with `T` and `Params` read off `func`'s signature.
-pub fn mapFn(
-    comptime name: [:0]const u8,
-    comptime func: anytype,
-    comptime options: MapOptions,
-) type {
-    return spec.MapFn(name, func, options);
-}
-
+pub const mapFn = spec.MapFn;
 pub const splat = spec.splat;
-
-/// The rest of the operation set. Aliases, not wrappers: repeating these
-/// signatures in both roots is two places to get them wrong.
 pub const mapTo = spec.MapTo;
 pub const zip = spec.Zip;
 pub const mapIndexed = spec.MapIndexed;
