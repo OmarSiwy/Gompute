@@ -15,36 +15,41 @@
 
 const std = @import("std");
 
-const Writer = std.ArrayList(u8);
+/// Every writer here is `std.Io.Writer.Allocating` over the caller's arena, so
+/// the only error it can produce is OOM and there is nothing a build-time tool
+/// can usefully do about that.
+fn put(w: *std.Io.Writer, text: []const u8) void {
+    w.writeAll(text) catch @panic("OOM");
+}
 
-fn put(out: *Writer, a: std.mem.Allocator, text: []const u8) void {
-    out.appendSlice(a, text) catch @panic("OOM");
+fn fmt(w: *std.Io.Writer, comptime format: []const u8, args: anytype) void {
+    w.print(format, args) catch @panic("OOM");
 }
 
 /// HTML-escape. Applied to every literal run, so nothing in the source can
 /// inject markup.
-fn escape(out: *Writer, a: std.mem.Allocator, text: []const u8) void {
+fn escape(w: *std.Io.Writer, text: []const u8) void {
     for (text) |c| switch (c) {
-        '&' => put(out, a, "&amp;"),
-        '<' => put(out, a, "&lt;"),
-        '>' => put(out, a, "&gt;"),
-        '"' => put(out, a, "&quot;"),
-        else => out.append(a, c) catch @panic("OOM"),
+        '&' => put(w, "&amp;"),
+        '<' => put(w, "&lt;"),
+        '>' => put(w, "&gt;"),
+        '"' => put(w, "&quot;"),
+        else => w.writeByte(c) catch @panic("OOM"),
     };
 }
 
 /// Inline spans, in one pass. Code spans are handled first by construction:
 /// once a backtick opens, everything to the closing backtick is literal, so
 /// `**` or `[` inside a code span cannot be misread as markup.
-fn inlineSpans(out: *Writer, a: std.mem.Allocator, src: []const u8) void {
+fn inlineSpans(w: *std.Io.Writer, src: []const u8) void {
     var i: usize = 0;
     while (i < src.len) {
         // `code`
         if (src[i] == '`') {
             if (std.mem.indexOfScalarPos(u8, src, i + 1, '`')) |end| {
-                put(out, a, "<code>");
-                escape(out, a, src[i + 1 .. end]);
-                put(out, a, "</code>");
+                put(w, "<code>");
+                escape(w, src[i + 1 .. end]);
+                put(w, "</code>");
                 i = end + 1;
                 continue;
             }
@@ -54,11 +59,11 @@ fn inlineSpans(out: *Writer, a: std.mem.Allocator, src: []const u8) void {
             if (std.mem.indexOfScalarPos(u8, src, i, ']')) |close| {
                 if (close + 1 < src.len and src[close + 1] == '(') {
                     if (std.mem.indexOfScalarPos(u8, src, close + 2, ')')) |paren| {
-                        put(out, a, "<a href=\"");
-                        escape(out, a, src[close + 2 .. paren]);
-                        put(out, a, "\">");
-                        inlineSpans(out, a, src[i + 1 .. close]);
-                        put(out, a, "</a>");
+                        put(w, "<a href=\"");
+                        escape(w, src[close + 2 .. paren]);
+                        put(w, "\">");
+                        inlineSpans(w, src[i + 1 .. close]);
+                        put(w, "</a>");
                         i = paren + 1;
                         continue;
                     }
@@ -68,9 +73,9 @@ fn inlineSpans(out: *Writer, a: std.mem.Allocator, src: []const u8) void {
         // **bold**
         if (i + 1 < src.len and src[i] == '*' and src[i + 1] == '*') {
             if (std.mem.indexOfPos(u8, src, i + 2, "**")) |end| {
-                put(out, a, "<strong>");
-                inlineSpans(out, a, src[i + 2 .. end]);
-                put(out, a, "</strong>");
+                put(w, "<strong>");
+                inlineSpans(w, src[i + 2 .. end]);
+                put(w, "</strong>");
                 i = end + 2;
                 continue;
             }
@@ -79,14 +84,14 @@ fn inlineSpans(out: *Writer, a: std.mem.Allocator, src: []const u8) void {
         // multiplication in the prose around this codebase.
         if (src[i] == '*' and i + 1 < src.len and src[i + 1] != ' ') {
             if (std.mem.indexOfScalarPos(u8, src, i + 1, '*')) |end| {
-                put(out, a, "<em>");
-                inlineSpans(out, a, src[i + 1 .. end]);
-                put(out, a, "</em>");
+                put(w, "<em>");
+                inlineSpans(w, src[i + 1 .. end]);
+                put(w, "</em>");
                 i = end + 1;
                 continue;
             }
         }
-        escape(out, a, src[i .. i + 1]);
+        escape(w, src[i .. i + 1]);
         i += 1;
     }
 }
@@ -110,46 +115,46 @@ fn tokenClass(tag: std.zig.Token.Tag, text: []const u8) ?[]const u8 {
     };
 }
 
-fn span(out: *Writer, a: std.mem.Allocator, class: []const u8, text: []const u8) void {
-    put(out, a, "<span class=\"");
-    put(out, a, class);
-    put(out, a, "\">");
-    escape(out, a, text);
-    put(out, a, "</span>");
+fn span(w: *std.Io.Writer, class: []const u8, text: []const u8) void {
+    fmt(w, "<span class=\"{s}\">", .{class});
+    escape(w, text);
+    put(w, "</span>");
 }
 
 /// The text between two tokens: whitespace, and `//` comments, which the
 /// tokenizer skips rather than reporting.
-fn betweenTokens(out: *Writer, a: std.mem.Allocator, text: []const u8) void {
+fn betweenTokens(w: *std.Io.Writer, text: []const u8) void {
     var i: usize = 0;
     while (std.mem.indexOfPos(u8, text, i, "//")) |start| {
-        escape(out, a, text[i..start]);
+        escape(w, text[i..start]);
         const end = std.mem.indexOfScalarPos(u8, text, start, '\n') orelse text.len;
-        span(out, a, "hl-c", text[start..end]);
+        span(w, "hl-c", text[start..end]);
         i = end;
     }
-    escape(out, a, text[i..]);
+    escape(w, text[i..]);
 }
 
 /// Colour a ```zig block with the compiler's own tokenizer, so the docs cannot
 /// disagree with the language about what a keyword is. Everything is escaped on
 /// the way out, exactly as an unhighlighted block would be.
-fn highlightZig(out: *Writer, a: std.mem.Allocator, src: []const u8) void {
+fn highlightZig(w: *std.Io.Writer, a: std.mem.Allocator, src: []const u8) void {
     const buf = a.dupeZ(u8, src) catch @panic("OOM");
     var tokenizer = std.zig.Tokenizer.init(buf);
     var prev: usize = 0;
     while (true) {
         const token = tokenizer.next();
-        betweenTokens(out, a, buf[prev..token.loc.start]);
+        betweenTokens(w, buf[prev..token.loc.start]);
         if (token.tag == .eof) break;
         const text = buf[token.loc.start..token.loc.end];
-        if (tokenClass(token.tag, text)) |class| span(out, a, class, text) else escape(out, a, text);
+        if (tokenClass(token.tag, text)) |class| span(w, class, text) else escape(w, text);
         prev = token.loc.end;
     }
 }
 
+/// Arena-scoped, like everything else here: the result is a slice into memory
+/// that is never freed, and it stays valid as long as `a`'s arena does.
 fn slug(a: std.mem.Allocator, text: []const u8) []const u8 {
-    var s: Writer = .empty;
+    var s: std.ArrayList(u8) = .empty;
     var dash = false;
     for (text) |c| {
         if (std.ascii.isAlphanumeric(c)) {
@@ -175,27 +180,27 @@ fn isTableRule(line: []const u8) bool {
     return true;
 }
 
-fn emitCells(out: *Writer, a: std.mem.Allocator, line: []const u8, tag: []const u8) void {
+fn emitCells(w: *std.Io.Writer, line: []const u8, tag: []const u8) void {
     const trimmed = std.mem.trim(u8, line, "| \t");
     var it = std.mem.splitScalar(u8, trimmed, '|');
-    put(out, a, "<tr>");
+    put(w, "<tr>");
     while (it.next()) |cell| {
-        put(out, a, "<");
-        put(out, a, tag);
-        put(out, a, ">");
-        inlineSpans(out, a, std.mem.trim(u8, cell, " \t"));
-        put(out, a, "</");
-        put(out, a, tag);
-        put(out, a, ">");
+        fmt(w, "<{s}>", .{tag});
+        inlineSpans(w, std.mem.trim(u8, cell, " \t"));
+        fmt(w, "</{s}>", .{tag});
     }
-    put(out, a, "</tr>\n");
+    put(w, "</tr>\n");
 }
 
 const Rendered = struct { body: []const u8, toc: []const u8, title: []const u8 };
 
-pub fn render(a: std.mem.Allocator, src: []const u8) Rendered {
-    var body: Writer = .empty;
-    var toc: Writer = .empty;
+/// Render one page. `a` must be an arena: nothing here is ever freed, and the
+/// three slices in the result point into it.
+fn render(a: std.mem.Allocator, src: []const u8) Rendered {
+    var body_out: std.Io.Writer.Allocating = .init(a);
+    var toc_out: std.Io.Writer.Allocating = .init(a);
+    const body = &body_out.writer;
+    const toc = &toc_out.writer;
     var title: []const u8 = "Gompute";
 
     var lines: std.ArrayList([]const u8) = .empty;
@@ -215,19 +220,17 @@ pub fn render(a: std.mem.Allocator, src: []const u8) Rendered {
         // info string picks the highlighter; anything but `zig` stays plain.
         if (std.mem.startsWith(u8, line, "```")) {
             const lang = std.mem.trim(u8, line[3..], " \t");
-            var block: Writer = .empty;
+            var block: std.Io.Writer.Allocating = .init(a);
             i += 1;
-            while (i < lines.items.len and !std.mem.startsWith(u8, lines.items[i], "```")) : (i += 1) {
-                block.appendSlice(a, lines.items[i]) catch @panic("OOM");
-                block.append(a, '\n') catch @panic("OOM");
-            }
+            while (i < lines.items.len and !std.mem.startsWith(u8, lines.items[i], "```")) : (i += 1)
+                fmt(&block.writer, "{s}\n", .{lines.items[i]});
             i += 1; // closing fence
-            put(&body, a, "<pre><code>");
+            put(body, "<pre><code>");
             if (std.mem.eql(u8, lang, "zig"))
-                highlightZig(&body, a, block.items)
+                highlightZig(body, a, block.written())
             else
-                escape(&body, a, block.items);
-            put(&body, a, "</code></pre>\n");
+                escape(body, block.written());
+            put(body, "</code></pre>\n");
             continue;
         }
 
@@ -242,41 +245,33 @@ pub fn render(a: std.mem.Allocator, src: []const u8) Rendered {
                 2 => "h2",
                 else => "h3",
             };
-            put(&body, a, "<");
-            put(&body, a, tag);
-            put(&body, a, " id=\"");
-            put(&body, a, id);
-            put(&body, a, "\">");
-            inlineSpans(&body, a, text);
-            put(&body, a, "</");
-            put(&body, a, tag);
-            put(&body, a, ">\n");
+            fmt(body, "<{s} id=\"{s}\">", .{ tag, id });
+            inlineSpans(body, text);
+            fmt(body, "</{s}>\n", .{tag});
             if (level == 2) {
-                put(&toc, a, "<li><a href=\"#");
-                put(&toc, a, id);
-                put(&toc, a, "\">");
-                inlineSpans(&toc, a, text);
-                put(&toc, a, "</a></li>\n");
+                fmt(toc, "<li><a href=\"#{s}\">", .{id});
+                inlineSpans(toc, text);
+                put(toc, "</a></li>\n");
             }
             i += 1;
             continue;
         }
 
         if (isTableRow(line)) {
-            put(&body, a, "<table>\n");
+            put(body, "<table>\n");
             const has_head = i + 1 < lines.items.len and isTableRule(lines.items[i + 1]);
             if (has_head) {
-                put(&body, a, "<thead>\n");
-                emitCells(&body, a, line, "th");
-                put(&body, a, "</thead>\n");
+                put(body, "<thead>\n");
+                emitCells(body, line, "th");
+                put(body, "</thead>\n");
                 i += 2;
             }
-            put(&body, a, "<tbody>\n");
+            put(body, "<tbody>\n");
             while (i < lines.items.len and isTableRow(lines.items[i])) : (i += 1) {
                 if (isTableRule(lines.items[i])) continue;
-                emitCells(&body, a, lines.items[i], "td");
+                emitCells(body, lines.items[i], "td");
             }
-            put(&body, a, "</tbody>\n</table>\n");
+            put(body, "</tbody>\n</table>\n");
             continue;
         }
 
@@ -285,9 +280,7 @@ pub fn render(a: std.mem.Allocator, src: []const u8) Rendered {
         const is_ol = ordered(line) != null;
         if (is_ul or is_ol) {
             const tag = if (is_ul) "ul" else "ol";
-            put(&body, a, "<");
-            put(&body, a, tag);
-            put(&body, a, ">\n");
+            fmt(body, "<{s}>\n", .{tag});
             while (i < lines.items.len) {
                 const cur = lines.items[i];
                 const start = if (std.mem.startsWith(u8, cur, "- "))
@@ -296,42 +289,37 @@ pub fn render(a: std.mem.Allocator, src: []const u8) Rendered {
                     ordered(cur);
                 if (start == null) break;
 
-                var item: Writer = .empty;
-                put(&item, a, cur[start.?..]);
+                var item: std.Io.Writer.Allocating = .init(a);
+                put(&item.writer, cur[start.?..]);
                 i += 1;
                 // Wrapped continuation lines belong to the same item.
                 while (i < lines.items.len and lines.items[i].len > 0 and
                     (lines.items[i][0] == ' ' or lines.items[i][0] == '\t')) : (i += 1)
-                {
-                    put(&item, a, " ");
-                    put(&item, a, std.mem.trim(u8, lines.items[i], " \t"));
-                }
-                put(&body, a, "<li>");
-                inlineSpans(&body, a, item.items);
-                put(&body, a, "</li>\n");
+                    fmt(&item.writer, " {s}", .{std.mem.trim(u8, lines.items[i], " \t")});
+                put(body, "<li>");
+                inlineSpans(body, item.written());
+                put(body, "</li>\n");
             }
-            put(&body, a, "</");
-            put(&body, a, tag);
-            put(&body, a, ">\n");
+            fmt(body, "</{s}>\n", .{tag});
             continue;
         }
 
         // Paragraph: consume until a blank line or the start of another block.
-        var para: Writer = .empty;
+        var para: std.Io.Writer.Allocating = .init(a);
         while (i < lines.items.len) : (i += 1) {
             const cur = lines.items[i];
             if (cur.len == 0 or cur[0] == '#' or isTableRow(cur) or
                 std.mem.startsWith(u8, cur, "```") or std.mem.startsWith(u8, cur, "- ") or
                 ordered(cur) != null) break;
-            if (para.items.len != 0) put(&para, a, " ");
-            put(&para, a, std.mem.trim(u8, cur, " \t"));
+            if (para.written().len != 0) put(&para.writer, " ");
+            put(&para.writer, std.mem.trim(u8, cur, " \t"));
         }
-        put(&body, a, "<p>");
-        inlineSpans(&body, a, para.items);
-        put(&body, a, "</p>\n");
+        put(body, "<p>");
+        inlineSpans(body, para.written());
+        put(body, "</p>\n");
     }
 
-    return .{ .body = body.items, .toc = toc.items, .title = title };
+    return .{ .body = body_out.written(), .toc = toc_out.written(), .title = title };
 }
 
 /// Offset of the text in `1. item`, or null when the line is not an ordered item.
