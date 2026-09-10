@@ -144,6 +144,17 @@ fn IndexedCopyEntry(comptime Spec: type, comptime gathering: bool) type {
 
 /// Accepts a tuple of map specs, or a module/struct type — in which case every
 /// pub decl that looks like a map spec is exported, in declaration order.
+///
+/// Asserts at compile time that the target is `nvptx64` or `amdgcn`.
+///
+/// The module form force-analyses every pub decl for the GPU target, `@field`
+/// first and `isSpec` second, so a pub decl that cannot compile for a device --
+/// or a `pub var`, which `@field` cannot read at comptime at all -- errors
+/// inside this file rather than at the decl that caused it.
+///
+/// No duplicate-`entry_name` check: two specs sharing a name become two strong
+/// symbols, which surfaces as an `ld.lld` duplicate-symbol error on HIP and is
+/// undefined on CUDA. `build.zig` does the equivalent check for root names.
 pub fn exportAll(comptime specs: anytype) void {
     if (builtin.cpu.arch != .nvptx64 and builtin.cpu.arch != .amdgcn)
         @compileError("exportAll must be compiled for nvptx64 or amdgcn");
@@ -166,6 +177,17 @@ fn isSpec(comptime Spec: anytype) bool {
     return @hasDecl(Spec, "entry_name") and (@hasDecl(Spec, "eval") or @hasDecl(Spec, "kind"));
 }
 
+/// The kind -> entry-shape table, and the one `@export` in the library. Each
+/// `run` signature must match its `*Launch` argument array in
+/// `src/host/kernel.zig` in count, order and width; nothing checks the pairing,
+/// and a mismatch is garbage on the GPU rather than a compile error.
+///
+/// One asymmetry to know about: a `Parameters` of `struct {}` makes
+/// `BoundaryParameters` zero-sized, and Zig drops zero-sized parameters from
+/// the emitted ABI, so the entry takes one fewer argument than `mapLaunch`
+/// pushes. Harmless today -- both drivers read only as many argument pointers
+/// as the kernel declares -- but it is a reliance on driver behaviour, not on
+/// anything this code guarantees.
 fn exportOne(comptime Spec: type) void {
     const E = switch (comptime spec.kindOf(Spec)) {
         .map => Entry(Spec, false),
