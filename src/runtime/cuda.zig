@@ -457,3 +457,21 @@ pub const Stream = struct {
         self.* = .{};
     }
 };
+
+test loadedModuleCount {
+    // Nothing in this suite JITs anything, and a fresh process starts empty --
+    // this is the number a consumer with 37 device models wants to stay at 1.
+    try std.testing.expectEqual(@as(usize, 0), loadedModuleCount());
+}
+
+test "hand-built handles do not call through an undefined driver" {
+    // `g` is undefined until loadApiLocked succeeds, and every handle type is
+    // pub with all-default fields, so `Buffer{}` and `Stream{}` are values a
+    // caller can make on a machine with no driver at all.
+    if (loaded) return error.SkipZigTest; // this box has one; nothing to prove
+    var b: Buffer = .{};
+    b.free();
+    b.free();
+    var s: Stream = .{};
+    s.deinit();
+}

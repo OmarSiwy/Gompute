@@ -221,3 +221,25 @@ pub const Stream = union(Backend) {
         }
     }
 };
+
+test "the .cpu arm fails politely instead of pretending" {
+    // No driver of any kind involved: this is the fallback `init` lands on when
+    // a machine has neither, and every call on it has to be an ordinary error.
+    var c: Compute = .{ .backend = .cpu };
+    defer c.deinit();
+    try c.synchronize();
+    try std.testing.expectError(error.AllocFailed, c.alloc(16));
+    try std.testing.expectError(error.ModuleLoadFailed, c.loadModule(""));
+    try std.testing.expectError(error.InitFailed, c.createStream());
+}
+
+test "Compute.init picks a backend and never fails" {
+    // The contract is that probing never fails, whatever the machine has: on a
+    // box with no driver this is `.cpu`, on one with a driver it is that driver.
+    var probed = try Compute.init(null);
+    defer probed.deinit();
+
+    var cpu = try Compute.init(.cpu);
+    defer cpu.deinit();
+    try std.testing.expectEqual(Backend.cpu, cpu.backend);
+}
