@@ -743,6 +743,13 @@ pub fn AutoKernel(comptime Spec: type) type {
     };
 }
 
+test {
+    // `root.zig` reaches raw.zig only through lazily-analyzed decls, so without
+    // this neither its tests nor its bodies ever reach `zig build test` -- the
+    // whole file was checked only by `examples/exhaustive`, which needs a GPU.
+    _ = @import("raw.zig");
+}
+
 test "vectorized cpu run matches the scalar loop at every tail boundary" {
     const P = struct { scale: f32 };
     const Generic = spec.Map("simd_probe", f32, P, struct {

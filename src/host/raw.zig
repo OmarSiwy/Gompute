@@ -1,5 +1,6 @@
 //! Thin loader for hand-written GPU kernels emitted by the same build pipeline.
 
+const std = @import("std");
 const iface = @import("../core/interface.zig");
 const host = @import("kernel.zig");
 
@@ -126,4 +127,55 @@ fn GpuRaw(comptime entry_name: ?[:0]const u8, comptime gpu: host.Gpu) type {
             return self.context.synchronize();
         }
     };
+}
+
+// ---------------------------------------------------------------------------
+// Seams. None of this needs a GPU, and none of it can go through `RawKernel`:
+// the library's own test build emits no artifacts, so `requireArtifacts` makes
+// every public entry point here a compile error. `GpuRaw` is reachable, and
+// naming it is most of the point -- these tests are what pulls this file's
+// bodies through semantic analysis at all (see the `test` at the end of
+// kernel.zig for why that needs help).
+// ---------------------------------------------------------------------------
+
+test GpuRaw {
+    inline for (.{ host.gpu_cuda, host.gpu_hip }) |gpu| {
+        const Raw = GpuRaw("gompute_seam_probe", gpu);
+        std.testing.refAllDecls(Raw);
+        try std.testing.expect(Raw.Buffer == gpu.rt.Buffer);
+        try std.testing.expect(Raw.Stream == gpu.rt.Stream);
+
+        // A reset handle's methods are driver-level no-ops; see `deinit`.
+        var raw: Raw = .{};
+        var empty: [0]u8 = .{};
+        raw.freePinned(&empty);
+        raw.deinit();
+    }
+}
+
+test "the async surface still lines up with the blocking one" {
+    // `Stream`, `createStream`, `allocPinned`/`freePinned` and `launchOn` all
+    // landed in one commit and nothing calls them yet. Until something does,
+    // this is the oracle: the pairs have to keep matching, or whoever finishes
+    // the overlap path inherits three mismatches at once.
+    inline for (.{ host.gpu_cuda, host.gpu_hip }) |gpu| {
+        const Raw = GpuRaw("gompute_seam_probe", gpu);
+
+        const stream = @typeInfo(@TypeOf(Raw.createStream)).@"fn".return_type.?;
+        try std.testing.expect(@typeInfo(stream).error_union.payload == Raw.Stream);
+
+        // Driver memory: `freePinned` is the only legal way to release it, so it
+        // has to accept exactly what `allocPinned` hands back.
+        const pinned = @typeInfo(@TypeOf(Raw.allocPinned)).@"fn".return_type.?;
+        try std.testing.expect(@typeInfo(pinned).error_union.payload ==
+            @typeInfo(@TypeOf(Raw.freePinned)).@"fn".params[1].type.?);
+
+        // `launchOn` is `launch` with a stream spliced in after `self`.
+        const blocking = @typeInfo(@TypeOf(Raw.launch)).@"fn".params;
+        const ordered = @typeInfo(@TypeOf(Raw.launchOn)).@"fn".params;
+        try std.testing.expectEqual(blocking.len + 1, ordered.len);
+        try std.testing.expect(ordered[1].type.? == *Raw.Stream);
+        inline for (blocking[1..], ordered[2..]) |a, b|
+            try std.testing.expect(a.type.? == b.type.?);
+    }
 }
