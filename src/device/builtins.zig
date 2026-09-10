@@ -1,6 +1,5 @@
 //! Device-only thread-index builtins for Zig 0.16.0.
 
-const std = @import("std");
 const builtin = @import("builtin");
 
 extern fn @"llvm.amdgcn.workitem.id.x"() callconv(.c) u32;
