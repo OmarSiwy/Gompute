@@ -25,6 +25,9 @@ pub const affine_transform = g.map("affine_transform", f32, MultiParams, affine,
 fn clamp01(x: f32, _: ScalarParams) f32 {
     return @max(0.0, @min(1.0, x));
 }
+/// The one spec here whose entry name differs from its decl name, on purpose:
+/// the launch key is the string, not the identifier. A rename that assumes the
+/// two agree breaks the artifact index at this line.
 pub const clamp = g.map("clamp01", f32, ScalarParams, clamp01, .{ .block_size = 256 });
 
 fn negate(x: f32, _: ScalarParams) f32 {

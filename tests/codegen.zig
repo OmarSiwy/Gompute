@@ -1,3 +1,23 @@
+//! Codegen probe: one `export fn` per way of building a spec, plus a hand-written
+//! loop beside the two that are compared.
+//!
+//! Nothing links or runs this object. `build.zig` takes only its
+//! `getEmittedAsm()` and hands that to `tools/codegen_check.zig`, which asserts
+//! that `gompute_scale_relu` matches `manual_scale_relu` and `gompute_zip`
+//! matches `manual_zip` -- the library's central claim, that
+//! `Kernel(Spec, .cpu)` leaves no runtime residue. Those four names are the
+//! interface: rename one and `zig build test` fails with SymbolNotFound, change
+//! one body without the other and it reports a mismatch.
+//!
+//! The exports nothing compares are not spare. They are the only thing that
+//! forces zip/sum/mapTo/mapIndexed/gather/scatter/mapFn and the generic-body map
+//! through the CPU backend at all; delete one and that constructor stops being
+//! compiled anywhere.
+//!
+//! `Kernel(Spec, .cpu).init(0)` is restated in every export deliberately. A
+//! shared helper would put a call between the export boundary and the loop,
+//! which is the inlining this file exists to measure.
+
 const g = @import("gompute");
 
 const Params = struct { scale: f32 };

@@ -1,3 +1,10 @@
+//! The GPU integration suite, run by hand: `cd examples/exhaustive && zig build
+//! run`. Nothing in CI builds it, so it can break and stay broken -- run it
+//! after touching anything on the host or device path.
+//!
+//! Exits 1 on any failure. A section that hits an error part-way through counts
+//! as a failure too; see `section` for why that needs saying.
+
 const std = @import("std");
 const g = @import("gompute");
 const k = @import("kernels");
