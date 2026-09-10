@@ -37,22 +37,42 @@ fn detectCudaGpu(b: *std.Build) ?[]const u8 {
     // card it cannot report. Passing that through produced "sm_[N/A]", which
     // reached Target.Query.parse and killed the build. An unreadable capability
     // means "no usable GPU detected" -- the same answer as no nvidia-smi at all.
-    if (!isComputeCap(line)) return null;
-    var buf: std.ArrayList(u8) = .empty;
-    buf.appendSlice(b.allocator, "sm_") catch @panic("OOM");
-    for (line) |c| if (c != '.') buf.append(b.allocator, c) catch @panic("OOM");
-    return buf.items;
+    const dot = computeCapDot(line) orelse return null;
+    return b.fmt("sm_{s}{s}", .{ line[0..dot], line[dot + 1 ..] });
 }
 
-/// A compute capability is exactly `<digits>.<digits>`, e.g. "8.9".
-fn isComputeCap(s: []const u8) bool {
-    const dot = std.mem.indexOfScalar(u8, s, '.') orelse return false;
-    const major = s[0..dot];
-    const minor = s[dot + 1 ..];
-    if (major.len == 0 or minor.len == 0) return false;
-    for (major) |c| if (!std.ascii.isDigit(c)) return false;
-    for (minor) |c| if (!std.ascii.isDigit(c)) return false;
-    return true;
+/// Index of the `.` in a compute capability, which is exactly
+/// `<digits>.<digits>`, e.g. "8.9". Null when `s` is not one.
+fn computeCapDot(s: []const u8) ?usize {
+    const dot = std.mem.indexOfScalar(u8, s, '.') orelse return null;
+    if (dot == 0 or dot + 1 == s.len) return null;
+    for (s, 0..) |c, i| if (i != dot and !std.ascii.isDigit(c)) return null;
+    return dot;
+}
+
+test computeCapDot {
+    // What nvidia-smi prints on a working card, and what detectCudaGpu makes
+    // of it. `sm_` ++ digits, dot dropped.
+    for ([_]struct { []const u8, ?usize }{
+        .{ "8.9", 1 },
+        .{ "12.0", 2 },
+        .{ "7.5", 1 },
+        // The reason this guard exists: nvidia-smi exits 0 and prints these for
+        // a card it cannot report. "sm_[N/A]" used to reach Target.Query.parse
+        // and kill the build.
+        .{ "[N/A]", null },
+        .{ "[Not Supported]", null },
+        .{ "", null },
+        .{ "8", null },
+        .{ ".9", null },
+        .{ "8.", null },
+        .{ "8.9.1", null },
+        .{ "8 .9", null },
+        .{ "sm_89", null },
+    }) |case| {
+        const s, const want = case;
+        try std.testing.expectEqual(want, computeCapDot(s));
+    }
 }
 
 fn detectHipGpu(b: *std.Build) ?[]const u8 {
@@ -251,6 +271,18 @@ pub fn build(b: *std.Build) void {
     });
     const run_tool_tests = b.addRunArtifact(tool_tests);
 
+    // build.zig compiled as a plain module, for the handful of pure helpers in
+    // it. `pub fn build` is never called here -- only `test` decls run -- but
+    // this is the only automated coverage anything in this file has.
+    const build_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("build.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    const run_build_tests = b.addRunArtifact(build_tests);
+
     const codegen_probe = b.addObject(.{
         .name = "gompute-codegen-probe",
         .root_module = b.createModule(.{
@@ -281,6 +313,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run Gompute unit tests");
     test_step.dependOn(&run_unit_tests.step);
     test_step.dependOn(&run_tool_tests.step);
+    test_step.dependOn(&run_build_tests.step);
     test_step.dependOn(&run_check_tests.step);
     test_step.dependOn(&run_codegen_check.step);
 
