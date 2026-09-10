@@ -15,15 +15,21 @@ pub const Compute = struct {
     cuda_ctx: cuda.Context = .{},
     hip_ctx: hip.Context = .{},
 
+    /// Probe CUDA, then HIP, then settle for `.cpu`. Never fails: a machine with
+    /// no GPU at all is an ordinary outcome, which is also why the three probe
+    /// results are `std.log.debug` and not a print to stderr -- see f08b34b,
+    /// which did the same to cuda.zig's own "no NVIDIA driver here" line.
+    ///
+    /// Pass a `preferred` backend to skip the probe and take that one or fail.
     pub fn init(preferred: ?Backend) Error!Compute {
         if (preferred) |p| return initBackend(p);
         if (initBackend(.cuda)) |c| return c else |e| {
-            std.debug.print("gompute: cuda init failed: {s}\n", .{@errorName(e)});
+            std.log.debug("gompute: cuda init failed: {s}", .{@errorName(e)});
         }
         if (initBackend(.hip)) |c| return c else |e| {
-            std.debug.print("gompute: hip init failed: {s}\n", .{@errorName(e)});
+            std.log.debug("gompute: hip init failed: {s}", .{@errorName(e)});
         }
-        std.debug.print("gompute: no GPU backend available, using CPU fallback\n", .{});
+        std.log.debug("gompute: no GPU backend available, using CPU fallback", .{});
         return .{ .backend = .cpu };
     }
 
