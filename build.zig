@@ -427,6 +427,11 @@ fn normalizeRoots(b: *std.Build, options: EmitOptions) []const KernelRoot {
     return roots.items;
 }
 
+/// The two device backends. `@tagName` is also the prefix of the generated
+/// import names (`cuda_blob_0`, `hip_names_1`), so it must keep matching what
+/// `artifactsSource` writes.
+const Device = enum { cuda, hip };
+
 /// Serializes `heavy` roots into `lanes` chains, leaving light roots free.
 ///
 /// A plain `dependOn` edge between two unrelated compilations is a false
@@ -498,95 +503,95 @@ fn buildArtifacts(
         )),
     });
 
-    var cuda_lanes: HeavyLanes = .init(b, options.heavy_lanes);
-    var hip_lanes: HeavyLanes = .init(b, options.heavy_lanes);
+    // The two backends run the same pipeline -- device module, build-obj, IR
+    // tool, then one final command -- and differ only in the values below plus
+    // that last step. Kept as one loop so a change to the pipeline cannot be
+    // applied to CUDA and forgotten for HIP; nothing in `zig build test`
+    // exercises either path.
+    for ([_]struct {
+        device: Device,
+        triple: []const u8,
+        expected_cpu: []const u8,
+        cpu: ?[]const u8,
+        optimize: ?std.builtin.OptimizeMode,
+    }{
+        .{
+            .device = .cuda,
+            .triple = "nvptx64-cuda",
+            .expected_cpu = "an NVPTX CPU name such as sm_70, sm_80, sm_89 or sm_90",
+            .cpu = cuda_cpu,
+            .optimize = options.cuda.optimize,
+        },
+        .{
+            .device = .hip,
+            .triple = "amdgcn-amdhsa",
+            .expected_cpu = "an AMDGCN CPU name such as gfx900, gfx1030 or gfx1100",
+            .cpu = hip_cpu,
+            .optimize = options.hip.optimize,
+        },
+    }) |d| {
+        const cpu = d.cpu orelse continue;
+        const tag = @tagName(d.device);
 
-    if (cuda_cpu) |cpu| {
         const query = std.Target.Query.parse(.{
-            .arch_os_abi = "nvptx64-cuda",
+            .arch_os_abi = d.triple,
             .cpu_features = cpu,
         }) catch |err| std.debug.panic(
-            "gompute: invalid CUDA target CPU \"{s}\" ({t}). Expected an NVPTX CPU name such " ++
-                "as sm_70, sm_80, sm_89 or sm_90; run `zig targets` for the full list.",
-            .{ cpu, err },
+            "gompute: invalid {s} target CPU \"{s}\" ({t}). Expected {s}; " ++
+                "run `zig targets` for the full list.",
+            .{ tag, cpu, err, d.expected_cpu },
         );
         const target = b.resolveTargetQuery(query);
-        const mode = if (options.cuda.optimize) |m| deviceOptimize(m) else optimize;
-        for (roots, 0..) |root, i| {
-            const gpu_mod = b.createModule(.{
-                .root_source_file = root.root,
-                .target = target,
-                .optimize = mode,
-                // Debug info in device IR makes the PTX claim DWARF it doesn't
-                // have; the CUDA driver then rejects the module (error 218).
-                .strip = true,
-                .imports = deviceImports(b, dep, root, target, mode),
-            });
-            const object = b.addObject(.{
-                .name = b.fmt("gompute_cuda_ir_{s}", .{root.name}),
-                .root_module = gpu_mod,
-            });
-            if (root.heavy) cuda_lanes.chain(&object.step);
+        const mode = if (d.optimize) |m| deviceOptimize(m) else optimize;
+        var lanes: HeavyLanes = .init(b, options.heavy_lanes);
 
+        for (roots, 0..) |root, i| {
+            const object = b.addObject(.{
+                .name = b.fmt("gompute_{s}_obj_{s}", .{ tag, root.name }),
+                .root_module = b.createModule(.{
+                    .root_source_file = root.root,
+                    .target = target,
+                    .optimize = mode,
+                    // Debug info in device IR makes the PTX claim DWARF it
+                    // doesn't have; the CUDA driver then rejects the module
+                    // (error 218).
+                    .strip = true,
+                    .imports = deviceImports(b, dep, root, target, mode),
+                }),
+            });
+            if (root.heavy) lanes.chain(&object.step);
+
+            // The tool always writes both outputs. CUDA assembles the rewritten
+            // IR; HIP links the object itself and keeps only the name table.
             const rewrite = b.addRunArtifact(tool);
             rewrite.addFileArg(object.getEmittedLlvmIr());
-            const rewritten_ir = rewrite.addOutputFileArg(b.fmt("gompute_cuda_{s}.ll", .{root.name}));
-            const names = rewrite.addOutputFileArg(b.fmt("gompute_cuda_names_{s}.zig", .{root.name}));
+            const rewritten_ir = rewrite.addOutputFileArg(b.fmt("gompute_{s}_{s}.ll", .{ tag, root.name }));
+            const names = rewrite.addOutputFileArg(b.fmt("gompute_{s}_names_{s}.zig", .{ tag, root.name }));
 
-            const assemble = b.addSystemCommand(&.{
-                b.graph.zig_exe,
-                "cc",
-                "-target",
-                "nvptx64-cuda",
-                b.fmt("-mcpu={s}", .{cpu}),
-                "-S",
-                "-g0", // nvptx rejects dwarf debug info; keeps stderr clean
-                "-Wno-unused-command-line-argument",
-            });
-            assemble.addFileArg(rewritten_ir);
-            const blob = assemble.addPrefixedOutputFileArg("-o", b.fmt("gompute_{s}.ptx", .{root.name}));
+            const blob = switch (d.device) {
+                .cuda => blk: {
+                    const assemble = b.addSystemCommand(&.{
+                        b.graph.zig_exe,
+                        "cc",
+                        "-target",
+                        d.triple,
+                        b.fmt("-mcpu={s}", .{cpu}),
+                        "-S",
+                        "-g0", // nvptx rejects dwarf debug info; keeps stderr clean
+                        "-Wno-unused-command-line-argument",
+                    });
+                    assemble.addFileArg(rewritten_ir);
+                    break :blk assemble.addPrefixedOutputFileArg("-o", b.fmt("gompute_{s}.ptx", .{root.name}));
+                },
+                .hip => blk: {
+                    const link = b.addSystemCommand(&.{ b.graph.zig_exe, "ld.lld", "-shared" });
+                    link.addFileArg(object.getEmittedBin());
+                    break :blk link.addPrefixedOutputFileArg("-o", b.fmt("gompute_{s}.hsaco", .{root.name}));
+                },
+            };
 
-            artifacts_mod.addAnonymousImport(b.fmt("cuda_blob_{d}", .{i}), .{ .root_source_file = blob });
-            artifacts_mod.addAnonymousImport(b.fmt("cuda_names_{d}", .{i}), .{ .root_source_file = names });
-        }
-    }
-
-    if (hip_cpu) |cpu| {
-        const query = std.Target.Query.parse(.{
-            .arch_os_abi = "amdgcn-amdhsa",
-            .cpu_features = cpu,
-        }) catch |err| std.debug.panic(
-            "gompute: invalid HIP target CPU \"{s}\" ({t}). Expected an AMDGCN CPU name such " ++
-                "as gfx900, gfx1030 or gfx1100; run `zig targets` for the full list.",
-            .{ cpu, err },
-        );
-        const target = b.resolveTargetQuery(query);
-        const mode = if (options.hip.optimize) |m| deviceOptimize(m) else optimize;
-        for (roots, 0..) |root, i| {
-            const gpu_mod = b.createModule(.{
-                .root_source_file = root.root,
-                .target = target,
-                .optimize = mode,
-                .strip = true,
-                .imports = deviceImports(b, dep, root, target, mode),
-            });
-            const object = b.addObject(.{
-                .name = b.fmt("gompute_hip_obj_{s}", .{root.name}),
-                .root_module = gpu_mod,
-            });
-            if (root.heavy) hip_lanes.chain(&object.step);
-
-            const names_run = b.addRunArtifact(tool);
-            names_run.addFileArg(object.getEmittedLlvmIr());
-            _ = names_run.addOutputFileArg(b.fmt("gompute_hip_rewritten_{s}.ll", .{root.name}));
-            const names = names_run.addOutputFileArg(b.fmt("gompute_hip_names_{s}.zig", .{root.name}));
-
-            const link = b.addSystemCommand(&.{ b.graph.zig_exe, "ld.lld", "-shared" });
-            link.addFileArg(object.getEmittedBin());
-            const blob = link.addPrefixedOutputFileArg("-o", b.fmt("gompute_{s}.hsaco", .{root.name}));
-
-            artifacts_mod.addAnonymousImport(b.fmt("hip_blob_{d}", .{i}), .{ .root_source_file = blob });
-            artifacts_mod.addAnonymousImport(b.fmt("hip_names_{d}", .{i}), .{ .root_source_file = names });
+            artifacts_mod.addAnonymousImport(b.fmt("{s}_blob_{d}", .{ tag, i }), .{ .root_source_file = blob });
+            artifacts_mod.addAnonymousImport(b.fmt("{s}_names_{d}", .{ tag, i }), .{ .root_source_file = names });
         }
     }
 
