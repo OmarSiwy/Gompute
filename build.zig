@@ -1,5 +1,18 @@
+//! Gompute's build system, and the API a consumer's own build.zig calls.
+//!
+//! Consumers use `emitKernels` (one artifact-consuming executable) or
+//! `addKernels` (several), plus the option structs above them. Everything
+//! below `pub fn build`'s `b.pkg_hash.len != 0` early return is gompute's own
+//! dev tooling -- tests, the codegen probe, the docs site -- and never runs for
+//! a dependency.
+//!
+//! Note that almost nothing here is reachable from `zig build test`: the
+//! device sub-compilation path is only exercised by building `examples/` or a
+//! real consumer.
+
 const std = @import("std");
 
+/// Which GPU the device code is compiled for.
 pub const Gpu = union(enum) {
     /// Detect the GPU on the BUILD machine; the backend is compiled out (with a
     /// warning) if none is found. Not the deploy machine -- pin `.name` in CI,
@@ -176,6 +189,7 @@ pub const KernelRoot = struct {
     heavy: bool = false,
 };
 
+/// What `emitKernels` compiles, and for which GPUs.
 pub const EmitOptions = struct {
     /// The single-root form. Equivalent to one `kernel_roots` entry; the two may
     /// be combined, and at least one of them must be set.
@@ -203,6 +217,8 @@ pub const EmitOptions = struct {
 /// the double-call. Keyed on the dependency pointer.
 var emitted_deps: std.ArrayList(*std.Build.Dependency) = .empty;
 
+/// The `gompute` and `gompute_device` modules are the product; the dev-only
+/// half after the `pkg_hash` guard is skipped when gompute is a dependency.
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -416,6 +432,9 @@ fn buildDocs(b: *std.Build, host_mod: *std.Build.Module, test_step: *std.Build.S
 }
 
 /// `gompute` plus whatever `root.imports` builds for this backend.
+///
+/// The result is `b.allocator` memory, i.e. the build arena: never freed, valid
+/// for the rest of configure.
 fn deviceImports(
     b: *std.Build,
     dep: *std.Build.Dependency,
@@ -435,7 +454,14 @@ fn deviceImports(
     return all;
 }
 
-/// `options.kernels_root` and `options.kernel_roots` as one list, checked.
+/// `options.kernels_root` and `options.kernel_roots` as one list.
+///
+/// Panics if the result is empty, or if two roots share a name -- names become
+/// object-file names and blob indices, so a collision would make one root
+/// silently overwrite the other's artifact.
+///
+/// The result is `b.allocator` memory, i.e. the build arena: never freed, valid
+/// for the rest of configure.
 fn normalizeRoots(b: *std.Build, options: EmitOptions) []const KernelRoot {
     var roots: std.ArrayList(KernelRoot) = .empty;
     if (options.kernels_root) |path| roots.append(b.allocator, .{
@@ -788,6 +814,8 @@ pub fn emitKernels(
     host.root_module.addImport("gompute_kernels", artifacts_mod);
 }
 
+/// `EmitOptions` for `addKernels`, which needs `target`/`optimize` up front
+/// because it has no host artifact to read them off.
 pub const KernelsOptions = struct {
     /// The single-root form. Equivalent to one `kernel_roots` entry; the two may
     /// be combined, and at least one of them must be set.
