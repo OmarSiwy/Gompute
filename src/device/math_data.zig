@@ -810,11 +810,6 @@ pub const log2_tab2 = [64]LogTab2{
 /// double-double split is needed.
 pub const logf_ln2: f64 = 0x1.62e42fefa39efp-1;
 
-/// 1/ln10. `log10f` is `logf`'s body with this folded into the binary64
-/// accumulator before the single rounding to f32, which is what makes it
-/// accurate rather than a scaled `logf` result.
-pub const logf_invln10: f64 = 0x1.bcb7b1526e50ep-2;
-
 /// log1p(r) = r + r^2*(poly[2] + poly[1]*r + poly[0]*r^2).
 pub const logf_poly = [3]f64{
     -0x1.00ea348b88334p-2,
