@@ -32,6 +32,17 @@ pub fn Kernel(comptime Spec: type, comptime backend: Backend) type {
     };
 }
 
+/// Every kind that takes more than one slice needs the ones it pairs up to
+/// agree: a disagreement is the caller's bug, not a truncated run.
+///
+/// One place for it so a kind's CPU and GPU arms cannot drift apart. They did
+/// once -- `gather` -- and the divergence was a download of uninitialized
+/// device memory. `inline` so this stays the same comparison the arms spelled
+/// out by hand; `lens` is a comptime tuple, not a slice.
+inline fn sameLen(lens: anytype) iface.Error!void {
+    inline for (1..lens.len) |i| if (lens[i] != lens[0]) return error.InvalidArgument;
+}
+
 fn CpuKernel(comptime Spec: type) type {
     return struct {
         const Self = @This();
@@ -86,7 +97,7 @@ fn CpuKernel(comptime Spec: type) type {
             out: []Spec.Out,
             params: Spec.Parameters,
         ) iface.Error!void {
-            if (in.len != out.len) return error.InvalidArgument;
+            try sameLen(.{ in.len, out.len });
             for (in, out) |x, *o| o.* = Spec.eval(x, params);
         }
 
@@ -97,7 +108,7 @@ fn CpuKernel(comptime Spec: type) type {
             out: []Spec.Out,
             params: Spec.Parameters,
         ) iface.Error!void {
-            if (a.len != b.len or a.len != out.len) return error.InvalidArgument;
+            try sameLen(.{ a.len, b.len, out.len });
             for (a, b, out) |x, y, *o| o.* = Spec.eval(x, y, params);
         }
 
@@ -136,7 +147,7 @@ fn CpuKernel(comptime Spec: type) type {
             idx: []const Spec.Index,
             out: []Spec.Value,
         ) iface.Error!void {
-            if (idx.len != out.len) return error.InvalidArgument;
+            try sameLen(.{ idx.len, out.len });
             for (idx, out) |j, *o| if (j < src.len) {
                 o.* = src[j];
             };
@@ -148,7 +159,7 @@ fn CpuKernel(comptime Spec: type) type {
             idx: []const Spec.Index,
             out: []Spec.Value,
         ) iface.Error!void {
-            if (src.len != idx.len) return error.InvalidArgument;
+            try sameLen(.{ src.len, idx.len });
             for (src, idx) |x, j| if (j < out.len) {
                 out[j] = x;
             };
@@ -432,7 +443,7 @@ fn GpuKernel(comptime Spec: type, comptime gpu: Gpu) type {
             out: []Spec.Out,
             params: Spec.Parameters,
         ) iface.Error!void {
-            if (in.len != out.len) return error.InvalidArgument;
+            try sameLen(.{ in.len, out.len });
             if (in.len == 0) return;
             var in_buf = try self.staged(Spec.In, in);
             defer in_buf.free();
@@ -471,7 +482,7 @@ fn GpuKernel(comptime Spec: type, comptime gpu: Gpu) type {
             out: []Spec.Out,
             params: Spec.Parameters,
         ) iface.Error!void {
-            if (a.len != b.len or a.len != out.len) return error.InvalidArgument;
+            try sameLen(.{ a.len, b.len, out.len });
             if (a.len == 0) return;
             var a_buf = try self.staged(Spec.A, a);
             defer a_buf.free();
@@ -569,7 +580,7 @@ fn GpuKernel(comptime Spec: type, comptime gpu: Gpu) type {
             idx: []const Spec.Index,
             out: []Spec.Value,
         ) iface.Error!void {
-            if (idx.len != out.len) return error.InvalidArgument;
+            try sameLen(.{ idx.len, out.len });
             if (out.len == 0 or src.len == 0) return;
             var src_buf = try self.staged(Spec.Value, src);
             defer src_buf.free();
@@ -590,7 +601,7 @@ fn GpuKernel(comptime Spec: type, comptime gpu: Gpu) type {
             idx: []const Spec.Index,
             out: []Spec.Value,
         ) iface.Error!void {
-            if (src.len != idx.len) return error.InvalidArgument;
+            try sameLen(.{ src.len, idx.len });
             if (src.len == 0 or out.len == 0) return;
             var src_buf = try self.staged(Spec.Value, src);
             defer src_buf.free();
