@@ -356,27 +356,41 @@ pub const Buffer = struct {
     handle: CUdeviceptr = 0,
     bytes: usize = 0,
 
+    /// `free` zeroes the handle and a default-constructed Buffer never had one.
+    /// 0 is never a valid CUdeviceptr, so this is a caller mistake, not a copy
+    /// from device address `offset`. Mirrors `hip.Buffer`: a use-after-free has
+    /// to mean the same thing on both backends, because `host/kernel.zig` is
+    /// generic over them.
+    fn devicePtr(self: *const Buffer) Error!CUdeviceptr {
+        if (self.handle == 0) return error.InvalidArgument;
+        return self.handle;
+    }
+
+    fn offsetPtr(self: *const Buffer, offset: usize) Error!CUdeviceptr {
+        return (try self.devicePtr()) + offset;
+    }
+
     pub fn upload(self: *Buffer, host: *const anyopaque, n: usize) Error!void {
         ensureCurrent();
-        try check(g.cuMemcpyHtoD_v2(self.handle, host, n), error.CopyFailed);
+        try check(g.cuMemcpyHtoD_v2(try self.devicePtr(), host, n), error.CopyFailed);
     }
     pub fn download(self: *Buffer, host: *anyopaque, n: usize) Error!void {
         ensureCurrent();
-        try check(g.cuMemcpyDtoH_v2(host, self.handle, n), error.CopyFailed);
+        try check(g.cuMemcpyDtoH_v2(host, try self.devicePtr(), n), error.CopyFailed);
     }
     pub fn downloadAt(self: *Buffer, host: *anyopaque, offset: usize, n: usize) Error!void {
         ensureCurrent();
-        try check(g.cuMemcpyDtoH_v2(host, self.handle + offset, n), error.CopyFailed);
+        try check(g.cuMemcpyDtoH_v2(host, try self.offsetPtr(offset), n), error.CopyFailed);
     }
     pub fn uploadAt(self: *Buffer, host: *const anyopaque, offset: usize, n: usize) Error!void {
         ensureCurrent();
-        try check(g.cuMemcpyHtoD_v2(self.handle + offset, host, n), error.CopyFailed);
+        try check(g.cuMemcpyHtoD_v2(try self.offsetPtr(offset), host, n), error.CopyFailed);
     }
     pub fn free(self: *Buffer) void {
         // `g` is undefined until loadApi succeeds, and every handle type here is
         // pub with all-default fields -- so a hand-constructed `Buffer{}` freed
         // on a machine with no driver would call through garbage.
-        if (!loaded) return;
+        if (!loaded or self.handle == 0) return;
         ensureCurrent();
         _ = g.cuMemFree_v2(self.handle);
         self.* = .{};
@@ -386,24 +400,24 @@ pub const Buffer = struct {
     }
     pub fn copyFrom(self: *Buffer, src: *const Buffer, src_offset: usize, dst_offset: usize, n: usize) Error!void {
         ensureCurrent();
-        try check(g.cuMemcpyDtoD_v2(self.handle + dst_offset, src.handle + src_offset, n), error.CopyFailed);
+        try check(g.cuMemcpyDtoD_v2(try self.offsetPtr(dst_offset), try src.offsetPtr(src_offset), n), error.CopyFailed);
     }
     /// Enqueued on `stream` and not waited on; `host` must be `allocPinned`
     /// memory and must stay put until `stream.synchronize()` returns.
     pub fn downloadAtAsync(self: *Buffer, host: *anyopaque, offset: usize, n: usize, stream: *Stream) Error!void {
         ensureCurrent();
-        try check(g.cuMemcpyDtoHAsync_v2(host, self.handle + offset, n, stream.stream), error.CopyFailed);
+        try check(g.cuMemcpyDtoHAsync_v2(host, try self.offsetPtr(offset), n, stream.stream), error.CopyFailed);
     }
     pub fn uploadAtAsync(self: *Buffer, host: *const anyopaque, offset: usize, n: usize, stream: *Stream) Error!void {
         ensureCurrent();
-        try check(g.cuMemcpyHtoDAsync_v2(self.handle + offset, host, n, stream.stream), error.CopyFailed);
+        try check(g.cuMemcpyHtoDAsync_v2(try self.offsetPtr(offset), host, n, stream.stream), error.CopyFailed);
     }
     /// Set the first `n` bytes to `value`, on the device and on `stream`. The
     /// memory controller does it in place: zeroing this way costs no bus
     /// traffic, where copying a resident block of zeros over it does.
     pub fn fillAsync(self: *Buffer, value: u8, n: usize, stream: *Stream) Error!void {
         ensureCurrent();
-        try check(g.cuMemsetD8Async(self.handle, value, n, stream.stream), error.CopyFailed);
+        try check(g.cuMemsetD8Async(try self.devicePtr(), value, n, stream.stream), error.CopyFailed);
     }
 
     pub fn deviceAddr(self: *const Buffer) u64 {
@@ -474,4 +488,25 @@ test "hand-built handles do not call through an undefined driver" {
     b.free();
     var s: Stream = .{};
     s.deinit();
+}
+
+test "a handle-less Buffer errors instead of copying from address zero" {
+    // The twin of hip.zig's test, and the reason it exists: `host/kernel.zig` is
+    // generic over both backends, so a use-after-free has to report the same way
+    // on each. cuda used to hand the driver `0 + offset` and let it decide.
+    var buffer: Buffer = .{};
+    var byte: u8 = 0;
+    try std.testing.expectError(error.InvalidArgument, buffer.upload(&byte, 1));
+    try std.testing.expectError(error.InvalidArgument, buffer.download(&byte, 1));
+    try std.testing.expectError(error.InvalidArgument, buffer.uploadAt(&byte, 4, 1));
+    try std.testing.expectError(error.InvalidArgument, buffer.downloadAt(&byte, 4, 1));
+    try std.testing.expectError(error.InvalidArgument, buffer.copyFrom(&buffer, 0, 0, 1));
+    // Same for the stream-ordered forms: they resolve the device pointer before
+    // they reach the driver, so a null handle never becomes a queued copy.
+    var stream: Stream = .{};
+    try std.testing.expectError(error.InvalidArgument, buffer.uploadAtAsync(&byte, 4, 1, &stream));
+    try std.testing.expectError(error.InvalidArgument, buffer.downloadAtAsync(&byte, 4, 1, &stream));
+    try std.testing.expectError(error.InvalidArgument, buffer.fillAsync(0, 1, &stream));
+    buffer.free();
+    buffer.free();
 }
