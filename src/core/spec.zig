@@ -312,7 +312,7 @@ pub fn Sum(
     comptime Params: type,
     comptime options: ReduceOptions(T, Params),
 ) type {
-    return Reduce(name, T, Params, Arith(T).add, 0, withOp(T, Params, options, .Add));
+    return Reduce(name, T, Params, Arith(T).add, 0, withOp(options, .Add));
 }
 
 pub fn Min(
@@ -321,7 +321,7 @@ pub fn Min(
     comptime Params: type,
     comptime options: ReduceOptions(T, Params),
 ) type {
-    return Reduce(name, T, Params, Arith(T).min, Arith(T).largest, withOp(T, Params, options, .Min));
+    return Reduce(name, T, Params, Arith(T).min, Arith(T).largest, withOp(options, .Min));
 }
 
 pub fn Max(
@@ -330,7 +330,7 @@ pub fn Max(
     comptime Params: type,
     comptime options: ReduceOptions(T, Params),
 ) type {
-    return Reduce(name, T, Params, Arith(T).max, Arith(T).smallest, withOp(T, Params, options, .Max));
+    return Reduce(name, T, Params, Arith(T).max, Arith(T).smallest, withOp(options, .Max));
 }
 
 /// Bitwise OR, i.e. "is any element nonzero". Integer only; write the predicate
@@ -342,7 +342,7 @@ pub fn Any(
     comptime options: ReduceOptions(T, Params),
 ) type {
     requireInt(T, "any");
-    return Reduce(name, T, Params, Arith(T).bitOr, 0, withOp(T, Params, options, .Or));
+    return Reduce(name, T, Params, Arith(T).bitOr, 0, withOp(options, .Or));
 }
 
 /// Bitwise AND, i.e. "is every element all-ones". Integer only; write the
@@ -354,7 +354,7 @@ pub fn All(
     comptime options: ReduceOptions(T, Params),
 ) type {
     requireInt(T, "all");
-    return Reduce(name, T, Params, Arith(T).bitAnd, ~@as(T, 0), withOp(T, Params, options, .And));
+    return Reduce(name, T, Params, Arith(T).bitAnd, ~@as(T, 0), withOp(options, .And));
 }
 
 fn requireInt(comptime T: type, comptime what: []const u8) void {
@@ -362,12 +362,7 @@ fn requireInt(comptime T: type, comptime what: []const u8) void {
         @compileError(what ++ " combines bitwise and needs an integer value type, not " ++ @typeName(T));
 }
 
-fn withOp(
-    comptime T: type,
-    comptime Params: type,
-    comptime options: ReduceOptions(T, Params),
-    comptime op: std.builtin.ReduceOp,
-) ReduceOptions(T, Params) {
+fn withOp(comptime options: anytype, comptime op: std.builtin.ReduceOp) @TypeOf(options) {
     var out = options;
     out.simd_op = op;
     return out;
