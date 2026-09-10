@@ -150,7 +150,10 @@ pub fn pack(comptime T: type, value: T) Boundary(T) {
         .bool => @intFromBool(value),
         .int, .float => value,
         .@"enum" => @intFromEnum(value),
-        .vector => @bitCast(value),
+        // A bool vector is bit-packed -- @Vector(4, bool) is 4 bits, its wire
+        // form @Vector(4, u8) is 32 -- so it is the one vector a @bitCast
+        // cannot carry. Both builtins are elementwise on vectors.
+        .vector => |v| if (v.child == bool) @intCast(@intFromBool(value)) else @bitCast(value),
         .array => |a| blk: {
             var out: Boundary(T) = undefined;
             inline for (0..a.len) |i| out[i] = pack(a.child, value[i]);
@@ -172,7 +175,10 @@ pub fn unpack(comptime T: type, value: Boundary(T)) T {
         .bool => value != 0,
         .int, .float => value,
         .@"enum" => @enumFromInt(value),
-        .vector => @bitCast(value),
+        .vector => |v| if (v.child == bool)
+            value != @as(Boundary(T), @splat(0))
+        else
+            @bitCast(value),
         .array => |a| blk: {
             var out: T = undefined;
             inline for (0..a.len) |i| out[i] = unpack(a.child, value[i]);
@@ -240,6 +246,15 @@ test "arrays and vectors round-trip element by element" {
     const Mode = enum(u32) { a, b };
     try std.testing.expectEqual([2]u32, Boundary([2]Mode));
     try std.testing.expectEqual([2]u32{ 1, 0 }, pack([2]Mode, .{ .b, .a }));
+
+    // A bool vector is bit-packed on the host: @Vector(4, bool) is 4 bits and
+    // the wire form is 32, so this used to fail inside pack() with a raw
+    // @bitCast size mismatch pointing into this file.
+    const Mask = @Vector(4, bool);
+    try std.testing.expectEqual(@Vector(4, u8), Boundary(Mask));
+    const mask: Mask = .{ true, false, true, false };
+    try std.testing.expectEqual(@Vector(4, u8){ 1, 0, 1, 0 }, pack(Mask, mask));
+    try std.testing.expectEqual(mask, unpack(Mask, pack(Mask, mask)));
 }
 
 test "nested structs, f16 and a zero-field params struct" {
