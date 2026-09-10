@@ -9,19 +9,19 @@ pub const Gpu = union(enum) {
     name: []const u8,
 };
 
-pub const CudaOptions = struct {
+/// One backend's device-code settings. `CudaOptions` and `HipOptions` are the
+/// same shape and always have been; the two names exist so that `.cuda = .{...}`
+/// and `.hip = .{...}` read as what they are.
+const BackendOptions = struct {
     enabled: bool = true,
     gpu: Gpu = .auto,
-    /// Optimize mode for CUDA device code. Overrides `EmitOptions.optimize`.
+    /// Optimize mode for this backend's device code. Overrides
+    /// `EmitOptions.optimize`.
     optimize: ?std.builtin.OptimizeMode = null,
 };
 
-pub const HipOptions = struct {
-    enabled: bool = true,
-    gpu: Gpu = .auto,
-    /// Optimize mode for HIP device code. Overrides `EmitOptions.optimize`.
-    optimize: ?std.builtin.OptimizeMode = null,
-};
+pub const CudaOptions = BackendOptions;
+pub const HipOptions = BackendOptions;
 
 /// ponytail: nvidia-smi ships with every NVIDIA driver; querying it is the
 /// lightest reliable probe. Compute cap "8.9" maps directly to "sm_89".
