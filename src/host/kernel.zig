@@ -7,6 +7,8 @@ const spec = @import("../core/spec.zig");
 const cuda = @import("../runtime/cuda.zig");
 const hip = @import("../runtime/hip.zig");
 
+/// Where a kernel runs. `.cpu` always exists; the GPU tags need the matching
+/// backend to have been emitted by build.zig.
 pub const Backend = enum { cpu, cuda, hip };
 
 /// The most partial results a `reduce` will ever produce, and therefore the
@@ -47,13 +49,20 @@ fn CpuKernel(comptime Spec: type) type {
     return struct {
         const Self = @This();
         pub const backend: Backend = .cpu;
+        /// The CPU is always there, so `AutoKernel`'s probe always has a tail.
         pub const available = true;
+        /// There is no device memory to hoist, so the buffer type is `void` and
+        /// this handle has no `alloc`/`launch` at all. The three handle types
+        /// are only substitutable across `init`/`deinit`/`run`.
         pub const Buffer = void;
 
+        /// The device ordinal is accepted and ignored, so a caller can pass the
+        /// same one to every backend. Never fails.
         pub inline fn init(_: c_int) iface.Error!Self {
             return .{};
         }
 
+        /// Nothing was acquired, so nothing is released.
         pub inline fn deinit(_: *Self) void {}
 
         const vec_lanes: usize = std.simd.suggestVectorLength(Spec.Value) orelse 1;
@@ -141,6 +150,9 @@ fn CpuKernel(comptime Spec: type) type {
             return acc;
         }
 
+        /// An index at or past the end of `src` selects nothing, so that slot
+        /// of `out` keeps the value the caller put there. The GPU arm uploads
+        /// `out` to honour the same contract.
         inline fn gatherRun(
             _: *Self,
             src: []const Spec.Value,
@@ -153,6 +165,9 @@ fn CpuKernel(comptime Spec: type) type {
             };
         }
 
+        /// An index at or past the end of `out` writes nothing; an element of
+        /// `out` no index selects keeps its prior value. Duplicate indices race,
+        /// and which one lands is unspecified on both vendors.
         inline fn scatterRun(
             _: *Self,
             src: []const Spec.Value,
@@ -185,6 +200,8 @@ pub const Gpu = struct {
     example_cpu: []const u8,
 };
 
+/// The two descriptors that exist. Every generic in this file is instantiated
+/// with one of them, and `gpuOf` is how a `Backend` tag picks.
 pub const gpu_cuda: Gpu = .{ .backend = .cuda, .rt = cuda, .has = "has_cuda", .images = "cuda_images", .index = "cuda_index", .example_cpu = "sm_89" };
 pub const gpu_hip: Gpu = .{ .backend = .hip, .rt = hip, .has = "has_hip", .images = "hip_images", .index = "hip_index", .example_cpu = "gfx1100" };
 
@@ -333,6 +350,8 @@ fn GpuKernel(comptime Spec: type, comptime gpu: Gpu) type {
         /// False when this build emitted no artifact for `gpu`; `init` then
         /// always returns `error.BackendUnavailable`.
         pub const available = host_available(gpu);
+        /// Device memory. Valid on every handle for the same device, because
+        /// they all share one primary context.
         pub const Buffer = gpu.rt.Buffer;
 
         context: gpu.rt.Context = .{},
@@ -363,6 +382,12 @@ fn GpuKernel(comptime Spec: type, comptime gpu: Gpu) type {
             self.* = .{};
         }
 
+        /// Room for `count` **elements**, not bytes -- `RawKernel.alloc` takes
+        /// bytes, because it has no spec to size against.
+        ///
+        /// Caller owns the returned buffer and must `free` it; nothing here
+        /// tracks it. Hoisting one out of a loop is the point: `run` allocates
+        /// and frees on every call.
         pub fn alloc(self: *Self, count: usize) iface.Error!Buffer {
             return self.context.alloc(count * @sizeOf(Spec.Value));
         }
@@ -394,6 +419,12 @@ fn GpuKernel(comptime Spec: type, comptime gpu: Gpu) type {
             .gather, .scatter => indexedCopyLaunch,
         };
 
+        /// Stage the caller's slices, launch, synchronize, download, free --
+        /// the whole round trip. Use `alloc` + `launch` instead when the data
+        /// is already on the device or outlives one call.
+        ///
+        /// Asserts the grid fits: `iface.Dim3.linear` panics past 2^31-1
+        /// blocks, i.e. `data.len > (2^31-1) * block_size`.
         pub const run = switch (spec.kindOf(Spec)) {
             .map, .map_indexed => mapRun,
             .map_to => mapToRun,
@@ -649,6 +680,10 @@ fn reportSkip(comptime tag: []const u8, err: iface.Error, strict: bool) iface.Er
     );
 }
 
+/// A handle that decides its backend on the machine it runs on, instead of at
+/// compile time. Compiles whether or not the build emitted GPU artifacts --
+/// that is the whole difference from `Kernel`, and the reason `Cuda`/`Hip`
+/// below bypass the public constructor.
 pub fn AutoKernel(comptime Spec: type) type {
     // Tagged by `Backend` itself, not by an inferred enum: the tag *is* the
     // answer `selected` returns, and the two cannot drift. Same shape the four
@@ -660,11 +695,13 @@ pub fn AutoKernel(comptime Spec: type) type {
 
         const Self = @This();
 
+        /// The fallback, and the only one that always exists.
         pub const Cpu = Kernel(Spec, .cpu);
         /// Not `Kernel(Spec, .cuda)`: that is a compile error when the build
         /// emitted no CUDA, and the entire point of `AutoKernel` is to compile
         /// either way. Ask `Cuda.available` for the answer instead.
         pub const Cuda = GpuKernel(Spec, gpu_cuda);
+        /// Same, for HIP.
         pub const Hip = GpuKernel(Spec, gpu_hip);
 
         /// Picks the fastest backend that works, silently falling back to the
@@ -703,6 +740,9 @@ pub fn AutoKernel(comptime Spec: type) type {
         /// Forwards to whichever backend `init` picked. One arm per kind
         /// because the argument list is the kind: all three backends agree on
         /// the signature, so the body is the same `inline else` every time.
+        /// Forwards to whichever backend `init` picked, with the signature the
+        /// kind implies. Asserts what the chosen backend asserts -- on a GPU
+        /// arm that includes the grid-size panic in `GpuKernel.run`.
         pub const run = switch (spec.kindOf(Spec)) {
             .map, .map_indexed => struct {
                 fn run(self: *Self, data: []Spec.Value, params: Spec.Parameters) iface.Error!void {

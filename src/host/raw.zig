@@ -37,7 +37,9 @@ pub fn rawKernelByName(
 fn GpuRaw(comptime entry_name: ?[:0]const u8, comptime gpu: host.Gpu) type {
     return struct {
         const Self = @This();
+        /// Device memory, valid on every handle for the same device.
         pub const Buffer = gpu.rt.Buffer;
+        /// The queue type `createStream` returns and `launchOn` takes.
         pub const Stream = gpu.rt.Stream;
 
         context: gpu.rt.Context = .{},
@@ -66,6 +68,10 @@ fn GpuRaw(comptime entry_name: ?[:0]const u8, comptime gpu: host.Gpu) type {
             self.* = .{};
         }
 
+        /// `bytes`, not elements -- there is no spec here to size against, which
+        /// is the one place this handle disagrees with `Kernel.alloc`.
+        ///
+        /// Caller owns the returned buffer and must `free` it.
         pub fn alloc(self: *Self, bytes: usize) iface.Error!Buffer {
             return self.context.alloc(bytes);
         }
@@ -73,10 +79,15 @@ fn GpuRaw(comptime entry_name: ?[:0]const u8, comptime gpu: host.Gpu) type {
         /// Page-locked host memory. Driver memory, not a Zig allocator's, so it
         /// is released with `freePinned`; see `Context.allocPinned` for why the
         /// async copies need it.
+        ///
+        /// Caller owns the returned block.
         pub fn allocPinned(self: *Self, bytes: usize) iface.Error![]u8 {
             return self.context.allocPinned(bytes);
         }
 
+        /// Releases a block from `allocPinned`, and nothing else -- passing a
+        /// Zig allocator's memory here hands the driver a pointer it never gave
+        /// out. A no-op on an empty slice or before the driver has loaded.
         pub fn freePinned(self: *Self, bytes: []u8) void {
             self.context.freePinned(bytes);
         }
@@ -84,10 +95,15 @@ fn GpuRaw(comptime entry_name: ?[:0]const u8, comptime gpu: host.Gpu) type {
         /// A stream to order copies and launches on. Anything issued here stays
         /// off the NULL stream, which implicitly synchronizes against every
         /// other blocking stream on the device.
+        ///
+        /// Caller owns the returned stream and must `deinit` it.
         pub fn createStream(self: *Self) iface.Error!Stream {
             return self.context.createStream();
         }
 
+        /// Launch on the NULL stream and return once the launch is queued. The
+        /// grid and block are yours to pick: unlike `Kernel`, nothing here knows
+        /// the kernel's shape.
         pub fn launch(
             self: *Self,
             grid: iface.Dim3,
@@ -116,6 +132,7 @@ fn GpuRaw(comptime entry_name: ?[:0]const u8, comptime gpu: host.Gpu) type {
             return self.kernel.launchOnStream(grid, block, shared_bytes, args, stream.stream);
         }
 
+        /// Block until every launch and copy queued on this device is done.
         pub fn synchronize(self: *Self) iface.Error!void {
             return self.context.synchronize();
         }
