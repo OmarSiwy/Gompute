@@ -6,20 +6,49 @@ pub fn Boundary(comptime T: type) type {
     return BoundaryAt(T, @typeName(T));
 }
 
+/// The integer widths that mean the same thing in both compilations: exactly
+/// 8, 16, 32 or 64 bits, and never `usize`/`isize`, whose width is the target's
+/// pointer width and so is not a property of the type at all.
+///
+/// This predicate is the width half of the boundary rule. `spec.zig` validates
+/// value and index types against it too, so the rule has one definition rather
+/// than one per caller to drift out of sync.
+pub fn fixedWidthInt(comptime T: type) bool {
+    const info = @typeInfo(T);
+    if (info != .int or T == usize or T == isize) return false;
+    return switch (info.int.bits) {
+        8, 16, 32, 64 => true,
+        else => false,
+    };
+}
+
+/// f16, f32 and f64 -- the float widths both vendors' hardware implements.
+/// The float half of the boundary rule; see `fixedWidthInt`.
+pub fn fixedWidthFloat(comptime T: type) bool {
+    const info = @typeInfo(T);
+    if (info != .float) return false;
+    return switch (info.float.bits) {
+        16, 32, 64 => true,
+        else => false,
+    };
+}
+
 /// `at` is the dotted path from the root parameter type down to whatever we are
 /// currently deriving, so a rejection names the field the user actually wrote
 /// rather than the innermost type the recursion happened to reach.
 fn BoundaryAt(comptime T: type, comptime at: []const u8) type {
     return switch (@typeInfo(T)) {
         .bool => u8,
-        .int => |i| blk: {
+        .int => blk: {
+            // Split from the width check so the pointer-width case, which is the
+            // one people actually hit, gets its own diagnostic.
             if (T == usize or T == isize) @compileError(reject(at, T, "host and device pointer widths may differ, so usize/isize have no fixed size across the boundary; use u32/u64 or i32/i64"));
-            if (i.bits != 8 and i.bits != 16 and i.bits != 32 and i.bits != 64)
+            if (!fixedWidthInt(T))
                 @compileError(reject(at, T, "integers must be exactly 8, 16, 32, or 64 bits wide"));
             break :blk T;
         },
-        .float => |f| blk: {
-            if (f.bits != 16 and f.bits != 32 and f.bits != 64)
+        .float => blk: {
+            if (!fixedWidthFloat(T))
                 @compileError(reject(at, T, "floats must be f16, f32, or f64"));
             break :blk T;
         },
@@ -162,6 +191,26 @@ pub fn unpack(comptime T: type, value: Boundary(T)) T {
 
 // The tests below lock in what an on-hardware audit confirmed already works on
 // NVPTX. They are regressions locks for the derivation, not open questions.
+
+test fixedWidthInt {
+    // The rejections themselves are `@compileError`s and cannot be tested, so
+    // the rule they consult is tested instead -- the same split as
+    // `hasFixedLayout`, and the only coverage `spec.zig`'s index and value
+    // checks have.
+    inline for ([_]type{ u8, i8, u16, i16, u32, i32, u64, i64 }) |T|
+        try std.testing.expect(fixedWidthInt(T));
+    inline for ([_]type{ u1, u7, i24, u128, u0, usize, isize, f32, bool }) |T|
+        try std.testing.expect(!fixedWidthInt(T));
+
+    // usize/isize are 64-bit on this host and must still be rejected: the width
+    // is the target's, not the type's.
+    try std.testing.expectEqual(@as(u16, 64), @typeInfo(usize).int.bits);
+
+    inline for ([_]type{ f16, f32, f64 }) |T|
+        try std.testing.expect(fixedWidthFloat(T));
+    inline for ([_]type{ f80, f128, u32, bool }) |T|
+        try std.testing.expect(!fixedWidthFloat(T));
+}
 
 test "enums cross as their tag type, signed and negative included" {
     const Mode = enum(u8) { off, on };

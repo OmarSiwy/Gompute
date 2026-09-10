@@ -441,20 +441,16 @@ fn validateBlockSize(comptime n: u32) void {
 /// Gather/scatter subscripts. Unsigned only -- a negative subscript has no
 /// meaning and would silently wrap into the bounds check on the device.
 fn validateIndex(comptime T: type) void {
-    const info = @typeInfo(T);
-    if (info != .int or info.int.signedness != .unsigned or T == usize or
-        (info.int.bits != 8 and info.int.bits != 16 and info.int.bits != 32 and info.int.bits != 64))
+    if (!abi.fixedWidthInt(T) or @typeInfo(T).int.signedness != .unsigned)
         @compileError("index type must be u8, u16, u32, or u64, not " ++ @typeName(T));
 }
 
 fn validateValue(comptime T: type) void {
     switch (@typeInfo(T)) {
-        .int => |i| {
-            if (T == usize or T == isize or (i.bits != 8 and i.bits != 16 and i.bits != 32 and i.bits != 64))
-                @compileError("map value must be a fixed-width 8/16/32/64-bit integer");
-        },
-        .float => |f| if (f.bits != 16 and f.bits != 32 and f.bits != 64)
-            @compileError("map value must be f16, f32, or f64"),
+        .int => if (!abi.fixedWidthInt(T))
+            @compileError("map value must be a fixed-width 8/16/32/64-bit integer, not " ++ @typeName(T)),
+        .float => if (!abi.fixedWidthFloat(T))
+            @compileError("map value must be f16, f32, or f64, not " ++ @typeName(T)),
         .vector => |v| validateValue(v.child),
         else => @compileError("map value must be an integer, float, or vector: " ++ @typeName(T)),
     }
