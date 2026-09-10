@@ -7,6 +7,7 @@ const print = std.debug.print;
 
 var pass_count: u32 = 0;
 var fail_count: u32 = 0;
+var section_skipped = false;
 
 fn check(name: []const u8, ok: bool) void {
     if (ok) {
@@ -15,6 +16,34 @@ fn check(name: []const u8, ok: bool) void {
         fail_count += 1;
         print("  FAIL: {s}\n", .{name});
     }
+}
+
+/// Every GPU section bails out of a `catch` with a bare `return`, which records
+/// nothing -- so a broken driver used to print "55 passed, 0 failed" and exit 0.
+/// A section therefore declares how many checks it must reach, and reaching a
+/// different number is itself a failure. One floor covers every bail site at
+/// once, including bail sites nobody has written yet.
+///
+/// The count is exact, not a minimum, so adding a `check` to a section without
+/// updating its floor fails loudly instead of quietly widening the hole.
+fn section(name: []const u8, expected_checks: u32, comptime body: fn () void) void {
+    const before = pass_count + fail_count;
+    section_skipped = false;
+    body();
+    if (section_skipped) return;
+    const reached = pass_count + fail_count - before;
+    if (reached != expected_checks) {
+        fail_count += 1;
+        print("  FAIL: {s} reached {d} of {d} checks\n", .{ name, reached, expected_checks });
+    }
+}
+
+/// The one exit from a section that is not a failure: the hardware or the build
+/// artifacts it needs do not exist on this machine. Asserts nothing about what
+/// already ran, so call it before the section's first `check`.
+fn skip(reason: []const u8) void {
+    section_skipped = true;
+    print("  skipped: {s}\n", .{reason});
 }
 
 fn approxEq(a: f32, b: f32) bool {
@@ -49,16 +78,16 @@ pub fn main() !void {
     testAutoLarge();
 
     // ── Runtime dynamic backend ─────────────────────────────────────────
-    testRuntimeDynamic();
+    section("runtime.dynamic", 11, testRuntimeDynamic);
 
     // ── Second kernel root + run-time kernel selection ──────────────────
-    testSecondRoot();
+    section("second root", 5, testSecondRoot);
 
     // ── Comptime CPU reference (sanity baseline) ────────────────────────
     testCpuReference();
 
     // ── Hand-written raw kernel through the same artifact pipeline ──────
-    testRawKernel();
+    section("raw kernel", 1, testRawKernel);
 
     // ── Pure comptime: ABI, fusion, Dim3 ────────────────────────────────
     testAbiPack();
@@ -270,10 +299,7 @@ fn testAutoLarge() void {
 /// error rather than a panic.
 fn testSecondRoot() void {
     print("\n[second root]\n", .{});
-    if (!g.AutoKernel(k2.add_offset).Cuda.available) {
-        print("  no CUDA artifacts, skipping\n", .{});
-        return;
-    }
+    if (!g.AutoKernel(k2.add_offset).Cuda.available) return skip("this build emitted no CUDA artifacts");
     const loaded = g.runtime.cuda.loadedModuleCount;
     const before = loaded();
 
@@ -333,31 +359,18 @@ fn testRuntimeDynamic() void {
     print("\n[runtime.dynamic] ", .{});
     const rt = g.runtime.dynamic;
 
-    var gpu = rt.Compute.init(null) catch |e| {
-        print("init failed ({s}), skipping\n", .{@errorName(e)});
-        return;
-    };
+    var gpu = rt.Compute.init(null) catch |e| return skip(@errorName(e));
     defer gpu.deinit();
     print("backend={s}\n", .{@tagName(gpu.backend)});
 
-    if (gpu.backend == .cpu) {
-        print("  no GPU backend, skipping runtime tests\n", .{});
-        check("runtime_init", true);
-        return;
-    }
+    if (gpu.backend == .cpu) return skip("no GPU backend on this machine");
 
     // Load the compiled kernel module. One artifact per kernel root, so ask the
     // generated index which blob holds the kernel we are about to launch.
     const artifacts = @import("gompute_kernels");
     const image: [:0]const u8 = switch (gpu.backend) {
-        .cuda => if (artifacts.has_cuda) artifacts.cuda_images[artifacts.cuda_index.get("scale_relu").?.blob] else {
-            print("  no CUDA artifacts\n", .{});
-            return;
-        },
-        .hip => if (artifacts.has_hip) artifacts.hip_images[artifacts.hip_index.get("scale_relu").?.blob] else {
-            print("  no HIP artifacts\n", .{});
-            return;
-        },
+        .cuda => if (artifacts.has_cuda) artifacts.cuda_images[artifacts.cuda_index.get("scale_relu").?.blob] else return skip("this build emitted no CUDA artifacts"),
+        .hip => if (artifacts.has_hip) artifacts.hip_images[artifacts.hip_index.get("scale_relu").?.blob] else return skip("this build emitted no HIP artifacts"),
         .cpu => unreachable,
     };
 
@@ -498,13 +511,11 @@ fn testCpuReference() void {
 /// did not, so a probe that must compile on any machine has to ask first.
 fn testRawKernel() void {
     print("[raw kernel] ", .{});
-    if (comptime !g.AutoKernel(k.scale_relu).Cuda.available) {
-        print("skipped (build emitted no CUDA artifacts)\n", .{});
-        return;
-    }
+    if (comptime !g.AutoKernel(k.scale_relu).Cuda.available) return skip("this build emitted no CUDA artifacts");
 
+    // Not a skip: the artifacts exist, so failing to load one is a regression.
     var raw = g.RawKernel("raw_increment", .cuda).init(0) catch |e| {
-        print("skipped ({s})\n", .{@errorName(e)});
+        print("init failed: {s}\n", .{@errorName(e)});
         return;
     };
     defer raw.deinit();
