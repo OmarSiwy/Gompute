@@ -510,6 +510,10 @@ test "hand-built handles do not call through an undefined driver" {
     b.free();
     var s: Stream = .{};
     s.deinit();
+    // The pinned-memory pair from e928f1c has the same exposure: `freePinned`
+    // takes a slice the caller could have built anywhere.
+    var ctx: Context = .{};
+    ctx.freePinned(&.{});
 }
 
 test "a handle-less Buffer errors instead of copying from address zero" {
