@@ -270,6 +270,9 @@ inline fn check(rc: CUresult, err: Error) Error!void {
 
 // ---- Public API ----
 
+/// One device. Cheap to copy; the expensive part -- the retained primary context
+/// -- is process-wide and shared. Every method makes this device's context
+/// current on the calling thread first, so a Context is usable from any thread.
 pub const Context = struct {
     device: CUdevice = 0,
     ctx: CUcontext = null,
@@ -306,12 +309,15 @@ pub const Context = struct {
         try check(g.cuCtxSynchronize(), error.SyncFailed);
     }
 
+    /// Caller owns the returned Stream and must `deinit` it.
     pub fn createStream(self: *Context) Error!Stream {
         try self.makeCurrent();
         var s: Stream = .{};
         try check(g.cuStreamCreate(&s.stream, 0), error.SyncFailed);
         return s;
     }
+    /// Allocate device memory. Caller owns the returned Buffer and must `free`
+    /// it; nothing here tracks it.
     pub fn alloc(self: *Context, bytes: usize) Error!Buffer {
         try self.makeCurrent();
         var b: Buffer = .{ .bytes = bytes };
@@ -324,8 +330,8 @@ pub const Context = struct {
     /// transfer through an internal pinned buffer and blocks, so
     /// `uploadAtAsync`/`downloadAtAsync` are asynchronous in name only.
     ///
-    /// Driver memory, not the caller's allocator's -- release it with
-    /// `freePinned` and nothing else.
+    /// Caller owns the returned block. It is driver memory, not the caller's
+    /// allocator's -- release it with `freePinned` and nothing else.
     pub fn allocPinned(self: *Context, bytes: usize) Error![]u8 {
         try self.makeCurrent();
         var p: ?*anyopaque = null;
@@ -352,6 +358,12 @@ pub const Context = struct {
     }
 };
 
+/// Device memory. All-default fields on purpose -- a hand-built or already-freed
+/// Buffer has a null handle, and every method here reports that as
+/// `error.InvalidArgument` rather than handing the driver an address of `offset`.
+///
+/// `bytes` records the allocation size but nothing checks against it: transfers
+/// are not bounds-checked in process.
 pub const Buffer = struct {
     handle: CUdeviceptr = 0,
     bytes: usize = 0,
@@ -386,6 +398,7 @@ pub const Buffer = struct {
         ensureCurrent();
         try check(g.cuMemcpyHtoD_v2(try self.offsetPtr(offset), host, n), error.CopyFailed);
     }
+    /// Release the device memory. Idempotent.
     pub fn free(self: *Buffer) void {
         // `g` is undefined until loadApi succeeds, and every handle type here is
         // pub with all-default fields -- so a hand-constructed `Buffer{}` freed
@@ -395,6 +408,8 @@ pub const Buffer = struct {
         _ = g.cuMemFree_v2(self.handle);
         self.* = .{};
     }
+    /// The handle as a kernel argument. Borrows `self`: the pointer is into the
+    /// Buffer, which must outlive every launch it is passed to.
     pub fn argPtr(self: *Buffer) iface.Arg {
         return @ptrCast(&self.handle);
     }
@@ -420,11 +435,14 @@ pub const Buffer = struct {
         try check(g.cuMemsetD8Async(try self.devicePtr(), value, n, stream.stream), error.CopyFailed);
     }
 
+    /// The raw device address, for printing or for handing to code outside
+    /// this library. Not dereferenceable from the host.
     pub fn deviceAddr(self: *const Buffer) u64 {
         return self.handle;
     }
 };
 
+/// A loaded module. `getKernel` looks entry points up by mangled symbol name.
 pub const Module = struct {
     module: CUmodule = null,
     /// Owned by the process-wide cache; `deinit` must leave it alone.
@@ -447,17 +465,21 @@ pub const Module = struct {
     }
 };
 
+/// An entry point in a loaded module.
 pub const Kernel = struct {
     func: CUfunction = null,
     pub fn launch(self: Kernel, grid: Dim3, block: Dim3, shared_bytes: u32, args: []const iface.Arg) Error!void {
         try self.launchOnStream(grid, block, shared_bytes, args, null);
     }
+    /// Launch on `stream` and return without waiting. `args` must stay put
+    /// until the launch has actually run -- `stream.synchronize()`.
     pub fn launchOnStream(self: Kernel, grid: Dim3, block: Dim3, shared_bytes: u32, args: []const iface.Arg, stream: CUstream) Error!void {
         ensureCurrent();
         try check(g.cuLaunchKernel(self.func, grid.x, grid.y, grid.z, block.x, block.y, block.z, shared_bytes, stream, @constCast(args.ptr), null), error.LaunchFailed);
     }
 };
 
+/// A queue of ordered asynchronous work. `null` is the default stream.
 pub const Stream = struct {
     stream: CUstream = null,
     pub fn synchronize(self: *Stream) Error!void {

@@ -1,4 +1,5 @@
-///! HIP backend via runtime loading (dlopen), mirroring backend_cuda.zig.
+//! HIP backend via runtime dlopen, mirroring cuda.zig.
+
 const std = @import("std");
 const builtin = @import("builtin");
 const iface = @import("../core/interface.zig");
@@ -211,6 +212,9 @@ pub fn shutdown() void {
     default_ordinal.store(-1, .monotonic);
 }
 
+/// One device. Cheap to copy; the expensive part -- the retained primary context
+/// -- is process-wide and shared. Every method makes this device's context
+/// current on the calling thread first, so a Context is usable from any thread.
 pub const Context = struct {
     device: hipDevice_t = 0,
     ctx: hipCtx_t = null,
@@ -238,6 +242,8 @@ pub const Context = struct {
         try self.makeCurrent();
         try check(g.hipDeviceSynchronize(), error.SyncFailed);
     }
+    /// Allocate device memory. Caller owns the returned Buffer and must `free`
+    /// it; nothing here tracks it.
     pub fn alloc(self: *Context, bytes: usize) Error!Buffer {
         try self.makeCurrent();
         var b: Buffer = .{ .bytes = bytes };
@@ -249,8 +255,8 @@ pub const Context = struct {
     /// transfer through an internal pinned buffer and blocks, so
     /// `uploadAtAsync`/`downloadAtAsync` are asynchronous in name only.
     ///
-    /// Runtime memory, not the caller's allocator's -- release it with
-    /// `freePinned` and nothing else.
+    /// Caller owns the returned block. It is runtime memory, not the caller's
+    /// allocator's -- release it with `freePinned` and nothing else.
     pub fn allocPinned(self: *Context, bytes: usize) Error![]u8 {
         try self.makeCurrent();
         var p: ?*anyopaque = null;
@@ -273,6 +279,7 @@ pub const Context = struct {
         try self.makeCurrent();
         return loadModuleCached(self.ordinal, image);
     }
+    /// Caller owns the returned Stream and must `deinit` it.
     pub fn createStream(self: *Context) Error!Stream {
         try self.makeCurrent();
         var s: Stream = .{};
@@ -281,6 +288,12 @@ pub const Context = struct {
     }
 };
 
+/// Device memory. All-default fields on purpose -- a hand-built or already-freed
+/// Buffer has a null handle, and every method here reports that as
+/// `error.InvalidArgument` rather than handing the runtime an address of `offset`.
+///
+/// `bytes` records the allocation size but nothing checks against it: transfers
+/// are not bounds-checked in process.
 pub const Buffer = struct {
     handle: hipDeviceptr_t = null,
     bytes: usize = 0,
@@ -305,6 +318,8 @@ pub const Buffer = struct {
         ensureCurrent();
         try check(g.hipMemcpyDtoH(host, try self.devicePtr(), n), error.CopyFailed);
     }
+    /// Release the device memory. Idempotent.
+    /// Release the device memory. Idempotent.
     pub fn free(self: *Buffer) void {
         // Also covers a default-constructed Buffer, where `g` is still
         // `undefined` because nothing ever dlopen'd the runtime.
@@ -313,6 +328,8 @@ pub const Buffer = struct {
         _ = g.hipFree(self.handle);
         self.* = .{};
     }
+    /// The handle as a kernel argument. Borrows `self`: the pointer is into the
+    /// Buffer, which must outlive every launch it is passed to.
     pub fn argPtr(self: *Buffer) iface.Arg {
         return @ptrCast(&self.handle);
     }
@@ -347,6 +364,7 @@ pub const Buffer = struct {
     }
 };
 
+/// A loaded module. `getKernel` looks entry points up by mangled symbol name.
 pub const Module = struct {
     module: hipModule_t = null,
     /// Owned by the process-wide cache; `deinit` must leave it alone.
@@ -369,17 +387,21 @@ pub const Module = struct {
     }
 };
 
+/// An entry point in a loaded module.
 pub const Kernel = struct {
     func: hipFunction_t = null,
     pub fn launch(self: Kernel, grid: Dim3, block: Dim3, shared_bytes: u32, args: []const iface.Arg) Error!void {
         try self.launchOnStream(grid, block, shared_bytes, args, null);
     }
+    /// Launch on `stream` and return without waiting. `args` must stay put
+    /// until the launch has actually run -- `stream.synchronize()`.
     pub fn launchOnStream(self: Kernel, grid: Dim3, block: Dim3, shared_bytes: u32, args: []const iface.Arg, stream: hipStream_t) Error!void {
         ensureCurrent();
         try check(g.hipModuleLaunchKernel(self.func, grid.x, grid.y, grid.z, block.x, block.y, block.z, shared_bytes, stream, @constCast(args.ptr), null), error.LaunchFailed);
     }
 };
 
+/// A queue of ordered asynchronous work. `null` is the default stream.
 pub const Stream = struct {
     stream: hipStream_t = null,
     pub fn synchronize(self: *Stream) Error!void {

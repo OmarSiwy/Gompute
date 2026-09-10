@@ -5,11 +5,20 @@ const cuda = @import("cuda.zig");
 const hip = @import("hip.zig");
 const iface = @import("../core/interface.zig");
 
+/// Which backend a handle came from. Distinct from `gompute.Backend`
+/// (`host/kernel.zig`), which is a separate enum with the same three tags --
+/// they do not coerce to each other.
 pub const Backend = enum { cpu, cuda, hip };
+/// Launch geometry; see `core/interface.zig`.
 pub const Dim3 = iface.Dim3;
+/// One kernel argument: a pointer to caller-owned storage that must outlive the
+/// launch. See `core/interface.zig`.
 pub const Arg = iface.Arg;
+/// The error set every call in this file returns; see `core/interface.zig`.
 pub const Error = iface.Error;
 
+/// A device handle over whichever backend `init` found. Holds a context for
+/// both GPU backends and uses the one `backend` names.
 pub const Compute = struct {
     backend: Backend,
     cuda_ctx: cuda.Context = .{},
@@ -41,6 +50,11 @@ pub const Compute = struct {
         };
     }
 
+    /// Init on a chosen device ordinal.
+    ///
+    /// Unlike `init`, this does not probe and does not fall back: a null
+    /// `preferred` means `.cuda`, and on a machine without CUDA it returns
+    /// `error.InitFailed` rather than trying HIP or settling for `.cpu`.
     pub fn initDevice(preferred: ?Backend, ordinal: c_int) Error!Compute {
         const b = preferred orelse .cuda;
         return switch (b) {
@@ -61,6 +75,7 @@ pub const Compute = struct {
         }
     }
 
+    /// Block until every launch on this device has finished. A no-op on `.cpu`.
     pub fn synchronize(self: *Compute) Error!void {
         switch (self.backend) {
             .cuda => try self.cuda_ctx.synchronize(),
@@ -69,6 +84,9 @@ pub const Compute = struct {
         }
     }
 
+    /// Allocate device memory. Caller owns the returned Buffer and must
+    /// `free` it. Returns `error.AllocFailed` on the `.cpu` backend, which has
+    /// no device to allocate on.
     pub fn alloc(self: *Compute, bytes: usize) Error!Buffer {
         return switch (self.backend) {
             .cuda => .{ .cuda = try self.cuda_ctx.alloc(bytes) },
@@ -77,6 +95,9 @@ pub const Compute = struct {
         };
     }
 
+    /// JIT a module image, cached per (device, image) by the backend. The
+    /// sentinel on `image` is load-bearing for CUDA -- `cuModuleLoadData` reads
+    /// PTX up to a NUL. Returns `error.ModuleLoadFailed` on `.cpu`.
     pub fn loadModule(self: *Compute, image: [:0]const u8) Error!Module {
         return switch (self.backend) {
             .cuda => .{ .cuda = try self.cuda_ctx.loadModuleFromMemory(image) },
@@ -85,6 +106,8 @@ pub const Compute = struct {
         };
     }
 
+    /// Create a stream for ordered asynchronous work. Caller owns the returned
+    /// Stream and must `deinit` it. Returns `error.InitFailed` on `.cpu`.
     pub fn createStream(self: *Compute) Error!Stream {
         return switch (self.backend) {
             .cuda => .{ .cuda = try self.cuda_ctx.createStream() },
@@ -102,11 +125,16 @@ pub fn shutdown() void {
     hip.shutdown();
 }
 
+/// Device memory on whichever backend allocated it.
+///
+/// Asserts the backend is not `.cpu` in every method except `free`: a `.cpu`
+/// Buffer cannot exist, because `Compute.alloc` refuses to make one.
 pub const Buffer = union(Backend) {
     cpu: void,
     cuda: cuda.Buffer,
     hip: hip.Buffer,
 
+    /// Copy `n` bytes from host memory into the buffer, and wait.
     pub fn upload(self: *Buffer, host: *const anyopaque, n: usize) Error!void {
         switch (self.*) {
             .cuda => |*b| try b.upload(host, n),
@@ -114,6 +142,7 @@ pub const Buffer = union(Backend) {
             .cpu => unreachable,
         }
     }
+    /// Copy `n` bytes out of the buffer into host memory, and wait.
     pub fn download(self: *Buffer, host: *anyopaque, n: usize) Error!void {
         switch (self.*) {
             .cuda => |*b| try b.download(host, n),
@@ -121,6 +150,8 @@ pub const Buffer = union(Backend) {
             .cpu => unreachable,
         }
     }
+    /// `download`, starting `offset` bytes into the buffer. Not bounds-checked
+    /// against the allocation.
     pub fn downloadAt(self: *Buffer, host: *anyopaque, offset: usize, n: usize) Error!void {
         switch (self.*) {
             .cuda => |*b| try b.downloadAt(host, offset, n),
@@ -128,6 +159,8 @@ pub const Buffer = union(Backend) {
             .cpu => unreachable,
         }
     }
+    /// `upload`, starting `offset` bytes into the buffer. Not bounds-checked
+    /// against the allocation.
     pub fn uploadAt(self: *Buffer, host: *const anyopaque, offset: usize, n: usize) Error!void {
         switch (self.*) {
             .cuda => |*b| try b.uploadAt(host, offset, n),
@@ -135,6 +168,7 @@ pub const Buffer = union(Backend) {
             .cpu => unreachable,
         }
     }
+    /// Release the device memory. Idempotent, and a no-op on `.cpu`.
     pub fn free(self: *Buffer) void {
         switch (self.*) {
             .cuda => |*b| b.free(),
@@ -142,6 +176,8 @@ pub const Buffer = union(Backend) {
             .cpu => {},
         }
     }
+    /// The buffer's handle as a kernel argument. Borrows `self`: the pointer is
+    /// into the Buffer, which must outlive the launch it is passed to.
     pub fn argPtr(self: *Buffer) Arg {
         return switch (self.*) {
             .cuda => |*b| b.argPtr(),
@@ -149,6 +185,8 @@ pub const Buffer = union(Backend) {
             .cpu => unreachable,
         };
     }
+    /// Device-to-device copy of `n` bytes. Asserts `src` is on the same backend
+    /// as `self`.
     pub fn copyFrom(self: *Buffer, src: *const Buffer, src_offset: usize, dst_offset: usize, n: usize) Error!void {
         switch (self.*) {
             .cuda => |*b| try b.copyFrom(&src.cuda, src_offset, dst_offset, n),
@@ -156,6 +194,8 @@ pub const Buffer = union(Backend) {
             .cpu => unreachable,
         }
     }
+    /// The raw device address, for printing or for passing to code outside this
+    /// library. Not dereferenceable from the host.
     pub fn deviceAddr(self: *const Buffer) u64 {
         return switch (self.*) {
             .cuda => |b| b.handle,
@@ -165,11 +205,13 @@ pub const Buffer = union(Backend) {
     }
 };
 
+/// A loaded module. Asserts the backend is not `.cpu` in `getKernel`.
 pub const Module = union(Backend) {
     cpu: void,
     cuda: cuda.Module,
     hip: hip.Module,
 
+    /// Look up an entry point by its mangled symbol name.
     pub fn getKernel(self: *Module, name: [*:0]const u8) Error!Kernel {
         return switch (self.*) {
             .cuda => |*m| .{ .cuda = try m.getKernel(name) },
@@ -177,6 +219,8 @@ pub const Module = union(Backend) {
             .cpu => unreachable,
         };
     }
+    /// (#3) Drops this handle. A cached module stays loaded for the process;
+    /// `shutdown()` unloads it.
     pub fn deinit(self: *Module) void {
         switch (self.*) {
             .cuda => |*m| m.deinit(),
@@ -186,11 +230,13 @@ pub const Module = union(Backend) {
     }
 };
 
+/// An entry point. Asserts the backend is not `.cpu` in both launch methods.
 pub const Kernel = union(Backend) {
     cpu: void,
     cuda: cuda.Kernel,
     hip: hip.Kernel,
 
+    /// Launch on the default stream. `args` must outlive the call.
     pub fn launch(self: Kernel, grid: Dim3, block: Dim3, shared_bytes: u32, args: []const Arg) Error!void {
         switch (self) {
             .cuda => |k| try k.launch(grid, block, shared_bytes, args),
@@ -198,6 +244,9 @@ pub const Kernel = union(Backend) {
             .cpu => unreachable,
         }
     }
+    /// Launch on `stream` and return without waiting. `args` must stay put until
+    /// `stream.synchronize()` returns. Asserts `stream` is on the same backend
+    /// as the kernel.
     pub fn launchOnStream(self: Kernel, grid: Dim3, block: Dim3, shared_bytes: u32, args: []const Arg, stream: *Stream) Error!void {
         switch (self) {
             .cuda => |k| try k.launchOnStream(grid, block, shared_bytes, args, stream.cuda.stream),
@@ -207,11 +256,14 @@ pub const Kernel = union(Backend) {
     }
 };
 
+/// A queue of ordered asynchronous work. Asserts the backend is not `.cpu` in
+/// `synchronize`.
 pub const Stream = union(Backend) {
     cpu: void,
     cuda: cuda.Stream,
     hip: hip.Stream,
 
+    /// Block until everything queued on this stream has finished.
     pub fn synchronize(self: *Stream) Error!void {
         switch (self.*) {
             .cuda => |*s| try s.synchronize(),
@@ -219,6 +271,7 @@ pub const Stream = union(Backend) {
             .cpu => unreachable,
         }
     }
+    /// Destroy the stream. A no-op on `.cpu`.
     pub fn deinit(self: *Stream) void {
         switch (self.*) {
             .cuda => |*s| s.deinit(),
