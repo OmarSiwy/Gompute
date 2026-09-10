@@ -427,14 +427,6 @@ fn normalizeRoots(b: *std.Build, options: EmitOptions) []const KernelRoot {
     return roots.items;
 }
 
-/// One kernel root's outputs for one backend.
-const RootArtifacts = struct {
-    /// PTX (CUDA) or HSACO (HIP), ready to `@embedFile`.
-    blob: std.Build.LazyPath,
-    /// The generated `exported -> internal` name table for this root.
-    names: std.Build.LazyPath,
-};
-
 /// Serializes `heavy` roots into `lanes` chains, leaving light roots free.
 ///
 /// A plain `dependOn` edge between two unrelated compilations is a false
@@ -493,8 +485,19 @@ fn buildArtifacts(
     else
         resolveGpu(b, "hip", "gfx1100", options.hip.gpu, detectHipGpu);
 
-    const cuda_out = b.allocator.alloc(RootArtifacts, roots.len) catch @panic("OOM");
-    const hip_out = b.allocator.alloc(RootArtifacts, roots.len) catch @panic("OOM");
+    // Created up front so each backend loop can register its blobs on the spot.
+    // `has_cuda`/`has_hip` are already known, and the generated source depends
+    // on nothing else, so there is no reason to stage the LazyPaths anywhere.
+    const write = b.addWriteFiles();
+    const artifacts_mod = b.createModule(.{
+        .root_source_file = write.add("gompute_kernels.zig", artifactsSource(
+            b,
+            roots,
+            cuda_cpu != null,
+            hip_cpu != null,
+        )),
+    });
+
     var cuda_lanes: HeavyLanes = .init(b, options.heavy_lanes);
     var hip_lanes: HeavyLanes = .init(b, options.heavy_lanes);
 
@@ -509,7 +512,7 @@ fn buildArtifacts(
         );
         const target = b.resolveTargetQuery(query);
         const mode = if (options.cuda.optimize) |m| deviceOptimize(m) else optimize;
-        for (roots, cuda_out) |root, *out| {
+        for (roots, 0..) |root, i| {
             const gpu_mod = b.createModule(.{
                 .root_source_file = root.root,
                 .target = target,
@@ -528,7 +531,7 @@ fn buildArtifacts(
             const rewrite = b.addRunArtifact(tool);
             rewrite.addFileArg(object.getEmittedLlvmIr());
             const rewritten_ir = rewrite.addOutputFileArg(b.fmt("gompute_cuda_{s}.ll", .{root.name}));
-            out.names = rewrite.addOutputFileArg(b.fmt("gompute_cuda_names_{s}.zig", .{root.name}));
+            const names = rewrite.addOutputFileArg(b.fmt("gompute_cuda_names_{s}.zig", .{root.name}));
 
             const assemble = b.addSystemCommand(&.{
                 b.graph.zig_exe,
@@ -541,7 +544,10 @@ fn buildArtifacts(
                 "-Wno-unused-command-line-argument",
             });
             assemble.addFileArg(rewritten_ir);
-            out.blob = assemble.addPrefixedOutputFileArg("-o", b.fmt("gompute_{s}.ptx", .{root.name}));
+            const blob = assemble.addPrefixedOutputFileArg("-o", b.fmt("gompute_{s}.ptx", .{root.name}));
+
+            artifacts_mod.addAnonymousImport(b.fmt("cuda_blob_{d}", .{i}), .{ .root_source_file = blob });
+            artifacts_mod.addAnonymousImport(b.fmt("cuda_names_{d}", .{i}), .{ .root_source_file = names });
         }
     }
 
@@ -556,7 +562,7 @@ fn buildArtifacts(
         );
         const target = b.resolveTargetQuery(query);
         const mode = if (options.hip.optimize) |m| deviceOptimize(m) else optimize;
-        for (roots, hip_out) |root, *out| {
+        for (roots, 0..) |root, i| {
             const gpu_mod = b.createModule(.{
                 .root_source_file = root.root,
                 .target = target,
@@ -573,32 +579,17 @@ fn buildArtifacts(
             const names_run = b.addRunArtifact(tool);
             names_run.addFileArg(object.getEmittedLlvmIr());
             _ = names_run.addOutputFileArg(b.fmt("gompute_hip_rewritten_{s}.ll", .{root.name}));
-            out.names = names_run.addOutputFileArg(b.fmt("gompute_hip_names_{s}.zig", .{root.name}));
+            const names = names_run.addOutputFileArg(b.fmt("gompute_hip_names_{s}.zig", .{root.name}));
 
             const link = b.addSystemCommand(&.{ b.graph.zig_exe, "ld.lld", "-shared" });
             link.addFileArg(object.getEmittedBin());
-            out.blob = link.addPrefixedOutputFileArg("-o", b.fmt("gompute_{s}.hsaco", .{root.name}));
+            const blob = link.addPrefixedOutputFileArg("-o", b.fmt("gompute_{s}.hsaco", .{root.name}));
+
+            artifacts_mod.addAnonymousImport(b.fmt("hip_blob_{d}", .{i}), .{ .root_source_file = blob });
+            artifacts_mod.addAnonymousImport(b.fmt("hip_names_{d}", .{i}), .{ .root_source_file = names });
         }
     }
 
-    const write = b.addWriteFiles();
-    const artifacts_source = write.add("gompute_kernels.zig", artifactsSource(
-        b,
-        roots,
-        cuda_cpu != null,
-        hip_cpu != null,
-    ));
-    const artifacts_mod = b.createModule(.{ .root_source_file = artifacts_source });
-    for (roots, cuda_out, hip_out, 0..) |_, cuda, hip, i| {
-        if (cuda_cpu != null) {
-            artifacts_mod.addAnonymousImport(b.fmt("cuda_blob_{d}", .{i}), .{ .root_source_file = cuda.blob });
-            artifacts_mod.addAnonymousImport(b.fmt("cuda_names_{d}", .{i}), .{ .root_source_file = cuda.names });
-        }
-        if (hip_cpu != null) {
-            artifacts_mod.addAnonymousImport(b.fmt("hip_blob_{d}", .{i}), .{ .root_source_file = hip.blob });
-            artifacts_mod.addAnonymousImport(b.fmt("hip_names_{d}", .{i}), .{ .root_source_file = hip.names });
-        }
-    }
     return artifacts_mod;
 }
 
