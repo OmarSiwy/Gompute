@@ -11,12 +11,18 @@
 
 const std = @import("std");
 
-/// The two symbols must end up as the same code. In practice LLVM notices they
-/// are identical and folds them into one symbol, which is the strongest
-/// possible evidence; if it ever stops doing that we fall back to comparing the
-/// instruction streams.
-const generated = "gompute_scale_relu";
-const handwritten = "manual_scale_relu";
+const Pair = struct { generated: []const u8, handwritten: []const u8 };
+
+/// Each pair must end up as the same code. In practice LLVM notices the two are
+/// identical and folds them into one symbol, which is the strongest possible
+/// evidence; if it ever stops doing that we fall back to comparing the
+/// instruction streams. Every entry here has to be exported by
+/// `tests/codegen.zig` -- a name with no export resolves to itself and reports a
+/// mismatch.
+const pairs = [_]Pair{
+    .{ .generated = "gompute_scale_relu", .handwritten = "manual_scale_relu" },
+    .{ .generated = "gompute_zip", .handwritten = "manual_zip" },
+};
 
 fn endsWithSymbol(line: []const u8, symbol: []const u8) bool {
     return std.mem.endsWith(u8, line, symbol) and
@@ -61,15 +67,25 @@ fn resolve(text: []const u8, symbol: []const u8) []const u8 {
 /// True when both names end up owned by the same symbol. LLVM folds identical
 /// function bodies, so the usual outcome is that both are equated to a third
 /// name -- which is the strongest evidence available that the code is the same.
-fn foldedTogether(text: []const u8) bool {
-    // Compare the trailing identifier: the same symbol shows up both bare and
-    // module-qualified (`gompute_scale_relu` vs `codegen.gompute_scale_relu`).
-    return std.mem.eql(u8, trailingName(resolve(text, generated)), trailingName(resolve(text, handwritten)));
+fn foldedTogether(text: []const u8, pair: Pair) bool {
+    return sameSymbol(resolve(text, pair.generated), resolve(text, pair.handwritten));
 }
 
-fn trailingName(s: []const u8) []const u8 {
-    const dot = std.mem.lastIndexOfScalar(u8, s, '.') orelse return s;
-    return s[dot + 1 ..];
+/// The same symbol shows up both bare and module-qualified
+/// (`gompute_scale_relu` vs `codegen.gompute_scale_relu`), so a `module.`
+/// qualifier in front of an otherwise identical name is ignored -- but only
+/// that. Comparing just the text after the last `.` made `a.foo` and `b.foo`
+/// compare equal: a silent pass on a real regression, in the one tool whose
+/// whole job is to not lie. A separator other than `.` is rejected, which fails
+/// loudly rather than quietly, and is the safe direction.
+fn sameSymbol(a: []const u8, b: []const u8) bool {
+    return std.mem.eql(u8, a, b) or qualifies(a, b) or qualifies(b, a);
+}
+
+/// `long` is `short` with a non-empty `module.` prefix in front of it.
+fn qualifies(long: []const u8, short: []const u8) bool {
+    return long.len > short.len + 1 and std.mem.endsWith(u8, long, short) and
+        long[long.len - short.len - 1] == '.';
 }
 
 /// ponytail: the fallback compares branch targets (`.LBB0_8`) literally, so two
@@ -106,41 +122,26 @@ fn body(arena: std.mem.Allocator, text: []const u8, symbol: []const u8) !?[]cons
     return if (inside) out.items else null;
 }
 
-pub fn main(init: std.process.Init) !void {
-    const arena = init.arena.allocator();
-    const io = init.io;
-    const args = try init.minimal.args.toSlice(arena);
-    if (args.len != 2) {
-        std.debug.print("usage: codegen_check <probe.s>\n", .{});
-        return error.BadUsage;
-    }
-
-    const text = try std.Io.Dir.cwd().readFileAlloc(io, args[1], arena, .limited(64 * 1024 * 1024));
-
-    if (foldedTogether(text)) return;
+fn checkPair(arena: std.mem.Allocator, text: []const u8, path: []const u8, pair: Pair) !void {
+    if (foldedTogether(text, pair)) return;
 
     // Each name may itself be an equate onto whichever identical function won
     // the fold, so look up the body under the resolved symbol, not the export.
-    const gen_sym = resolve(text, generated);
-    const manual_sym = resolve(text, handwritten);
+    const gen_sym = resolve(text, pair.generated);
+    const manual_sym = resolve(text, pair.handwritten);
 
     const gen = try body(arena, text, gen_sym) orelse {
-        std.debug.print("codegen_check: symbol '{s}' (from '{s}') not found in {s}\n", .{ gen_sym, generated, args[1] });
+        std.debug.print("codegen_check: symbol '{s}' (from '{s}') not found in {s}\n", .{ gen_sym, pair.generated, path });
         return error.SymbolNotFound;
     };
     const manual = try body(arena, text, manual_sym) orelse {
-        std.debug.print("codegen_check: symbol '{s}' (from '{s}') not found in {s}\n", .{ manual_sym, handwritten, args[1] });
+        std.debug.print("codegen_check: symbol '{s}' (from '{s}') not found in {s}\n", .{ manual_sym, pair.handwritten, path });
         return error.SymbolNotFound;
     };
 
-    var same = gen.len == manual.len;
-    if (same) for (gen, manual) |a, b| {
-        if (!std.mem.eql(u8, a, b)) {
-            same = false;
-            break;
-        }
-    };
-    if (same) return;
+    if (gen.len == manual.len and for (gen, manual) |a, b| {
+        if (!std.mem.eql(u8, a, b)) break false;
+    } else true) return;
 
     std.debug.print(
         \\codegen_check: the generated CPU kernel no longer matches the hand-written loop.
@@ -151,7 +152,7 @@ pub fn main(init: std.process.Init) !void {
         \\  {s}  ({d} instructions)
         \\  {s}  ({d} instructions)
         \\
-    , .{ generated, gen.len, handwritten, manual.len });
+    , .{ pair.generated, gen.len, pair.handwritten, manual.len });
 
     const n = @max(gen.len, manual.len);
     for (0..n) |i| {
@@ -163,21 +164,60 @@ pub fn main(init: std.process.Init) !void {
     return error.CodegenMismatch;
 }
 
-test "folded alias is recognised directly and through a shared target" {
-    try std.testing.expect(foldedTogether("\tmanual_scale_relu = cg.gompute_scale_relu\n"));
-    try std.testing.expect(foldedTogether("probe.gompute_scale_relu = probe.manual_scale_relu\n"));
+pub fn main(init: std.process.Init) !void {
+    const arena = init.arena.allocator();
+    const io = init.io;
+    const args = try init.minimal.args.toSlice(arena);
+    if (args.len != 2) {
+        std.debug.print("usage: codegen_check <probe.s>\n", .{});
+        return error.BadUsage;
+    }
+
+    const text = try std.Io.Dir.cwd().readFileAlloc(io, args[1], arena, .limited(64 * 1024 * 1024));
+    for (pairs) |pair| try checkPair(arena, text, args[1], pair);
+}
+
+test foldedTogether {
+    const p = pairs[0];
+    try std.testing.expect(foldedTogether("\tmanual_scale_relu = cg.gompute_scale_relu\n", p));
+    try std.testing.expect(foldedTogether("probe.gompute_scale_relu = probe.manual_scale_relu\n", p));
 
     // What LLVM actually emits: both names equated to a third symbol, because a
     // third identical function won the fold.
     try std.testing.expect(foldedTogether(
         "manual_scale_relu = codegen.gompute_inferred\n" ++
             "gompute_scale_relu = codegen.gompute_inferred\n",
+        p,
     ));
 
     // Only one of the two folded away -> they are not the same code.
-    try std.testing.expect(!foldedTogether("\tmanual_scale_relu = something_else\n"));
+    try std.testing.expect(!foldedTogether("\tmanual_scale_relu = something_else\n", p));
     // A symbol that merely ends with the name must not count.
-    try std.testing.expect(!foldedTogether("\tx_manual_scale_relu = y_gompute_scale_relu\n"));
+    try std.testing.expect(!foldedTogether("\tx_manual_scale_relu = y_gompute_scale_relu\n", p));
+
+    // Two different symbols that share a trailing name are NOT the same symbol.
+    // Comparing only the text after the last `.` passed this silently.
+    try std.testing.expect(!foldedTogether(
+        "gompute_scale_relu = a.folded\n" ++
+            "manual_scale_relu = b.folded\n",
+        p,
+    ));
+
+    // The second pair is wired in too.
+    try std.testing.expect(foldedTogether(
+        "manual_zip = codegen.gompute_zip\ngompute_zip = codegen.gompute_zip\n",
+        pairs[1],
+    ));
+    try std.testing.expect(!foldedTogether("\tmanual_zip = something_else\n", pairs[1]));
+}
+
+test sameSymbol {
+    try std.testing.expect(sameSymbol("codegen.foo", "foo"));
+    try std.testing.expect(sameSymbol("foo", "codegen.foo"));
+    try std.testing.expect(sameSymbol("a.b.foo", "b.foo"));
+    try std.testing.expect(!sameSymbol("a.foo", "b.foo"));
+    try std.testing.expect(!sameSymbol(".foo", "foo")); // empty qualifier
+    try std.testing.expect(!sameSymbol("x_foo", "foo")); // not a separator
 }
 
 test "body extraction stops at .size and drops directives and labels" {
@@ -196,7 +236,7 @@ test "body extraction stops at .size and drops directives and labels" {
         "\t.size\tprobe.manual_scale_relu, 16\n" ++
         "\tretq\n";
 
-    const lines = (try body(arena, asm_text, handwritten)).?;
+    const lines = (try body(arena, asm_text, pairs[0].handwritten)).?;
     try std.testing.expectEqual(@as(usize, 2), lines.len);
     try std.testing.expectEqualStrings("vmulss\txmm2, xmm0, dword ptr [rdi]", lines[0]);
     try std.testing.expectEqualStrings("vmaxss\txmm2, xmm2, xmm1", lines[1]);
@@ -205,5 +245,5 @@ test "body extraction stops at .size and drops directives and labels" {
 test "a missing symbol is reported, not silently passed" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    try std.testing.expect((try body(arena_state.allocator(), "nothing here\n", generated)) == null);
+    try std.testing.expect((try body(arena_state.allocator(), "nothing here\n", pairs[0].generated)) == null);
 }
