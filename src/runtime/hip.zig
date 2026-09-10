@@ -88,11 +88,14 @@ fn loadApiLocked() Error!void {
     loaded = true;
 }
 
+/// Check hipError_t, stash raw code for #7 error detail.
 inline fn check(rc: hipError_t, err: Error) Error!void {
-    if (rc != 0) {
-        iface.last_driver_error = .{ .code = rc, .backend = .hip };
-        return err;
-    }
+    // Records on failure AND clears on success, same as cuda.zig: assigning
+    // only on failure left lastDriverError() reporting a stale code
+    // indefinitely, so a caller could not tell a fresh failure from one made
+    // several calls ago.
+    iface.recordDriverResult(.hip, rc);
+    if (rc != 0) return err;
 }
 
 // ---- Process-wide device state ----
@@ -409,4 +412,17 @@ test "a handle-less Buffer errors instead of panicking, and free is idempotent" 
     try std.testing.expectError(error.InvalidArgument, buffer.fillAsync(0, 1, &stream));
     buffer.free();
     buffer.free();
+}
+
+test "a successful call clears the last driver error" {
+    // hip used to assign `iface.last_driver_error` by hand and only on failure,
+    // so a success after a failure left the old code standing forever --
+    // core/interface.zig documents that as fixed, and it was, on cuda only.
+    iface.recordDriverResult(.hip, 101);
+    try check(0, error.LaunchFailed);
+    try std.testing.expectEqual(iface.DriverError{}, iface.last_driver_error);
+
+    try std.testing.expectError(error.LaunchFailed, check(101, error.LaunchFailed));
+    try std.testing.expectEqual(@as(i64, 101), iface.last_driver_error.code);
+    iface.recordDriverResult(.hip, 0);
 }
