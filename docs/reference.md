@@ -297,7 +297,14 @@ fexp` or `Cannot select: fsin`. `g.math` provides device-safe replacements, and
 they compile on the host too, so one kernel source builds both ways.
 
 Every one is `inline fn (x: anytype) @TypeOf(x)`, except `pow(x, y)`. They take
-`f32` and `f64`; anything else is a compile error telling you to cast first.
+`f32`, `f64`, and `@Vector`s of either; anything else is a compile error telling
+you to cast first. Vectors matter because the CPU backend instantiates a generic
+map body at vector width, so that is what a vectorized kernel passes them.
+
+The vector form is correct rather than fast. The ones that are a builtin —
+`sin`, `cos`, `tan`, `sqrt`, `rsqrt` and `f32` `exp2` — stay elementwise; the
+ported transcendentals index a table with the input and branch on it, so they
+run a lane at a time.
 
 `exp`, `exp2`, `log`, `log2`, `log10` and `pow` are ports of [ARM
 optimized-routines][aor] — ONE body each, used unchanged on the host, on NVPTX

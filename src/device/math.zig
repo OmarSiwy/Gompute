@@ -45,8 +45,17 @@
 //! `@floatCast` — that path is software and correct, just slow (1/64 rate on
 //! consumer NVIDIA).
 //!
-//! Already safe everywhere and deliberately absent here: `@sqrt @abs @trunc
-//! @round @floor @ceil @copysign @min @max`, `std.math.scalbn/frexp/modf`.
+//! Every entry point takes a scalar `f32`/`f64` or a `@Vector` of either. That
+//! is not decoration: the CPU backend instantiates a generic map body at
+//! `@Vector` width, so a kernel written the way the guide recommends hands
+//! these functions vectors. Only the builtins are elementwise (`sin`, `cos`,
+//! `tan`, `sqrt`, `rsqrt`, f32 `exp2`); the ported bodies run lane by lane.
+//! See `apply`.
+//!
+//! Already safe everywhere and deliberately absent here: `@abs @trunc @round
+//! @floor @ceil @copysign @min @max`, `std.math.scalbn/frexp/modf`. `sqrt` and
+//! `rsqrt` ARE here despite being safe, so that a kernel need not keep two
+//! lists in its head — they are `@sqrt` with the argument checked.
 //!
 //! `@mulAdd` is NOT in that list. It is one instruction only where the target
 //! actually has an FMA; anywhere else it lowers to a `fma()` CALL into libm,

@@ -39,7 +39,7 @@ pub const powlog_poly = [7]f64{
 
 /// `pad` is never read. It is kept so the stride is 32 bytes and the index
 /// is a shift rather than a multiply -- the reference does the same.
-pub const PowLogEntry = extern struct { invc: f64, pad: f64, logc: f64, logctail: f64 };
+const PowLogEntry = extern struct { invc: f64, pad: f64, logc: f64, logctail: f64 };
 
 /// 1/c, log(c) and its tail for the 128 subintervals of [0x1.69555p-1, 0x1.69555p0].
 pub const powlog_tab = [128]PowLogEntry{
@@ -342,12 +342,16 @@ pub const exp2_poly = [5]f64{
 /// log(c) (log2(c) for the base-2 tables), rounded so that `768 + logc`
 /// (`1024 + logc` for log2) is exact -- that is what makes `k*ln2hi + logc`
 /// error-free.
+///
+/// The one entry type here that is `pub`: `math.zig`'s `logfSplit` takes a
+/// `*const [16]LogTab` so `logf` and `log2f` can share a prologue. The others
+/// are only ever reached through the arrays below, so they stay private.
 pub const LogTab = extern struct { invc: f64, logc: f64 };
 
 /// c split as a double-double, so `(z - chi - clo) * invc` reproduces
 /// `fma(z, invc, -1)` to within 2^-66 on a target with no hardware FMA.
 /// Referenced only from the `!fast_fma` branches.
-pub const LogTab2 = extern struct { chi: f64, clo: f64 };
+const LogTab2 = extern struct { chi: f64, clo: f64 };
 
 pub const log_ln2hi: f64 = 0x1.62e42fefa38p-1;
 pub const log_ln2lo: f64 = 0x1.ef35793c7673p-45;
