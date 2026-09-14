@@ -8,6 +8,14 @@
 //! replacement; it also compiles on the host, so one kernel source builds both
 //! ways.
 //!
+//! `expm1` and `atan` fail differently and only on AMD, which is how they went
+//! unnoticed: both assemble to PTX cleanly, and both die on AMDGCN. Not for
+//! want of a libcall — std's ports raise the subnormal underflow flag through
+//! `std.mem.doNotOptimizeAway`, which for a float is `asm volatile ("" :: "rm"
+//! (v))`, and the AMDGPU backend cannot match the `m` alternative. That flag is
+//! a register no GPU exposes, so the idiom is dead weight on device and a hard
+//! error there. See `expm1` for the port and `atan` for the cheaper dodge.
+//!
 //! `exp exp2 log log2 log10 pow` are ports of ARM optimized-routines, ONE body
 //! each for host and device, f32 and f64 (only f32 `exp2` still uses hardware).
 //! Table-driven, branch-light, no libm and no f64 builtin beyond `+ - * /` and
@@ -273,6 +281,66 @@ inline fn coshBody(x: anytype) @TypeOf(x) {
     if (!dev) return std.math.cosh(x);
     const e = exp(@abs(x));
     return @as(T, 0.5) * e + @as(T, 0.5) / e;
+}
+
+/// e^x - 1, without the cancellation `exp(x) - 1` suffers near zero.
+///
+/// Here because `std.math.expm1` DOES NOT COMPILE FOR AMDGCN. Its tiny-argument
+/// branch raises the underflow flag through `std.mem.doNotOptimizeAway`, which
+/// for a float lowers to `asm volatile ("" :: "rm" (v))`, and the AMDGPU backend
+/// cannot match the `m` alternative: `LLVM ERROR: Could not match memory
+/// address. Inline asm failure!`. NVPTX assembles the same source to PTX
+/// without complaint, so the hole is AMD-only and invisible on an NVIDIA box.
+///
+/// The body is std's own musl port with that one line dropped. The line only
+/// ever set an IEEE exception flag, and no GPU exposes one to read, so nothing
+/// on either target loses a value it could have observed — every return here is
+/// bit-identical to `std.math.expm1`.
+///
+/// ponytail: `log1p` is std's on both targets. Its port happens not to contain
+/// the idiom, so it compiles for AMDGCN today; bring it here if that changes.
+/// Upstream, the real fix is AMDGPU joining the carve-out list `doNotOptimizeAway`
+/// already keeps for LoongArch and stage2_c.
+pub inline fn expm1(x: anytype) @TypeOf(x) {
+    if (Elem(@TypeOf(x)) == f32) return apply(expm1f, x);
+    return apply(softExpm1, x);
+}
+
+/// f32 through the f64 body, per the module header: one rounding of a correctly
+/// rounded f64 result is itself correctly rounded, and it saves porting the
+/// second half of the reference.
+fn expm1f(x: f32) f32 {
+    return @floatCast(softExpm1(x));
+}
+
+/// arctangent.
+///
+/// Same AMDGCN hole as `expm1` — std's SCALAR atan raises the subnormal
+/// underflow flag through `doNotOptimizeAway` — but the fix is different,
+/// because `std.math.atan` carries a VECTOR path that never reaches it.
+///
+/// The two paths are not bit-identical: over 400k samples in [-200, 200] they
+/// disagree on 32% of inputs, by at most 2.22e-16 relative — one ulp, the
+/// ordinary gap between two polynomial approximations. The host therefore keeps
+/// the scalar body, so nothing already shipped moves.
+pub inline fn atan(x: anytype) @TypeOf(x) {
+    _ = Elem(@TypeOf(x));
+    return apply(atanBody, x);
+}
+
+inline fn atanBody(x: anytype) @TypeOf(x) {
+    if (!dev) return std.math.atan(x);
+    // ponytail: TWO lanes, and the width is the whole point. `@Vector(1, f64)`
+    // does not merely fail to select — it SEGVs the AMDGPU backend, so one lane
+    // is not an option and two is the cheapest that is. The second result is
+    // discarded, so device `atan` costs twice what it should. No GPU-eligible
+    // device calls `atan` today; if one ever does, port std's `atanBinary64`
+    // and `atanBinary32` minus their `doNotOptimizeAway` line, the way
+    // `softExpm1` does. `tests/device_entries.zig` compiles this for AMDGCN, so
+    // if the backend's handling of narrow vectors shifts again, the build says
+    // so rather than a GPU silently returning the wrong angle.
+    const v: @Vector(2, @TypeOf(x)) = @splat(x);
+    return std.math.atan(v)[0];
 }
 
 /// x^y, <=0.52 ulp on host AND device, from one body.
@@ -649,6 +717,105 @@ fn softExp(x: f64) f64 {
         if (abstop >= comptime top12(std.math.inf(f64))) return 1.0 + x; // nan, +inf
     }
     return expInline(x, 0, 0);
+}
+
+/// e^x - 1 — musl `expm1.c`, by way of `std.math.expm1`, MINUS the one line
+/// that does not compile for AMDGCN. See `expm1` above for why that line is
+/// there and why dropping it changes no return value.
+///
+/// Not built on `softExp`: the whole point of expm1 is that the `-1` happens
+/// INSIDE the reduced-argument polynomial, where `exp(x) - 1` would cancel away
+/// most of the significand for small x.
+fn softExpm1(x_: f64) f64 {
+    if (std.math.isNan(x_)) return std.math.nan(f64);
+
+    const o_threshold: f64 = 7.09782712893383973096e+02;
+    const ln2_hi: f64 = 6.93147180369123816490e-01;
+    const ln2_lo: f64 = 1.90821492927058770002e-10;
+    const invln2: f64 = 1.44269504088896338700e+00;
+    const Q1: f64 = -3.33333333333331316428e-02;
+    const Q2: f64 = 1.58730158725481460165e-03;
+    const Q3: f64 = -7.93650757867487942473e-05;
+    const Q4: f64 = 4.00821782732936239552e-06;
+    const Q5: f64 = -2.01099218183624371326e-07;
+
+    var x = x_;
+    const ux: u64 = @bitCast(x);
+    const hx: u32 = @as(u32, @intCast(ux >> 32)) & 0x7FFFFFFF;
+    const sign = ux >> 63;
+
+    if (std.math.isNegativeInf(x)) return -1.0;
+
+    // |x| >= 56 * ln2
+    if (hx >= 0x4043687A) {
+        if (hx > 0x7FF00000) return x; // nan
+        if (sign != 0) return -1; // expm1(-big) = -1
+        if (x > o_threshold) return std.math.inf(f64);
+    }
+
+    var hi: f64 = undefined;
+    var lo: f64 = undefined;
+    var c: f64 = undefined;
+    var k: i32 = undefined;
+
+    if (hx > 0x3FD62E42) { // |x| > 0.5 * ln2
+        if (hx < 0x3FF0A2B2) { // |x| < 1.5 * ln2
+            if (sign == 0) {
+                hi = x - ln2_hi;
+                lo = ln2_lo;
+                k = 1;
+            } else {
+                hi = x + ln2_hi;
+                lo = -ln2_lo;
+                k = -1;
+            }
+        } else {
+            var kf = invln2 * x;
+            if (sign != 0) kf -= 0.5 else kf += 0.5;
+            k = @intFromFloat(kf);
+            const t = @as(f64, @floatFromInt(k));
+            hi = x - t * ln2_hi;
+            lo = t * ln2_lo;
+        }
+        x = hi - lo;
+        c = (hi - x) - lo;
+    } else if (hx < 0x3C900000) {
+        // |x| < 2^-54, where expm1(x) == x. std raises the underflow flag for
+        // a subnormal here; that is the line this port drops.
+        return x;
+    } else {
+        k = 0;
+    }
+
+    const hfx = 0.5 * x;
+    const hxs = x * hfx;
+    const r1 = 1.0 + hxs * (Q1 + hxs * (Q2 + hxs * (Q3 + hxs * (Q4 + hxs * Q5))));
+    const t = 3.0 - r1 * hfx;
+    var e = hxs * ((r1 - t) / (6.0 - x * t));
+
+    if (k == 0) return x - (x * e - hxs); // c is 0
+
+    e = x * (e - c) - c;
+    e -= hxs;
+
+    // exp(x) ~ 2^k (x_reduced - e + 1)
+    if (k == -1) return 0.5 * (x - e) - 0.5;
+    if (k == 1) {
+        if (x < -0.25) return -2.0 * (e - (x + 0.5));
+        return 1.0 + 2.0 * (x - e);
+    }
+
+    const twopk: f64 = @bitCast(@as(u64, @intCast(0x3FF +% k)) << 52);
+
+    if (k < 0 or k > 56) {
+        var y = x - e + 1.0;
+        if (k == 1024) y = y * 2.0 * 0x1.0p1023 else y = y * twopk;
+        return y - 1.0;
+    }
+
+    const uf: f64 = @bitCast(@as(u64, @intCast(0x3FF -% k)) << 52);
+    if (k < 20) return (x - e + (1 - uf)) * twopk;
+    return (x - (e + uf) + 1) * twopk;
 }
 
 /// 2^x. Not `softExp(x * ln2)`: reducing on k/N directly keeps integer x
@@ -1229,6 +1396,49 @@ test "ported cores agree with the builtins" {
     try std.testing.expectApproxEqAbs(@sin(1e9), softSin(1e9), 1e-6);
 }
 
+test "expm1 is bit-identical to std, and atan is within an ulp" {
+    // The whole claim of the port: it drops a line that touched only the FP
+    // flag register, so every VALUE must match std exactly. Bit equality, over
+    // the branch boundaries the algorithm actually switches on -- 2^-54, the
+    // 0.5*ln2 and 1.5*ln2 reduction splits, 56*ln2, and the overflow threshold.
+    const edges = [_]f64{
+        0,          -0.0,         0x1p-60,     -0x1p-60,   0x1p-54,
+        -0x1p-54,   0x1p-53,      1e-300,      -1e-300,    0.3465,
+        -0.3465,    0.3466,       -0.3466,     1.0397,     -1.0397,
+        1.0398,     -1.0398,      1,           -1,         0.25,
+        -0.25,      -0.2501,      2,           -2,         38.8,
+        -38.8,      38.9,         709.78,      709.79,     710,
+        -745,       1e300,        -1e300,
+    };
+    for (edges) |x| {
+        try std.testing.expectEqual(
+            @as(u64, @bitCast(std.math.expm1(x))),
+            @as(u64, @bitCast(expm1(x))),
+        );
+    }
+    // A sweep, not just the edges: 200k points across the whole reduction range.
+    var i: i32 = -100_000;
+    while (i < 100_000) : (i += 1) {
+        const x = @as(f64, @floatFromInt(i)) * 1e-4;
+        try std.testing.expectEqual(
+            @as(u64, @bitCast(std.math.expm1(x))),
+            @as(u64, @bitCast(expm1(x))),
+        );
+    }
+    try std.testing.expectEqual(@as(f64, -1), expm1(-std.math.inf(f64)));
+    try std.testing.expectEqual(std.math.inf(f64), expm1(std.math.inf(f64)));
+    try std.testing.expect(std.math.isNan(expm1(std.math.nan(f64))));
+    // f32 rides the f64 body; one rounding of a correct f64 is correct.
+    for ([_]f32{ 0, 1e-10, -1e-10, 0.5, -0.5, 3, -3, 88, -88 }) |x| {
+        try std.testing.expect(ulpErr(f32, expm1(x), @floatCast(std.math.expm1(@as(f64, x)))) <= 1);
+    }
+
+    // atan on the host is std's scalar body, so it is std exactly.
+    for ([_]f64{ 0, 1e-20, 0.3, -0.4375, 1, -1, 1.5, 1e6, -1e6 }) |x| {
+        try std.testing.expectEqual(std.math.atan(x), atan(x));
+    }
+}
+
 test "every entry point takes a vector, lane for lane" {
     // The CPU backend instantiates a generic map body at `@Vector` width, so
     // these are the calls a vectorized kernel actually makes -- and every one
@@ -1238,12 +1448,16 @@ test "every entry point takes a vector, lane for lane" {
     // be the SAME arithmetic whether it arrives through an elementwise builtin
     // (`@sqrt`, `@sin`, f32 `@exp2`) or through `lanewise`; anything looser
     // would let a lane quietly take a different route.
+    // `apply` instantiates a whole body per lane, and `powBody` is a big one;
+    // fifteen entry points at two widths walks past the default in Debug. A
+    // caller that lane-loops `pow` over a wide vector needs the same raise.
+    @setEvalBranchQuota(20_000);
     inline for (.{ f32, f64 }) |T| {
         const V = @Vector(4, T);
         const xs: V = .{ 0.25, 1.0, 3.5, 40.0 };
         const ys: V = .{ 2.0, -1.5, 0.33, 3.0 };
 
-        inline for (.{ exp, exp2, log, log2, log10, sin, cos, tan, tanh, sinh, cosh, sqrt, rsqrt }) |f| {
+        inline for (.{ exp, exp2, expm1, log, log2, log10, atan, sin, cos, tan, tanh, sinh, cosh, sqrt, rsqrt }) |f| {
             const got: V = f(xs);
             inline for (0..4) |i| try std.testing.expectEqual(f(xs[i]), got[i]);
         }

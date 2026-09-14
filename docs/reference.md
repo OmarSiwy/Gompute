@@ -312,6 +312,17 @@ and on AMDGCN, for both widths (only `f32` `exp2` still uses the hardware
 instruction). Everything else is a musl port for device `f64` and a hardware
 approximation for device `f32`.
 
+`expm1` and `atan` are here for a different reason, and it is worth knowing if
+you reach for `std.math` in a kernel. Neither needs a libcall — but both of
+std's ports raise the subnormal underflow flag through
+`std.mem.doNotOptimizeAway`, which for a float becomes `asm volatile ("" :: "rm"
+(v))`. The AMDGPU backend cannot match the `m` alternative, so both are a hard
+error on AMDGCN while assembling to PTX without complaint. **An NVIDIA-only test
+matrix will not see this.** `g.math.expm1` is std's own algorithm with that line
+dropped (values bit-identical); `g.math.atan` keeps std's scalar body on the
+host and takes its vector path on device. `std.math.log1p` happens not to
+contain the idiom and is fine as-is.
+
 [aor]: https://github.com/ARM-software/optimized-routines
 
 That is a correctness decision before it is a speed one: glibc ≥ 2.28 *is* ARM

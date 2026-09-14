@@ -53,20 +53,44 @@ pub const scatter_entry = g.scatter("t_scatter", f32, u32, .{ .block_size = 256 
 /// from a device target, so the module's whole reason to exist had never been
 /// compiled the way it is meant to be used. `build.zig` assembles this probe
 /// down to real PTX for that reason, rather than stopping at the frontend.
-fn allMath(comptime T: type) fn (T, NoParams) T {
+/// Split into families rather than one body per width, and the split is load
+/// bearing. Every entry point is `inline`, so one body naming all fifteen is a
+/// single enormous function; at fifteen the AMDGCN backend stopped returning an
+/// error and started SEGV-ing the compiler under `zig build`'s server protocol
+/// (the same `zig build-obj` on its own still succeeded). Three smaller bodies
+/// compile, and when one does break it names which family did it.
+fn expFamily(comptime T: type) fn (T, NoParams) T {
     return struct {
         fn f(x: T, _: NoParams) T {
-            var a = g.math.exp(x) + g.math.exp2(x) + g.math.log(x);
-            a += g.math.log2(x) + g.math.log10(x) + g.math.sin(x);
-            a += g.math.cos(x) + g.math.tan(x) + g.math.tanh(x);
-            a += g.math.sinh(x) + g.math.cosh(x) + g.math.pow(x, x);
-            return a + g.math.sqrt(x) + g.math.rsqrt(x);
+            return g.math.exp(x) + g.math.exp2(x) + g.math.expm1(x) + g.math.pow(x, x);
         }
     }.f;
 }
 
-pub const math_f32_entry = g.map("t_math_f32", f32, NoParams, allMath(f32), .{ .block_size = 256 });
-pub const math_f64_entry = g.map("t_math_f64", f64, NoParams, allMath(f64), .{ .block_size = 256 });
+fn logFamily(comptime T: type) fn (T, NoParams) T {
+    return struct {
+        fn f(x: T, _: NoParams) T {
+            return g.math.log(x) + g.math.log2(x) + g.math.log10(x) +
+                g.math.sqrt(x) + g.math.rsqrt(x);
+        }
+    }.f;
+}
+
+fn trigFamily(comptime T: type) fn (T, NoParams) T {
+    return struct {
+        fn f(x: T, _: NoParams) T {
+            return g.math.sin(x) + g.math.cos(x) + g.math.tan(x) + g.math.atan(x) +
+                g.math.tanh(x) + g.math.sinh(x) + g.math.cosh(x);
+        }
+    }.f;
+}
+
+pub const math_exp_f32 = g.map("t_math_exp_f32", f32, NoParams, expFamily(f32), .{ .block_size = 256 });
+pub const math_exp_f64 = g.map("t_math_exp_f64", f64, NoParams, expFamily(f64), .{ .block_size = 256 });
+pub const math_log_f32 = g.map("t_math_log_f32", f32, NoParams, logFamily(f32), .{ .block_size = 256 });
+pub const math_log_f64 = g.map("t_math_log_f64", f64, NoParams, logFamily(f64), .{ .block_size = 256 });
+pub const math_trig_f32 = g.map("t_math_trig_f32", f32, NoParams, trigFamily(f32), .{ .block_size = 256 });
+pub const math_trig_f64 = g.map("t_math_trig_f64", f64, NoParams, trigFamily(f64), .{ .block_size = 256 });
 
 /// `abi.Boundary(struct{})` is a zero-field extern struct, so the emitted entry
 /// takes one fewer parameter than the host pushes. Compiled here so the shape
