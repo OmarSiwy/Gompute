@@ -837,17 +837,32 @@ fn softExpf(x: f32) f32 {
     return @floatCast(((c[0] * r + c[1]) * r2 + (c[2] * r + 1)) * s);
 }
 
-/// `scale` is 1 for log and 1/ln10 for log10 — ARM's log10f is byte for byte
-/// its logf with the constant folded into the binary64 accumulator, before
-/// the single rounding, so it is genuinely a log10 and not a scaled log.
-fn softLogf(x: f32, comptime scale: f64) f32 {
+/// Everything ARM's logf.c and log2f.c do before their polynomials, which is
+/// the same thing twice: the same near-1 exit, the same special values, the
+/// same subnormal scale-up, the same 16-way split. Only the table and the
+/// weight on `k` differ.
+///
+/// `kscale` is ln2 for logf, whose k arrives scaled, and 1 for log2f, where k
+/// folds in exactly — multiplying by 1.0 is exact in IEEE, so sharing the line
+/// costs log2f nothing.
+///
+/// Returns the finished answer for the inputs that have no `(r, y0)` pair to
+/// hand back, null otherwise: the same shape as `logSpecial`, which is the f64
+/// half of this.
+inline fn logfSplit(
+    x: f32,
+    tab: *const [16]md.LogTab,
+    comptime kscale: f64,
+    r: *f64,
+    y0: *f64,
+) ?f32 {
     var ix: u32 = @bitCast(x);
     if (ix == 0x3f800000) return 0; // +0, not -0, under downward rounding
     if (ix -% 0x00800000 >= 0x7f800000 - 0x00800000) {
         if (ix *% 2 == 0) return -std.math.inf(f32);
         if (ix == 0x7f800000) return x;
         if (ix & 0x80000000 != 0 or ix *% 2 >= 0xff000000) return std.math.nan(f32);
-        ix = @bitCast(x * 0x1p23);
+        ix = @bitCast(x * 0x1p23); // subnormal: scale up, then fix k
         ix -%= 23 << 23;
     }
 
@@ -855,35 +870,35 @@ fn softLogf(x: f32, comptime scale: f64) f32 {
     const i: usize = @intCast((tmp >> (23 - 4)) & 15);
     const k = @as(i32, @bitCast(tmp)) >> 23; // arithmetic
     const z: f64 = @as(f32, @bitCast(ix -% (tmp & 0xff800000)));
-    const e = md.logf_tab[i];
+    const e = tab[i];
 
-    const r = z * e.invc - 1;
-    const y0 = e.logc + @as(f64, @floatFromInt(k)) * md.logf_ln2;
+    r.* = z * e.invc - 1;
+    y0.* = e.logc + @as(f64, @floatFromInt(k)) * kscale;
+    return null;
+}
+
+/// `scale` is 1 for log and 1/ln10 for log10 — ARM's log10f is byte for byte
+/// its logf with the constant folded into the binary64 accumulator, before
+/// the single rounding, so it is genuinely a log10 and not a scaled log.
+fn softLogf(x: f32, comptime scale: f64) f32 {
+    var r: f64 = undefined;
+    var y0: f64 = undefined;
+    if (logfSplit(x, &md.logf_tab, md.logf_ln2, &r, &y0)) |v| return v;
+
     const a = md.logf_poly;
     const r2 = r * r;
     const y = (a[0] * r2 + (a[1] * r + a[2])) * r2 + (y0 + r);
     return @floatCast(if (scale == 1.0) y else y * scale);
 }
 
+/// Not `softLogf(x, 1/ln2)`: log2f has its own table and a fourth coefficient,
+/// and it is the `a[3]*r + y0` tail — k added as an exact integer, never
+/// through a scaled ln2 — that keeps powers of two exact.
 fn softLog2f(x: f32) f32 {
-    var ix: u32 = @bitCast(x);
-    if (ix == 0x3f800000) return 0;
-    if (ix -% 0x00800000 >= 0x7f800000 - 0x00800000) {
-        if (ix *% 2 == 0) return -std.math.inf(f32);
-        if (ix == 0x7f800000) return x;
-        if (ix & 0x80000000 != 0 or ix *% 2 >= 0xff000000) return std.math.nan(f32);
-        ix = @bitCast(x * 0x1p23);
-        ix -%= 23 << 23;
-    }
+    var r: f64 = undefined;
+    var y0: f64 = undefined;
+    if (logfSplit(x, &md.log2f_tab, 1.0, &r, &y0)) |v| return v;
 
-    const tmp = ix -% 0x3f330000;
-    const i: usize = @intCast((tmp >> (23 - 4)) & 15);
-    const k = @as(i32, @bitCast(tmp)) >> 23;
-    const z: f64 = @as(f32, @bitCast(ix -% (tmp & 0xff800000)));
-    const e = md.log2f_tab[i];
-
-    const r = z * e.invc - 1;
-    const y0 = e.logc + @as(f64, @floatFromInt(k)); // k folds in exactly
     const a = md.log2f_poly;
     const r2 = r * r;
     return @floatCast((a[0] * r2 + (a[1] * r + a[2])) * r2 + (a[3] * r + y0));
