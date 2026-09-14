@@ -59,24 +59,75 @@ const builtin = @import("builtin");
 const arch = builtin.cpu.arch;
 const dev = arch == .nvptx64 or arch == .amdgcn;
 
-fn Check(comptime T: type) type {
-    return switch (T) {
-        f32, f64 => T,
-        else => @compileError("gompute.math supports f32 and f64, not " ++
+/// The element type a body computes in: `T` itself for a scalar, the child for
+/// a vector.
+///
+/// Vectors are accepted because the CPU backend instantiates a generic map body
+/// at `@Vector` width -- see `Spec.is_generic` and `lanes` in
+/// `src/host/kernel.zig`. Rejecting them made `g.math` a compile error in
+/// exactly the kernel shape the guide recommends for CPU speed.
+fn Elem(comptime T: type) type {
+    const E = switch (@typeInfo(T)) {
+        .vector => |v| v.child,
+        else => T,
+    };
+    return switch (E) {
+        f32, f64 => E,
+        else => @compileError("gompute.math supports f32, f64 and vectors of them, not " ++
             @typeName(T) ++ " — cast first"),
     };
+}
+
+fn isVec(comptime T: type) bool {
+    return @typeInfo(T) == .vector;
+}
+
+/// A scalar body `f`, applied to a scalar, or one lane at a time to a vector.
+///
+/// `f` is always the scalar body, never the public entry point above it: Zig
+/// rejects `exp -> apply -> exp` as an inline recursion cycle even though the
+/// inner call is the scalar instantiation that terminates it.
+///
+/// ponytail: a lane loop, not a vector algorithm. Every ported body below
+/// indexes a table with the input (`exp_tab[idx]`) and branches on it (the
+/// saturation ends) -- a gather and a divergence, the two things `@Vector` does
+/// not have. Lane-parallel transcendentals exist (ARM's own vector routines,
+/// SLEEF) and are a rewrite of every body here, not a wrapper. This is what
+/// makes a vectorized map body COMPILE and be correct; if a profile ever blames
+/// the lane loop, that rewrite is the upgrade path. `sin` and `cos` on the
+/// host, `tan`, `sqrt`, `rsqrt` and f32 `exp2` never reach it -- their builtins
+/// are already elementwise.
+inline fn apply(comptime f: anytype, x: anytype) @TypeOf(x) {
+    if (comptime !isVec(@TypeOf(x))) return f(x);
+    var out: @TypeOf(x) = undefined;
+    inline for (0..@typeInfo(@TypeOf(x)).vector.len) |i| out[i] = f(x[i]);
+    return out;
+}
+
+/// `apply` for `pow`, the one entry point that takes two arguments.
+inline fn apply2(comptime f: anytype, x: anytype, y: @TypeOf(x)) @TypeOf(x) {
+    if (comptime !isVec(@TypeOf(x))) return f(x, y);
+    var out: @TypeOf(x) = undefined;
+    inline for (0..@typeInfo(@TypeOf(x)).vector.len) |i| out[i] = f(x[i], y[i]);
+    return out;
 }
 
 // ---------------------------------------------------------------------------
 // Public API. exp/exp2/log/log2/log10/pow are one body each, host and device;
 // the rest dispatch on the element type.
+//
+// Every entry point here is a dispatcher: it picks a scalar body and hands it
+// to `apply`, which runs it once or once per lane. Bodies never see a vector,
+// which is why `tanh`, `sinh`, `cosh` and `pow` keep theirs in a `*Body`
+// function rather than inline in the public one.
 // ---------------------------------------------------------------------------
 
 /// e^x, <=1 ulp on host AND device from one body: ARM optimized-routines
 /// `exp`/`expf`, which is what glibc >= 2.28 ships. See the note on `pow` for
 /// why matching the reference's arithmetic is worth more than the speed.
 pub inline fn exp(x: anytype) @TypeOf(x) {
-    return if (Check(@TypeOf(x)) == f32) softExpf(x) else softExp(x);
+    if (Elem(@TypeOf(x)) == f32) return apply(softExpf, x);
+    return apply(softExp, x);
 }
 
 /// 2^x, exact for integer x. Same table as `exp`, its own reduction.
@@ -86,7 +137,8 @@ pub inline fn exp(x: anytype) @TypeOf(x) {
 /// and one instruction beats ten f64 ops at 1/64 rate. Port `exp2f.c` if an
 /// f32 caller ever needs the last half ulp.
 pub inline fn exp2(x: anytype) @TypeOf(x) {
-    return if (Check(@TypeOf(x)) == f32) @exp2(x) else softExp2(x);
+    if (Elem(@TypeOf(x)) == f32) return @exp2(x); // elementwise on a vector
+    return apply(softExp2, x);
 }
 
 /// Natural log, <=1 ulp on host AND device from one body: ARM
@@ -97,14 +149,16 @@ pub inline fn exp2(x: anytype) @TypeOf(x) {
 /// not relatively — so log(x) for x near 1 was 2^-21 of noise on a near-zero
 /// answer, which is exactly where a SPICE junction sits.
 pub inline fn log(x: anytype) @TypeOf(x) {
-    return if (Check(@TypeOf(x)) == f32) softLogf(x, 1.0) else softLog(x);
+    if (Elem(@TypeOf(x)) == f32) return apply(softLnf, x);
+    return apply(softLog, x);
 }
 
 /// Base-2 log, <=1 ulp on host AND device: ARM optimized-routines
 /// `log2`/`log2f`, with its own 64-entry table rather than `log * 1/ln2`.
 /// Powers of two come back exact, which the scaled form could not manage.
 pub inline fn log2(x: anytype) @TypeOf(x) {
-    return if (Check(@TypeOf(x)) == f32) softLog2f(x) else softLog2(x);
+    if (Elem(@TypeOf(x)) == f32) return apply(softLog2f, x);
+    return apply(softLog2, x);
 }
 
 /// Base-10 log.
@@ -120,7 +174,8 @@ pub inline fn log2(x: anytype) @TypeOf(x) {
 /// the bottom of this file). ponytail: the fix, if a caller ever needs it, is
 /// to have `softLog` hand back its hi/lo pair and scale THAT, not a new table.
 pub inline fn log10(x: anytype) @TypeOf(x) {
-    return if (Check(@TypeOf(x)) == f32) softLogf(x, invln10) else softLog10(x);
+    if (Elem(@TypeOf(x)) == f32) return apply(softLog10f, x);
+    return apply(softLog10, x);
 }
 
 /// Measured sm_89 f32: ~1e-6 ABSOLUTE, which is <=29 ulp relative away from the
@@ -128,30 +183,37 @@ pub inline fn log10(x: anytype) @TypeOf(x) {
 /// devices, and their own range reduction gives out for large |x|. f64 matched
 /// glibc bit-for-bit over (0,8]; see `remPio2` for its ceiling.
 pub inline fn sin(x: anytype) @TypeOf(x) {
-    const T = Check(@TypeOf(x));
-    if (!dev) return @sin(x);
-    return if (T == f32) hwSin(x) else softSin(x);
+    const E = Elem(@TypeOf(x));
+    if (!dev) return @sin(x); // elementwise on a vector
+    if (E == f32) return apply(hwSin, x);
+    return apply(softSin, x);
 }
 
 /// Accuracy as `sin`.
 pub inline fn cos(x: anytype) @TypeOf(x) {
-    const T = Check(@TypeOf(x));
-    if (!dev) return @cos(x);
-    return if (T == f32) hwCos(x) else softCos(x);
+    const E = Elem(@TypeOf(x));
+    if (!dev) return @cos(x); // elementwise on a vector
+    if (E == f32) return apply(hwCos, x);
+    return apply(softCos, x);
 }
 
 /// ponytail: sin/cos, so error blows up near the poles where cos goes to zero
 /// (measured 0.16 absolute at x = 3pi/2 in f32). A dedicated tan with its own
 /// argument reduction is worth writing only if someone is actually near pi/2.
 pub inline fn tan(x: anytype) @TypeOf(x) {
-    _ = Check(@TypeOf(x));
-    return sin(x) / cos(x);
+    _ = Elem(@TypeOf(x));
+    return sin(x) / cos(x); // both already handle a vector
 }
 
 /// Cephes rational below 0.625, else 1 - 2/(e^2|x| + 1).
 /// Measured sm_89: f32 <=1.8 ulp, f64 <=1 ulp.
 pub inline fn tanh(x: anytype) @TypeOf(x) {
-    const T = Check(@TypeOf(x));
+    _ = Elem(@TypeOf(x));
+    return apply(tanhBody, x);
+}
+
+inline fn tanhBody(x: anytype) @TypeOf(x) {
+    const T = @TypeOf(x);
     if (!dev) return std.math.tanh(x);
     const ax = @abs(x);
     if (ax < 0.625) {
@@ -170,7 +232,12 @@ pub inline fn tanh(x: anytype) @TypeOf(x) {
 /// Taylor in x^2 below 0.5 (the (e^x - e^-x)/2 cancellation region), else the
 /// exponentials. Measured sm_89: f32 <=3.7 ulp, f64 <=1.4 ulp.
 pub inline fn sinh(x: anytype) @TypeOf(x) {
-    const T = Check(@TypeOf(x));
+    _ = Elem(@TypeOf(x));
+    return apply(sinhBody, x);
+}
+
+inline fn sinhBody(x: anytype) @TypeOf(x) {
+    const T = @TypeOf(x);
     if (!dev) return std.math.sinh(x);
     const ax = @abs(x);
     if (ax < 0.5) {
@@ -188,7 +255,12 @@ pub inline fn sinh(x: anytype) @TypeOf(x) {
 /// musl splits the exponential to buy those last ulps of range. Split it too if
 /// anything ever survives a cosh that large.
 pub inline fn cosh(x: anytype) @TypeOf(x) {
-    const T = Check(@TypeOf(x));
+    _ = Elem(@TypeOf(x));
+    return apply(coshBody, x);
+}
+
+inline fn coshBody(x: anytype) @TypeOf(x) {
+    const T = @TypeOf(x);
     if (!dev) return std.math.cosh(x);
     const e = exp(@abs(x));
     return @as(T, 0.5) * e + @as(T, 0.5) / e;
@@ -237,7 +309,12 @@ pub inline fn cosh(x: anytype) @TypeOf(x) {
 /// ponytail: if an f32 kernel ever wants a cheap pow, `exp2(y * log2 x)` on
 /// the f32 hardware path is the thing to bring back, for f32 only.
 pub inline fn pow(x: anytype, y: @TypeOf(x)) @TypeOf(x) {
-    const T = Check(@TypeOf(x));
+    _ = Elem(@TypeOf(x));
+    return apply2(powBody, x, y);
+}
+
+inline fn powBody(x: anytype, y: @TypeOf(x)) @TypeOf(x) {
+    const T = @TypeOf(x);
     if (y == 0 or x == 1) return 1;
     if (y == @trunc(y) and @abs(y) <= 64) {
         var n: u32 = @intFromFloat(@abs(y));
@@ -261,15 +338,17 @@ pub inline fn pow(x: anytype, y: @TypeOf(x)) @TypeOf(x) {
 /// Native instruction on both back ends; here so callers need not remember
 /// which builtins are device-safe.
 pub inline fn sqrt(x: anytype) @TypeOf(x) {
-    _ = Check(@TypeOf(x));
-    return @sqrt(x);
+    _ = Elem(@TypeOf(x));
+    return @sqrt(x); // elementwise on a vector
 }
 
 /// ponytail: 1/sqrt, i.e. two IEEE ops. Swap in `rsqrt.approx.f32`/`v_rsq_f32`
 /// if a normalization loop ever shows up hot in a profile.
 pub inline fn rsqrt(x: anytype) @TypeOf(x) {
-    const T = Check(@TypeOf(x));
-    return @as(T, 1) / @sqrt(x);
+    const T = @TypeOf(x);
+    _ = Elem(T);
+    const one: T = if (comptime isVec(T)) @splat(1) else 1;
+    return one / @sqrt(x); // elementwise on a vector
 }
 
 // ---------------------------------------------------------------------------
@@ -877,6 +956,15 @@ inline fn logfSplit(
     return null;
 }
 
+/// The two scales `softLogf` is ever called at. `apply` takes a one-argument
+/// body, and naming them beats a bare `1.0` at the call site.
+fn softLnf(x: f32) f32 {
+    return softLogf(x, 1.0);
+}
+fn softLog10f(x: f32) f32 {
+    return softLogf(x, invln10);
+}
+
 /// `scale` is 1 for log and 1/ln10 for log10 — ARM's log10f is byte for byte
 /// its logf with the constant folded into the binary64 accumulator, before
 /// the single rounding, so it is genuinely a log10 and not a scaled log.
@@ -1130,6 +1218,29 @@ test "ported cores agree with the builtins" {
     }
     // Past the Cody-Waite ceiling accuracy is only asserted loosely.
     try std.testing.expectApproxEqAbs(@sin(1e9), softSin(1e9), 1e-6);
+}
+
+test "every entry point takes a vector, lane for lane" {
+    // The CPU backend instantiates a generic map body at `@Vector` width, so
+    // these are the calls a vectorized kernel actually makes -- and every one
+    // of them used to be a compile error.
+    //
+    // Bit-equality against the scalar path, not a tolerance. A vector call must
+    // be the SAME arithmetic whether it arrives through an elementwise builtin
+    // (`@sqrt`, `@sin`, f32 `@exp2`) or through `lanewise`; anything looser
+    // would let a lane quietly take a different route.
+    inline for (.{ f32, f64 }) |T| {
+        const V = @Vector(4, T);
+        const xs: V = .{ 0.25, 1.0, 3.5, 40.0 };
+        const ys: V = .{ 2.0, -1.5, 0.33, 3.0 };
+
+        inline for (.{ exp, exp2, log, log2, log10, sin, cos, tan, tanh, sinh, cosh, sqrt, rsqrt }) |f| {
+            const got: V = f(xs);
+            inline for (0..4) |i| try std.testing.expectEqual(f(xs[i]), got[i]);
+        }
+        const got: V = pow(xs, ys);
+        inline for (0..4) |i| try std.testing.expectEqual(pow(xs[i], ys[i]), got[i]);
+    }
 }
 
 test "derived functions match std.math" {

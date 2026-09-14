@@ -10,9 +10,9 @@
 //! one body without the other and it reports a mismatch.
 //!
 //! The exports nothing compares are not spare. They are the only thing that
-//! forces zip/sum/mapTo/mapIndexed/gather/scatter/mapFn and the generic-body map
-//! through the CPU backend at all; delete one and that constructor stops being
-//! compiled anywhere.
+//! forces zip/sum/mapTo/mapIndexed/gather/scatter/mapFn, the generic-body map
+//! and `g.math` inside one through the CPU backend at all; delete one and that
+//! constructor stops being compiled anywhere.
 //!
 //! `Kernel(Spec, .cpu).init(0)` is restated in every export deliberately. A
 //! shared helper would put a call between the export boundary and the loop,
@@ -48,6 +48,22 @@ const SimdSpec = g.map("codegen_scale_relu_simd", f32, Params, opGeneric, .{});
 
 export fn gompute_scale_relu_simd(data: [*]f32, len: usize, scale: f32) void {
     var kernel = g.Kernel(SimdSpec, .cpu).init(0) catch unreachable;
+    kernel.run(data[0..len], .{ .scale = scale }) catch unreachable;
+}
+
+/// A generic body that calls `g.math`. This is the combination that used to be
+/// impossible to write: the CPU backend instantiates the body at `@Vector`
+/// width and `g.math` rejected every type that was not a bare f32 or f64, so
+/// the module and the vectorized map shape could not be used together at all.
+/// Compiled here rather than asserted against a hand-written loop -- a
+/// transcendental has no one-line manual equivalent to compare to.
+fn opMath(x: anytype, p: Params) @TypeOf(x) {
+    return g.math.tanh(g.math.exp(x) * g.splat(@TypeOf(x), p.scale));
+}
+const MathSpec = g.map("codegen_math_simd", f32, Params, opMath, .{});
+
+export fn gompute_math_simd(data: [*]f32, len: usize, scale: f32) void {
+    var kernel = g.Kernel(MathSpec, .cpu).init(0) catch unreachable;
     kernel.run(data[0..len], .{ .scale = scale }) catch unreachable;
 }
 
