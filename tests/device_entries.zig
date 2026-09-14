@@ -8,8 +8,8 @@
 //! `addrspace(.shared)` scratch array, `builtins.barrier`, `builtins.localIdX`
 //! and `builtins.blockIdX` had no compiled call site anywhere.
 //!
-//! Deliberately does NOT name `g.math`: that module is mid-rewrite, and a
-//! failure there is not a failure of this block.
+//! It also names every `g.math` entry point, which is the only device call site
+//! that module has. See `allMath` for why that one matters more than the rest.
 
 const g = @import("gompute");
 
@@ -43,6 +43,30 @@ pub const reduce_entry = g.reduce("t_reduce", f32, Scale, maxOf, -1e30, .{ .bloc
 pub const sum_entry = g.sum("t_sum", f32, Scale, .{ .block_size = 100 });
 pub const gather_entry = g.gather("t_gather", f32, u32, .{ .block_size = 256 });
 pub const scatter_entry = g.scatter("t_scatter", f32, u32, .{ .block_size = 256 });
+
+/// Every `g.math` entry point in one body, at one width.
+///
+/// `src/device/math.zig` exists because `@exp @log @sin` and friends fail at
+/// the IR->ISA stage on NVPTX and AMDGCN — `no libcall available for fexp`,
+/// `Cannot select: f32 = fsin`. That is a claim about the BACK END, and it went
+/// unchecked: no example, test or kernels root in this repo called `g.math`
+/// from a device target, so the module's whole reason to exist had never been
+/// compiled the way it is meant to be used. `build.zig` assembles this probe
+/// down to real PTX for that reason, rather than stopping at the frontend.
+fn allMath(comptime T: type) fn (T, NoParams) T {
+    return struct {
+        fn f(x: T, _: NoParams) T {
+            var a = g.math.exp(x) + g.math.exp2(x) + g.math.log(x);
+            a += g.math.log2(x) + g.math.log10(x) + g.math.sin(x);
+            a += g.math.cos(x) + g.math.tan(x) + g.math.tanh(x);
+            a += g.math.sinh(x) + g.math.cosh(x) + g.math.pow(x, x);
+            return a + g.math.sqrt(x) + g.math.rsqrt(x);
+        }
+    }.f;
+}
+
+pub const math_f32_entry = g.map("t_math_f32", f32, NoParams, allMath(f32), .{ .block_size = 256 });
+pub const math_f64_entry = g.map("t_math_f64", f64, NoParams, allMath(f64), .{ .block_size = 256 });
 
 /// `abi.Boundary(struct{})` is a zero-field extern struct, so the emitted entry
 /// takes one fewer parameter than the host pushes. Compiled here so the shape

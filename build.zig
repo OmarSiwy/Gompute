@@ -332,12 +332,15 @@ pub fn build(b: *std.Build) void {
     // generators in `src/device/export.zig` had never been through the frontend
     // for a GPU target at all. This compiles one spec of every `Kind`.
     //
-    // LLVM IR, not PTX: `@export` on a `callconv(.kernel)` function emits an
-    // LLVM alias, and the NVPTX backend rejects an alias to a kernel
-    // ("NVPTX aliasee must be a non-kernel function definition"). Rewriting
-    // those aliases away is what `tools/kernel_ir_tool.zig` is for, and the real
-    // pipeline runs it between the two -- see `emitKernels`. Stopping at IR
-    // keeps this a frontend check, which is the part that was missing.
+    // It runs the whole way to PTX, not just to IR. The frontend is not where
+    // device code fails: `src/device/math.zig` exists because `@exp` and `@sin`
+    // reach the IR->ISA stage and die there ("no libcall available for fexp"),
+    // which an IR-only probe cannot see. `@export` on a `callconv(.kernel)`
+    // function emits an LLVM alias and the NVPTX backend rejects one
+    // ("NVPTX aliasee must be a non-kernel function definition"), so the probe
+    // goes through `tools/kernel_ir_tool.zig` first -- the same three steps
+    // `buildArtifacts` runs, which until now nothing in `zig build test`
+    // exercised either.
     const device_probe = b.addObject(.{
         .name = "gompute-device-probe",
         .root_module = b.createModule(.{
@@ -351,9 +354,48 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "gompute", .module = device_mod }},
         }),
     });
-    // Requests the emit; without a consumer of the file nothing is produced.
-    // Deliberately NOT `getEmittedBin` -- nvptx64 has no object writer.
-    _ = device_probe.getEmittedLlvmIr();
+    const probe_rewrite = b.addRunArtifact(b.addExecutable(.{
+        .name = "gompute-kernel-ir-tool",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/kernel_ir_tool.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    }));
+    probe_rewrite.addFileArg(device_probe.getEmittedLlvmIr());
+    const probe_ir = probe_rewrite.addOutputFileArg("gompute_probe.ll");
+    _ = probe_rewrite.addOutputFileArg("gompute_probe_names.zig");
+
+    const probe_ptx = b.addSystemCommand(&.{
+        b.graph.zig_exe,
+        "cc",
+        "-target",
+        "nvptx64-cuda",
+        "-mcpu=sm_70",
+        "-S",
+        "-g0",
+        "-Wno-unused-command-line-argument",
+    });
+    probe_ptx.addFileArg(probe_ir);
+    _ = probe_ptx.addPrefixedOutputFileArg("-o", "gompute_probe.ptx");
+
+    // AMDGCN is the other half of the same claim, and it is cheaper to check:
+    // it has an object writer, so one `addObject` lowers all the way to ISA
+    // with no alias to rewrite and no assembler step.
+    const device_probe_amd = b.addObject(.{
+        .name = "gompute-device-probe-amd",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/device_entries.zig"),
+            .target = b.resolveTargetQuery(std.Target.Query.parse(.{
+                .arch_os_abi = "amdgcn-amdhsa",
+                .cpu_features = "gfx1100",
+            }) catch unreachable),
+            .optimize = .ReleaseFast,
+            .strip = true,
+            .imports = &.{.{ .name = "gompute", .module = device_mod }},
+        }),
+    });
+    _ = device_probe_amd.getEmittedBin();
 
     const test_step = b.step("test", "Run Gompute unit tests");
     test_step.dependOn(&run_unit_tests.step);
@@ -361,7 +403,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_build_tests.step);
     test_step.dependOn(&run_check_tests.step);
     test_step.dependOn(&run_codegen_check.step);
-    test_step.dependOn(&device_probe.step);
+    test_step.dependOn(&probe_ptx.step);
+    test_step.dependOn(&device_probe_amd.step);
 
     buildDocs(b, host_mod, test_step);
 }
