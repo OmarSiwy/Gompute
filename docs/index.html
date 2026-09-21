@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Gompute — one kernel, CPU or GPU, specialized at compile time</title>
+<title>Gompute: one kernel, CPU or GPU, specialized at compile time</title>
 <meta name="description" content="A Zig 0.16 library for defining a one-dimensional GPU/CPU kernel once and specializing the whole abstraction at compile time. CUDA, HIP and native CPU backends.">
 <link rel="stylesheet" href="style.css">
 </head>
@@ -28,7 +28,7 @@
     <h1>One kernel.<br>CPU or GPU.</h1>
     <p class="tagline">
       Write a one-dimensional kernel once in Zig. Gompute specializes the whole
-      abstraction at compile time — the backend is part of the type, and the
+      abstraction at compile time: the backend is part of the type, and the
       CPU path compiles down to the loop you would have written by hand.
     </p>
     <div class="pills">
@@ -96,7 +96,7 @@
       <div class="card">
         <h3>Compile-time fusion</h3>
         <p><code>Fused</code> expands an <code>inline for</code>, keeping intermediates in
-           registers — one kernel launch, no intermediate buffer.</p>
+           registers, so you get one kernel launch and no intermediate buffer.</p>
       </div>
       <div class="card">
         <h3>Device-safe math</h3>
@@ -147,7 +147,7 @@
 <pre><code>zig fetch --save git+https://github.com/OmarSiwy/Gompute.git</code></pre>
     <p class="note">
       Linux and macOS. The CUDA and HIP backends need
-      <code>linkSystemLibrary("c", .{})</code> on your executable — the drivers are
+      <code>linkSystemLibrary("c", .{})</code> on your executable, because the drivers are
       <code>dlopen</code>'d, and without libc Zig cannot resolve symbols out of them.
     </p>
   </section>

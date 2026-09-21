@@ -8,13 +8,13 @@ The backend is part of the type, and the CPU path compiles down to the loop you
 would have written by hand. That is checked on every build, not just claimed:
 `zig build test` compares the emitted assembly and fails on a difference.
 
-**📖 [Documentation](https://omarsiwy.github.io/Gompute/)** ·
+[Documentation](https://omarsiwy.github.io/Gompute/) ·
 [Guide](https://omarsiwy.github.io/Gompute/guide.html) ·
 [Build integration](https://omarsiwy.github.io/Gompute/build.html) ·
 [Reference](https://omarsiwy.github.io/Gompute/reference.html) ·
 [API](https://omarsiwy.github.io/Gompute/api/)
 
-I am aware, as the zig library evolves that this library will need to be updated
+I am aware that, as the zig library evolves, this library will need to be updated
 greatly. Hence, I'll attempt to maintain the interface, only ADDING features, rather
 than removing any features.
 
@@ -26,7 +26,7 @@ zig fetch --save git+https://github.com/OmarSiwy/Gompute.git
 
 Requires Zig 0.16.0 exactly. Linux and macOS; Windows and wasm are CPU-only and
 the GPU backends do not compile there. The CUDA/HIP backends need
-`exe.root_module.linkSystemLibrary("c", .{})` — the drivers are `dlopen`'d.
+`exe.root_module.linkSystemLibrary("c", .{})`, because the drivers are `dlopen`'d.
 
 ## Example
 
@@ -59,8 +59,8 @@ try kernel.run(&data, .{ .scale = 2 });
 
 Change `.cpu` to `.cuda` or `.hip` without touching the call site, or use
 `AutoKernel` to probe at run time. One `emitKernels` call in your `build.zig`
-wires up the device compilation — see the
-**[guide](https://omarsiwy.github.io/Gompute/guide.html)**.
+wires up the device compilation; the
+[guide](https://omarsiwy.github.io/Gompute/guide.html) walks through it.
 
 ## Commands
 

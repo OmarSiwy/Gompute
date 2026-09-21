@@ -6,18 +6,18 @@ Everything beyond the single `emitKernels` call in the [guide](guide.html).
 
 `.auto` runs `nvidia-smi` / `amdgpu-arch` **on the machine running
 `zig build`**, not on the machine that will run the binary. When the probe
-finds nothing, the backend is compiled out and the build still succeeds — the
+finds nothing, the backend is compiled out and the build still succeeds. The
 binary can then never use a GPU, and you find out in production.
 
 Gompute warns when this happens. Treat the warning as an error in any build
 whose output leaves the machine:
 
-- **CI, Docker, Nix** — build hosts almost never have a GPU. Always pin
+- CI, Docker and Nix hosts almost never have a GPU, so always pin
   `.cuda = .{ .gpu = .{ .name = "sm_89" } }` (or the `gfx*` you target).
-- **Releases** — pin, or you ship whatever card the release runner happened
-  to have.
-- **Genuinely CPU-only** — set `.enabled = false` rather than relying on
-  detection failing.
+- For releases, pin, or you ship whatever card the release runner happened to
+  have.
+- If the build is genuinely CPU-only, set `.enabled = false` rather than relying
+  on detection failing.
 
 `.auto` is also why the Nix dev shell is not hermetic: `nvidia-smi` comes from
 the ambient `PATH`, so the same source tree can produce different artifacts on
@@ -28,10 +28,10 @@ two machines. The flake's `packages.default` and `checks.default` never call
 
 `emitKernels` attaches `gompute_kernels` to `dep.module("gompute")`, which is
 **shared**. Two executables calling `emitKernels` against the same `dep` do not
-get one artifact set each — the last call would overwrite the first, the build
+get one artifact set each: the last call would overwrite the first, the build
 would stay green, and the first executable would ship the second one's PTX and
-fail at run time with `error.KernelNotFound`. Gompute now panics on the second
-call rather than letting that happen.
+fail at run time with `error.KernelNotFound`. Gompute panics on the second call
+rather than letting that happen.
 
 For two or more executables, use `addKernels`, which returns a private
 `gompute` module carrying only that root's artifacts:
@@ -71,14 +71,14 @@ Repeat verbatim for the second executable with its own kernel root; the two
 instances do not collide. `k.kernels` is the generated artifact module
 (`has_cuda`, `has_hip`, the blobs) if you want to read it directly.
 
-`emitKernels` is unchanged and stays supported for the single-executable case.
+`emitKernels` stays supported for the single-executable case.
 
 ## Kernel roots that import their own modules
 
 If `kernels.zig` imports anything besides `gompute`, supply an `.imports`
 callback. Gompute calls it once per enabled backend with that backend's
-resolved device target and optimize mode; build every module — including
-nested ones — from the values it hands you:
+resolved device target and optimize mode; build every module, including nested
+ones, from the values it hands you:
 
 ```zig
 fn deviceImports(
@@ -114,7 +114,7 @@ It is a callback rather than a plain list of modules because a
 `std.Build.Module` carries its own target and optimize mode. One prebuilt
 module cannot serve both the `nvptx64` and `amdgcn` compilations, and a
 host-built module dragged into device code would silently keep the host's
-optimize mode — which is how a `Debug` import ends up inside an otherwise
+optimize mode, which is how a `Debug` import ends up inside an otherwise
 `ReleaseFast` device build.
 
 ## Several kernel roots
@@ -144,8 +144,8 @@ it next to the other big ones costs memory rather than saving time. Heavy roots
 are chained into `heavy_lanes` serial lanes with ordinary build-graph edges;
 light roots run unconstrained.
 
-Kernel names must be unique across roots — a duplicate is a compile error naming
-both roots — because the name is what run-time dispatch looks up.
+Kernel names must be unique across roots, because the name is what run-time
+dispatch looks up. A duplicate is a compile error naming both roots.
 
 Measured on eight generated roots shaped like real device models, one of which
 was edited:
@@ -176,9 +176,9 @@ defer kernel.deinit();
 try kernel.launch(grid, block, 0, &args);
 ```
 
-An unknown name is `error.KernelNotFound`, not a panic. The comptime paths —
-`Kernel(spec, .cuda)`, `RawKernel(name, .cuda)` — resolve through the same map
-at compile time, so a kernel that is in no root is still a compile error.
+An unknown name is `error.KernelNotFound`, not a panic. The comptime paths
+(`Kernel(spec, .cuda)` and `RawKernel(name, .cuda)`) resolve through the same
+map at compile time, so a kernel that is in no root is still a compile error.
 
 Either way only the root that exports the kernel is JIT'd, and the runtime
 caches it per `(device, blob)`, so a process that touches 3 of 37 models pays

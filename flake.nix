@@ -1,5 +1,5 @@
 {
-  description = "Gompute — Zig GPU compute library (CUDA + HIP)";
+  description = "Gompute: Zig GPU compute library (CUDA + HIP)";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";

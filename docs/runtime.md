@@ -2,15 +2,15 @@
 
 `Kernel` and `AutoKernel` are one policy over a smaller layer: `g.runtime`.
 Reach for the runtime directly when you want something the map API does not
-express — streams, buffer-to-buffer copies, partial transfers, or launching a
+express: streams, buffer-to-buffer copies, partial transfers, or launching a
 [raw kernel](advanced.html) whose ABI is your own.
 
 Nothing here is required for ordinary use. If `run` fits, use `run`.
 
-- `g.runtime.dynamic` — one tagged-union facade over both vendors, plus a `.cpu`
+- `g.runtime.dynamic` is one tagged-union facade over both vendors, plus a `.cpu`
   arm that fails politely. Pick this unless you have a reason not to.
-- `g.runtime.cuda`, `g.runtime.hip` — the vendor APIs, unwrapped. Same shape,
-  same method names, no union tag to switch on.
+- `g.runtime.cuda` and `g.runtime.hip` are the vendor APIs, unwrapped. Same
+  shape, same method names, no union tag to switch on.
 
 ## The dynamic facade
 
@@ -54,8 +54,8 @@ pub const hip_index: std.StaticStringMap(Entry);
 ```
 
 One image per kernel root, so the index maps a kernel name to the blob that
-holds it and the symbol inside it. The symbol is not always the kernel name —
-HIP keeps Zig's mangled name — which is why the map stores both.
+holds it and the symbol inside it. The symbol is not always the kernel name,
+because HIP keeps Zig's mangled name, which is why the map stores both.
 
 ```zig
 const artifacts = @import("gompute_kernels");
@@ -94,8 +94,8 @@ try buffer.download(@ptrCast(&host_data), N * @sizeOf(f32));
 
 The block size in the launch must match the spec's `block_size`. For generated
 kernels that is `.{ .block_size = 256 }` in the spec, 256 here. For raw
-kernels, see the warning in [Advanced](advanced.html) — the two backends
-disagree about which one wins.
+kernels, see the warning in [Advanced](advanced.html): the two backends disagree
+about which one wins.
 
 `launch` does not synchronize. Nothing tells you a kernel faulted until the
 next `synchronize`, which is where you will see `error.SyncFailed` for a fault
@@ -132,8 +132,8 @@ streams. Two streams let a copy overlap a launch. `compute.synchronize()`
 waits for the whole device; `stream.synchronize()` waits for just that queue.
 
 There is no event API and no cross-stream dependency mechanism. If you need
-those, use `g.runtime.cuda` directly — the facade only carries what both
-vendors spell the same way.
+those, use `g.runtime.cuda` directly. The facade only carries what both vendors
+spell the same way.
 
 ## Lifetime
 
@@ -147,7 +147,7 @@ Contexts and modules are process-wide and per device, and they are shared:
   still be holding one.
 
 `rt.shutdown()` (or `g.runtime.cuda.shutdown()` / `g.runtime.hip.shutdown()`) is
-the real teardown. Call it once, at exit, if you care — and only once nothing
+the real teardown. Call it once, at exit, if you care, and only once nothing
 else is going to touch the device.
 
 Contexts are made current per thread on first use, so the runtime is safe to
@@ -164,8 +164,8 @@ var kernel = try g.rawKernelByName(.cuda, name_from_config, 0);
 defer kernel.deinit();
 ```
 
-The set of kernels is still closed at build time — everything was compiled from
-your kernel roots. Only the *choice* is deferred, and an unknown name is
+The set of kernels is still closed at build time, since everything was compiled
+from your kernel roots. Only the *choice* is deferred, and an unknown name is
 `error.KernelNotFound` rather than a panic. The returned handle is
 `g.RawByName(.cuda)`, which has the same `alloc` / `launch` / `synchronize` as
 [`RawKernel`](advanced.html) but no `init`, since it is already initialized.

@@ -27,7 +27,7 @@ length, and the generated extern parameter struct.
 
 `kernel.alloc` takes a count of **elements**; `Buffer` methods take **bytes**.
 `kernel.context` is the underlying `runtime.cuda.Context` / `runtime.hip.Context`,
-which is how you wait for a bare `launch` — it does not synchronize, and a
+which is how you wait for a bare `launch`. `launch` does not synchronize, and a
 device-side fault will not surface until you do. For partial transfers,
 device-to-device copies and streams, see [Runtime](runtime.html).
 
@@ -63,7 +63,7 @@ not two launches and not an intermediate buffer.
 
 The CPU backend runs a generic map function at the target's vector width. Write
 the operation over `anytype` and use `g.splat` so the same source compiles at
-both scalar and vector width — `x * p.scale` is illegal when `x` is a vector and
+both scalar and vector width. `x * p.scale` is illegal when `x` is a vector and
 `p.scale` is an `f32`:
 
 ```zig
@@ -75,7 +75,7 @@ fn scaleRelu(x: anytype, p: Params) @TypeOf(x) {
 pub const scale_relu = g.map("scale_relu", f32, Params, scaleRelu, .{});
 ```
 
-The GPU path still instantiates it at scalar type — one thread per element — so
+The GPU path still instantiates it at scalar type, one thread per element, so
 one definition serves both. A non-generic `fn (T, Params) T` keeps the plain
 scalar loop, unchanged.
 
@@ -115,8 +115,8 @@ try raw.synchronize();
 
 The block size passed to `globalIdX` **must** match the block size you launch
 with. Generated `map` kernels guarantee that by construction; raw kernels do
-not, and the mismatch is asymmetric — NVPTX reads the real block dimension and
-ignores the argument, while AMDGCN uses it — so the same code can be correct on
+not, and the mismatch is asymmetric: NVPTX reads the real block dimension and
+ignores the argument, while AMDGCN uses it. So the same code can be correct on
 CUDA and silently wrong on HIP.
 
 For shared memory, barriers, multidimensional indexing, textures, or a custom
@@ -125,8 +125,9 @@ ABI, use a raw kernel and the low-level [runtime](runtime.html) modules under
 
 Inside a raw kernel, `g.builtins` has the rest of the device intrinsics:
 `localIdX()` for the thread's index within its block, `blockIdX()`, and
-`barrier()` for a block-wide execution barrier and shared-memory fence — every
-thread in the block must reach it, or NVIDIA hangs and AMD is undefined.
+`barrier()` for a block-wide execution barrier and shared-memory fence. Every
+thread in the block must reach that barrier, or NVIDIA hangs and AMD is
+undefined.
 `gridDimX()` exists on NVPTX only, since AMDGCN has no portable way to read it;
 pass the stride as a kernel argument instead, which is what the generated
 `reduce` kernels do. `g.builtins` is only present in the device compilation.

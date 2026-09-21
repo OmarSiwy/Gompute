@@ -25,8 +25,8 @@ This is the *normal* answer on a machine with no GPU. It is what `AutoKernel`
 silently falls back to the CPU on, and it is what you should expect in CI.
 
 If you believe a GPU is there, check that the driver library is on the loader
-path — Gompute also looks in `/run/opengl-driver/lib`, which is where NixOS
-puts it.
+path. Gompute also looks in `/run/opengl-driver/lib`, which is where NixOS puts
+it.
 
 ## `error.ModuleLoadFailed`, and a loud log line about arch mismatch
 
@@ -74,9 +74,10 @@ compiles all three backends by design.
 
 `AutoKernel.init()` distinguishes two things that look alike:
 
-- **No driver.** Falls back to the CPU without a word. Correct: there is no GPU.
-- **Artifact present, failed to load.** Logs a warning, because that is a build
-  mistake and the cost of not noticing is enormous.
+- No driver at all. Falls back to the CPU without a word, which is correct:
+  there is no GPU.
+- Artifact present but it failed to load. Logs a warning, because that is a
+  build mistake and the cost of not noticing is enormous.
 
 If you want the second case to be fatal:
 
@@ -112,9 +113,9 @@ of hardware and ignores the argument; AMDGCN uses the argument, because it has
 no portable way to read it. Pass a 256 and launch with 128 and NVIDIA covers
 for you while AMD computes wrong indices.
 
-Generated `map` kernels guarantee the match by construction. Raw kernels do
-not — the `block_size` you pass `globalIdX` **must** be the `block.x` you
-launch with.
+Generated `map` kernels guarantee the match by construction. Raw kernels do not,
+so the `block_size` you pass `globalIdX` **must** be the `block.x` you launch
+with.
 
 ## Compile error naming a `Params` field
 
@@ -123,7 +124,7 @@ gompute: `Params.inner.w` has type `usize`, which cannot cross the GPU boundary.
 ```
 
 Some field cannot cross the host/device boundary. `usize` and `isize` are the
-common ones — pointer width may differ between host and device, so they are
+common ones: pointer width may differ between host and device, so they are
 rejected rather than guessed at. Use a fixed-width integer, or give the type a
 [custom boundary](advanced.html).
 
@@ -153,8 +154,8 @@ You are building for Windows or wasm and something instantiated a GPU backend.
 Zig 0.16's `std.DynLib` only supports Linux and the Darwin/BSD family;
 everything else is `@compileError("unsupported platform")`.
 
-`.cpu` alone compiles everywhere. `AutoKernel` does not count as CPU-only — it
-instantiates all three backends. See [Platform support](reference.html#platform-support).
+`.cpu` alone compiles everywhere. `AutoKernel` does not count as CPU-only,
+because it instantiates all three backends. See [Platform support](reference.html#platform-support).
 
 ## Getting the driver's own answer
 
@@ -165,6 +166,6 @@ const drv = g.lastDriverError();
 std.debug.print("{t} code {d}\n", .{ drv.backend, drv.code });
 ```
 
-Thread-local, and cleared on every successful driver call — so it always
+Thread-local, and cleared on every successful driver call, so it always
 describes the failure you just saw. The codes are `CUDA_ERROR_*` and
 `hipError_t` values; look them up in the vendor's headers.

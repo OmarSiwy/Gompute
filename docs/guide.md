@@ -5,16 +5,18 @@ kernel once and specializing the whole abstraction at compile time.
 
 ## Dependencies
 
-- **LLVM** — supplied by Zig itself; the PTX/HSACO steps call `zig cc` and
-  `zig ld.lld`. Nothing to install.
-- **libc, linked into your executable** — `exe.root_module.linkSystemLibrary("c", .{})`
-  is **required for the CUDA and HIP backends**. Without libc, Zig 0.16's
-  `std.DynLib` resolves to `ElfDynLib` instead of `DlDynLib`; it opens
-  `libcuda.so` but cannot resolve symbols out of it, and you get
-  `cuda: symbol not found: cuInit` at run time, which looks exactly like a
-  driver mismatch and is not one. CPU-only builds do not need it.
-- **A CUDA or HIP driver at run time**, if you use those backends. Both are
-  `dlopen`'d; neither is needed to build.
+LLVM comes from Zig itself: the PTX/HSACO steps call `zig cc` and `zig ld.lld`,
+so there is nothing to install.
+
+The CUDA and HIP backends do need libc linked into your executable, via
+`exe.root_module.linkSystemLibrary("c", .{})`. Without libc, Zig 0.16's
+`std.DynLib` resolves to `ElfDynLib` instead of `DlDynLib`; that opens
+`libcuda.so` but cannot resolve symbols out of it, and you get
+`cuda: symbol not found: cuInit` at run time. The message looks exactly like a
+driver mismatch and is not one. CPU-only builds do not need libc.
+
+Those two backends also need a CUDA or HIP driver at run time. Both are
+`dlopen`'d, so neither is needed to build.
 
 ## 1. Add the dependency
 
@@ -54,9 +56,8 @@ comptime {
 each requested GPU target. The public source is shared; target-specific
 address spaces and thread indexing stay inside Gompute's generated entry point.
 
-`g.exportKernels(@This())` exports every public map spec in the file. Pass a
-tuple instead — `g.exportKernels(.{scale_relu})` — if you want an explicit
-subset.
+`g.exportKernels(@This())` exports every public map spec in the file. For an
+explicit subset, pass a tuple instead: `g.exportKernels(.{scale_relu})`.
 
 ## 3. Add one build call
 
@@ -107,7 +108,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         // .gpu defaults to .auto: the build probes the GPU in THIS machine and
         // disables a backend when its GPU is absent. Pin it for CI, Docker,
-        // Nix and releases -- see the build integration page.
+        // Nix and releases; see the build integration page.
         // .cuda = .{ .gpu = .{ .name = "sm_89" } },
         // .hip = .{ .gpu = .{ .name = "gfx1100" } },
     });
@@ -156,8 +157,8 @@ the requirement.
 
 `AutoKernel` distinguishes *no GPU here* from *this build is broken*. A missing
 driver falls back to the CPU silently, as it should. But if the artifact is in
-the binary and still fails to start — wrong device arch, a kernel missing from
-`exportKernels` — it warns, because that is a ~100x slowdown caused by a build
+the binary and still fails to start (wrong device arch, or a kernel missing from
+`exportKernels`) it warns, because that is a ~100x slowdown caused by a build
 mistake rather than by hardware. Use `initStrict()` to make that fatal, and
 `kernel.selected()` to assert which backend you actually got.
 
@@ -192,7 +193,7 @@ zig build docs -Dopen
 cd examples/basic
 zig build run
 
-# Exhaustive example (GPU — requires libc + CUDA/HIP driver)
+# Exhaustive example (GPU: requires libc + a CUDA/HIP driver)
 cd examples/exhaustive
 zig build run
 ```
@@ -207,13 +208,13 @@ nix develop      # Zig + ROCm/CUDA library paths
 
 ## Where to go next
 
-- [Build integration](build.html) — pinning the device arch (do this before you
+- [Build integration](build.html): pinning the device arch (do this before you
   ship anything), multiple kernel roots, what `.auto` gets wrong in CI.
-- [Reference](reference.html) — the full operation set, the error set, the ABI
+- [Reference](reference.html): the full operation set, the error set, the ABI
   rules, device math accuracy.
-- [Advanced](advanced.html) — hoisting the allocation out of `run`, fusion,
+- [Advanced](advanced.html): hoisting the allocation out of `run`, fusion,
   vectorized CPU kernels, hand-written raw kernels.
-- [Runtime](runtime.html) — the layer underneath `Kernel`: modules, buffers,
-  streams, launching by hand.
-- [Troubleshooting](troubleshooting.html) — when something fails at run time,
-  start here.
+- [Runtime](runtime.html): the layer underneath `Kernel`, meaning modules,
+  buffers, streams and launching by hand.
+- [Troubleshooting](troubleshooting.html): start here when something fails at
+  run time.
