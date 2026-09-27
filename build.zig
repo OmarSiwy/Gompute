@@ -380,22 +380,29 @@ pub fn build(b: *std.Build) void {
     _ = probe_ptx.addPrefixedOutputFileArg("-o", "gompute_probe.ptx");
 
     // AMDGCN is the other half of the same claim, and it is cheaper to check:
-    // it has an object writer, so one `addObject` lowers all the way to ISA
-    // with no alias to rewrite and no assembler step.
+    // one `addObject` lowers all the way to ISA with no alias to rewrite and no
+    // assembler step. Asm only, never asm and bin together: Zig runs LLVM
+    // codegen once per output on the same module, and the second run dies on
+    // the first run's `llvm.amdgcn.if` ("Cannot select") once `globalIdX`'s
+    // trap adds a divergent branch. `buildArtifacts` asks for bin and IR, which
+    // is fine.
     const device_probe_amd = b.addObject(.{
         .name = "gompute-device-probe-amd",
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/device_entries.zig"),
             .target = b.resolveTargetQuery(std.Target.Query.parse(.{
                 .arch_os_abi = "amdgcn-amdhsa",
-                .cpu_features = "gfx1100",
+                // `buildArtifacts` adds `trap_handler` to every HIP target; see there.
+                .cpu_features = "gfx1100+trap_handler",
             }) catch unreachable),
             .optimize = .ReleaseFast,
             .strip = true,
             .imports = &.{.{ .name = "gompute", .module = device_mod }},
         }),
     });
-    _ = device_probe_amd.getEmittedBin();
+    // `globalIdX(256)` in the probe must keep its wide-launch trap; a silent
+    // `s_endpgm` in its place is the bug this pins.
+    const amd_trap = b.addCheckFile(device_probe_amd.getEmittedAsm(), .{ .expected_matches = &.{"s_trap 2"} });
 
     const test_step = b.step("test", "Run Gompute unit tests");
     test_step.dependOn(&run_unit_tests.step);
@@ -405,6 +412,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_codegen_check.step);
     test_step.dependOn(&probe_ptx.step);
     test_step.dependOn(&device_probe_amd.step);
+    test_step.dependOn(&amd_trap.step);
 
     buildDocs(b, host_mod, test_step);
 }
@@ -665,7 +673,7 @@ fn buildArtifacts(
         const cpu = d.cpu orelse continue;
         const tag = @tagName(d.device);
 
-        const query = std.Target.Query.parse(.{
+        var query = std.Target.Query.parse(.{
             .arch_os_abi = d.triple,
             .cpu_features = cpu,
         }) catch |err| std.debug.panic(
@@ -673,6 +681,11 @@ fn buildArtifacts(
                 "run `zig targets` for the full list.",
             .{ tag, cpu, err, d.expected_cpu },
         );
+        // LLVM turns `trap-handler` on for every amdhsa target, but Zig hands it
+        // an explicit feature list that leaves it off, and then `@trap()`
+        // lowers to a silent `s_endpgm` instead of `s_trap 2`. `globalIdX`'s
+        // wide-launch check is only loud with it.
+        if (d.device == .hip) query.cpu_features_add.addFeature(@intFromEnum(std.Target.amdgcn.Feature.trap_handler));
         const target = b.resolveTargetQuery(query);
         const mode = if (d.optimize) |m| deviceOptimize(m) else optimize;
         var lanes: HeavyLanes = .init(b, options.heavy_lanes);

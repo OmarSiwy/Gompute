@@ -22,7 +22,12 @@ extern fn @"llvm.nvvm.barrier0"() callconv(.c) void;
 ///
 /// Worse, it is wrong asymmetrically: NVPTX reads the real block dimension from
 /// `ntid.x` and ignores `block_size` entirely, so the same code gives correct
-/// indices on CUDA and silently wrong ones on HIP.
+/// indices on CUDA and wrong ones on HIP.
+///
+/// AMDGCN traps when a launch is *wider* than `block_size`: a thread whose
+/// `threadIdx.x` is past the end proves the mismatch, and the next sync on the
+/// host reports the aborted kernel. A *narrower* launch is still silent -- no
+/// thread can see it without the real block size, which is the wall below.
 ///
 /// ponytail: AMDGCN should read `workgroup_size_x` out of the HSA dispatch
 /// packet, which is the exact counterpart of `ntid.x`. It cannot be expressed
@@ -36,8 +41,11 @@ pub inline fn globalIdX(comptime block_size: u32) usize {
     return switch (builtin.cpu.arch) {
         .nvptx64 => @as(usize, @"llvm.nvvm.read.ptx.sreg.ctaid.x"()) *
             @"llvm.nvvm.read.ptx.sreg.ntid.x"() + @"llvm.nvvm.read.ptx.sreg.tid.x"(),
-        .amdgcn => @as(usize, @"llvm.amdgcn.workgroup.id.x"()) * block_size +
-            @"llvm.amdgcn.workitem.id.x"(),
+        .amdgcn => blk: {
+            const tid = @"llvm.amdgcn.workitem.id.x"();
+            if (tid >= block_size) @trap();
+            break :blk @as(usize, @"llvm.amdgcn.workgroup.id.x"()) * block_size + tid;
+        },
         else => @compileError("device globalIdX used on a non-GPU target"),
     };
 }
