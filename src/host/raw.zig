@@ -109,6 +109,16 @@ fn GpuRaw(comptime entry_name: ?[:0]const u8, comptime gpu: host.Gpu) type {
             return self.context.createStream();
         }
 
+        /// See `Context.hasGraphs`: false on a driver too old for graphs.
+        pub fn hasGraphs(self: *const Self) bool {
+            return self.context.hasGraphs();
+        }
+
+        /// See `Context.hasEvents`.
+        pub fn hasEvents(self: *const Self) bool {
+            return self.context.hasEvents();
+        }
+
         /// A stream that does not synchronize with the NULL stream, which is
         /// the kind a capture needs. Caller owns it and must `deinit` it.
         pub fn createStreamNonBlocking(self: *Self) iface.Error!Stream {

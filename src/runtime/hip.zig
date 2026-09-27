@@ -58,25 +58,37 @@ const Api = struct {
     hipStreamCreateWithFlags: *const fn (*hipStream_t, c_uint) callconv(.c) hipError_t,
     hipStreamQuery: *const fn (hipStream_t) callconv(.c) hipError_t,
     hipMemcpyDtoDAsync: *const fn (hipDeviceptr_t, hipDeviceptr_t, usize, hipStream_t) callconv(.c) hipError_t,
-    // Graphs. The same shapes as cuda.zig's, down to `hipGraphExecUpdate`'s
-    // error-node and result out-parameters.
-    hipStreamBeginCapture: *const fn (hipStream_t, CaptureMode) callconv(.c) hipError_t,
-    hipStreamEndCapture: *const fn (hipStream_t, *hipGraph_t) callconv(.c) hipError_t,
-    hipStreamIsCapturing: *const fn (hipStream_t, *c_int) callconv(.c) hipError_t,
-    hipGraphInstantiateWithFlags: *const fn (*hipGraphExec_t, hipGraph_t, c_ulonglong) callconv(.c) hipError_t,
-    hipGraphExecUpdate: *const fn (hipGraphExec_t, hipGraph_t, *hipGraphNode_t, *c_int) callconv(.c) hipError_t,
-    hipGraphLaunch: *const fn (hipGraphExec_t, hipStream_t) callconv(.c) hipError_t,
-    hipGraphExecDestroy: *const fn (hipGraphExec_t) callconv(.c) hipError_t,
-    hipGraphDestroy: *const fn (hipGraph_t) callconv(.c) hipError_t,
-    // Events. `hipEventCreate` takes no flags; `WithFlags` is the cuEventCreate twin.
-    hipEventCreateWithFlags: *const fn (*hipEvent_t, c_uint) callconv(.c) hipError_t,
-    hipEventRecord: *const fn (hipEvent_t, hipStream_t) callconv(.c) hipError_t,
-    hipEventSynchronize: *const fn (hipEvent_t) callconv(.c) hipError_t,
-    hipEventQuery: *const fn (hipEvent_t) callconv(.c) hipError_t,
-    hipEventElapsedTime: *const fn (*f32, hipEvent_t, hipEvent_t) callconv(.c) hipError_t,
-    hipEventDestroy: *const fn (hipEvent_t) callconv(.c) hipError_t,
-    hipStreamWaitEvent: *const fn (hipStream_t, hipEvent_t, c_uint) callconv(.c) hipError_t,
+    // Graphs, optional so an older ROCm still runs plain launches
+    // (`Context.hasGraphs`). The same shapes as cuda.zig's, down to
+    // `hipGraphExecUpdate`'s error-node and result out-parameters.
+    hipStreamBeginCapture: ?*const fn (hipStream_t, CaptureMode) callconv(.c) hipError_t,
+    hipStreamEndCapture: ?*const fn (hipStream_t, *hipGraph_t) callconv(.c) hipError_t,
+    hipStreamIsCapturing: ?*const fn (hipStream_t, *c_int) callconv(.c) hipError_t,
+    hipGraphInstantiateWithFlags: ?*const fn (*hipGraphExec_t, hipGraph_t, c_ulonglong) callconv(.c) hipError_t,
+    hipGraphExecUpdate: ?*const fn (hipGraphExec_t, hipGraph_t, *hipGraphNode_t, *c_int) callconv(.c) hipError_t,
+    hipGraphLaunch: ?*const fn (hipGraphExec_t, hipStream_t) callconv(.c) hipError_t,
+    hipGraphExecDestroy: ?*const fn (hipGraphExec_t) callconv(.c) hipError_t,
+    hipGraphDestroy: ?*const fn (hipGraph_t) callconv(.c) hipError_t,
+    // Events, optional (`Context.hasEvents`). `hipEventCreate` takes no flags;
+    // `WithFlags` is the cuEventCreate twin.
+    hipEventCreateWithFlags: ?*const fn (*hipEvent_t, c_uint) callconv(.c) hipError_t,
+    hipEventRecord: ?*const fn (hipEvent_t, hipStream_t) callconv(.c) hipError_t,
+    hipEventSynchronize: ?*const fn (hipEvent_t) callconv(.c) hipError_t,
+    hipEventQuery: ?*const fn (hipEvent_t) callconv(.c) hipError_t,
+    hipEventElapsedTime: ?*const fn (*f32, hipEvent_t, hipEvent_t) callconv(.c) hipError_t,
+    hipEventDestroy: ?*const fn (hipEvent_t) callconv(.c) hipError_t,
+    hipStreamWaitEvent: ?*const fn (hipStream_t, hipEvent_t, c_uint) callconv(.c) hipError_t,
 };
+
+const graph_fns = [_][]const u8{ "hipStreamBeginCapture", "hipStreamEndCapture", "hipStreamIsCapturing", "hipGraphInstantiateWithFlags", "hipGraphExecUpdate", "hipGraphLaunch", "hipGraphExecDestroy", "hipGraphDestroy" };
+const event_fns = [_][]const u8{ "hipEventCreateWithFlags", "hipEventRecord", "hipEventSynchronize", "hipEventQuery", "hipEventElapsedTime", "hipEventDestroy", "hipStreamWaitEvent" };
+
+/// Whether the loaded driver exports every name in `names`.
+fn present(comptime names: []const []const u8) bool {
+    if (!loaded) return false;
+    inline for (names) |name| if (@field(g, name) == null) return false;
+    return true;
+}
 
 var g: Api = undefined;
 var loaded = false;
@@ -322,6 +334,19 @@ pub const Context = struct {
         try self.makeCurrent();
         return loadModuleCached(self.ordinal, image);
     }
+    /// True when the driver has stream capture and graphs. When false, every
+    /// capture and graph call returns `error.Unsupported`; fall back to plain
+    /// launches.
+    pub fn hasGraphs(self: *const Context) bool {
+        _ = self;
+        return present(&graph_fns);
+    }
+    /// True when the driver has events. When false, every event call returns
+    /// `error.Unsupported`.
+    pub fn hasEvents(self: *const Context) bool {
+        _ = self;
+        return present(&event_fns);
+    }
     /// Caller owns the returned Stream and must `deinit` it.
     pub fn createStream(self: *Context) Error!Stream {
         try self.makeCurrent();
@@ -340,7 +365,7 @@ pub const Context = struct {
     pub fn createEvent(self: *Context, timing: bool) Error!Event {
         try self.makeCurrent();
         var e: Event = .{};
-        try check(g.hipEventCreateWithFlags(&e.event, if (timing) 0 else hipEventDisableTiming), error.EventFailed);
+        try check((g.hipEventCreateWithFlags orelse return error.Unsupported)(&e.event, if (timing) 0 else hipEventDisableTiming), error.EventFailed);
         return e;
     }
 };
@@ -478,25 +503,25 @@ pub const Stream = struct {
     /// See `cuda.Stream.waitEvent`.
     pub fn waitEvent(self: *Stream, event: *const Event) Error!void {
         ensureCurrent();
-        try check(g.hipStreamWaitEvent(self.stream, event.event, 0), error.EventFailed);
+        try check((g.hipStreamWaitEvent orelse return error.Unsupported)(self.stream, event.event, 0), error.EventFailed);
     }
     /// See `cuda.Stream.beginCapture`.
     pub fn beginCapture(self: *Stream, mode: CaptureMode) Error!void {
         ensureCurrent();
-        try check(g.hipStreamBeginCapture(self.stream, mode), error.CaptureFailed);
+        try check((g.hipStreamBeginCapture orelse return error.Unsupported)(self.stream, mode), error.CaptureFailed);
     }
     /// See `cuda.Stream.endCapture`.
     pub fn endCapture(self: *Stream) Error!Graph {
         ensureCurrent();
         var graph: Graph = .{};
-        try check(g.hipStreamEndCapture(self.stream, &graph.graph), error.CaptureFailed);
+        try check((g.hipStreamEndCapture orelse return error.Unsupported)(self.stream, &graph.graph), error.CaptureFailed);
         return graph;
     }
     /// See `cuda.Stream.isCapturing`.
     pub fn isCapturing(self: *Stream) Error!bool {
         ensureCurrent();
         var status: c_int = 0;
-        try check(g.hipStreamIsCapturing(self.stream, &status), error.CaptureFailed);
+        try check((g.hipStreamIsCapturing orelse return error.Unsupported)(self.stream, &status), error.CaptureFailed);
         return status != 0;
     }
     pub fn deinit(self: *Stream) void {
@@ -516,13 +541,13 @@ pub const Graph = struct {
     pub fn instantiate(self: *const Graph) Error!GraphExec {
         ensureCurrent();
         var exec: GraphExec = .{};
-        try check(g.hipGraphInstantiateWithFlags(&exec.exec, self.graph, 0), error.GraphFailed);
+        try check((g.hipGraphInstantiateWithFlags orelse return error.Unsupported)(&exec.exec, self.graph, 0), error.GraphFailed);
         return exec;
     }
     pub fn deinit(self: *Graph) void {
         if (!loaded or self.graph == null) return;
         ensureCurrent();
-        _ = g.hipGraphDestroy(self.graph);
+        if (g.hipGraphDestroy) |destroy| _ = destroy(self.graph);
         self.* = .{};
     }
 };
@@ -533,13 +558,13 @@ pub const GraphExec = struct {
 
     pub fn launch(self: *GraphExec, stream: *Stream) Error!void {
         ensureCurrent();
-        try check(g.hipGraphLaunch(self.exec, stream.stream), error.GraphFailed);
+        try check((g.hipGraphLaunch orelse return error.Unsupported)(self.exec, stream.stream), error.GraphFailed);
     }
     pub fn update(self: *GraphExec, graph: *const Graph) Error!bool {
         ensureCurrent();
         var node: hipGraphNode_t = null;
         var result: c_int = 0;
-        const rc = g.hipGraphExecUpdate(self.exec, graph.graph, &node, &result);
+        const rc = (g.hipGraphExecUpdate orelse return error.Unsupported)(self.exec, graph.graph, &node, &result);
         if (rc == hipErrorGraphExecUpdateFailure) {
             iface.recordDriverResult(.hip, rc);
             return false;
@@ -550,7 +575,7 @@ pub const GraphExec = struct {
     pub fn deinit(self: *GraphExec) void {
         if (!loaded or self.exec == null) return;
         ensureCurrent();
-        _ = g.hipGraphExecDestroy(self.exec);
+        if (g.hipGraphExecDestroy) |destroy| _ = destroy(self.exec);
         self.* = .{};
     }
 };
@@ -561,26 +586,26 @@ pub const Event = struct {
 
     pub fn record(self: *Event, stream: *Stream) Error!void {
         ensureCurrent();
-        try check(g.hipEventRecord(self.event, stream.stream), error.EventFailed);
+        try check((g.hipEventRecord orelse return error.Unsupported)(self.event, stream.stream), error.EventFailed);
     }
     pub fn synchronize(self: *Event) Error!void {
         ensureCurrent();
-        try check(g.hipEventSynchronize(self.event), error.EventFailed);
+        try check((g.hipEventSynchronize orelse return error.Unsupported)(self.event), error.EventFailed);
     }
     pub fn query(self: *Event) Error!bool {
         ensureCurrent();
-        return ready(g.hipEventQuery(self.event), error.EventFailed);
+        return ready((g.hipEventQuery orelse return error.Unsupported)(self.event), error.EventFailed);
     }
     pub fn elapsedUs(start: *const Event, end: *const Event) Error!f32 {
         ensureCurrent();
         var ms: f32 = 0;
-        try check(g.hipEventElapsedTime(&ms, start.event, end.event), error.EventFailed);
+        try check((g.hipEventElapsedTime orelse return error.Unsupported)(&ms, start.event, end.event), error.EventFailed);
         return ms * 1000;
     }
     pub fn deinit(self: *Event) void {
         if (!loaded or self.event == null) return;
         ensureCurrent();
-        _ = g.hipEventDestroy(self.event);
+        if (g.hipEventDestroy) |destroy| _ = destroy(self.event);
         self.* = .{};
     }
 };

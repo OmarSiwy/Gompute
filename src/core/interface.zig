@@ -51,6 +51,9 @@ pub const Error = error{
     /// a topology change (which `GraphExec.update` reports as `false`).
     GraphFailed,
     EventFailed,
+    /// The driver is too old for this call: graphs and events need CUDA 11.4+
+    /// or a ROCm that exports them. `hasGraphs()` / `hasEvents()` say so first.
+    Unsupported,
 };
 
 /// Which host threads a stream capture constrains. The tags are in the order

@@ -59,26 +59,38 @@ const Api = struct {
     cuStreamSynchronize: *const fn (CUstream) callconv(.c) CUresult,
     cuStreamQuery: *const fn (CUstream) callconv(.c) CUresult,
     cuMemcpyDtoDAsync_v2: *const fn (CUdeviceptr, CUdeviceptr, usize, CUstream) callconv(.c) CUresult,
-    // Graphs. `cuStreamBeginCapture` is `_v2` in cuda.h since 10.1 (the mode
+    // Graphs, optional: `cuGraphInstantiateWithFlags` needs driver 11.4, and an
+    // older one must still run plain launches (`Context.hasGraphs`).
+    // `cuStreamBeginCapture` is `_v2` in cuda.h since 10.1 (the mode
     // argument); `cuGraphExecUpdate` is the pre-12 four-argument form, which
     // every driver still exports and which matches `hipGraphExecUpdate`.
-    cuStreamBeginCapture_v2: *const fn (CUstream, CaptureMode) callconv(.c) CUresult,
-    cuStreamEndCapture: *const fn (CUstream, *CUgraph) callconv(.c) CUresult,
-    cuStreamIsCapturing: *const fn (CUstream, *c_int) callconv(.c) CUresult,
-    cuGraphInstantiateWithFlags: *const fn (*CUgraphExec, CUgraph, c_ulonglong) callconv(.c) CUresult,
-    cuGraphExecUpdate: *const fn (CUgraphExec, CUgraph, *CUgraphNode, *c_int) callconv(.c) CUresult,
-    cuGraphLaunch: *const fn (CUgraphExec, CUstream) callconv(.c) CUresult,
-    cuGraphExecDestroy: *const fn (CUgraphExec) callconv(.c) CUresult,
-    cuGraphDestroy: *const fn (CUgraph) callconv(.c) CUresult,
-    // Events
-    cuEventCreate: *const fn (*CUevent, c_uint) callconv(.c) CUresult,
-    cuEventRecord: *const fn (CUevent, CUstream) callconv(.c) CUresult,
-    cuEventSynchronize: *const fn (CUevent) callconv(.c) CUresult,
-    cuEventQuery: *const fn (CUevent) callconv(.c) CUresult,
-    cuEventElapsedTime: *const fn (*f32, CUevent, CUevent) callconv(.c) CUresult,
-    cuEventDestroy_v2: *const fn (CUevent) callconv(.c) CUresult,
-    cuStreamWaitEvent: *const fn (CUstream, CUevent, c_uint) callconv(.c) CUresult,
+    cuStreamBeginCapture_v2: ?*const fn (CUstream, CaptureMode) callconv(.c) CUresult,
+    cuStreamEndCapture: ?*const fn (CUstream, *CUgraph) callconv(.c) CUresult,
+    cuStreamIsCapturing: ?*const fn (CUstream, *c_int) callconv(.c) CUresult,
+    cuGraphInstantiateWithFlags: ?*const fn (*CUgraphExec, CUgraph, c_ulonglong) callconv(.c) CUresult,
+    cuGraphExecUpdate: ?*const fn (CUgraphExec, CUgraph, *CUgraphNode, *c_int) callconv(.c) CUresult,
+    cuGraphLaunch: ?*const fn (CUgraphExec, CUstream) callconv(.c) CUresult,
+    cuGraphExecDestroy: ?*const fn (CUgraphExec) callconv(.c) CUresult,
+    cuGraphDestroy: ?*const fn (CUgraph) callconv(.c) CUresult,
+    // Events, optional for the same reason (`Context.hasEvents`).
+    cuEventCreate: ?*const fn (*CUevent, c_uint) callconv(.c) CUresult,
+    cuEventRecord: ?*const fn (CUevent, CUstream) callconv(.c) CUresult,
+    cuEventSynchronize: ?*const fn (CUevent) callconv(.c) CUresult,
+    cuEventQuery: ?*const fn (CUevent) callconv(.c) CUresult,
+    cuEventElapsedTime: ?*const fn (*f32, CUevent, CUevent) callconv(.c) CUresult,
+    cuEventDestroy_v2: ?*const fn (CUevent) callconv(.c) CUresult,
+    cuStreamWaitEvent: ?*const fn (CUstream, CUevent, c_uint) callconv(.c) CUresult,
 };
+
+const graph_fns = [_][]const u8{ "cuStreamBeginCapture_v2", "cuStreamEndCapture", "cuStreamIsCapturing", "cuGraphInstantiateWithFlags", "cuGraphExecUpdate", "cuGraphLaunch", "cuGraphExecDestroy", "cuGraphDestroy" };
+const event_fns = [_][]const u8{ "cuEventCreate", "cuEventRecord", "cuEventSynchronize", "cuEventQuery", "cuEventElapsedTime", "cuEventDestroy_v2", "cuStreamWaitEvent" };
+
+/// Whether the loaded driver exports every name in `names`.
+fn present(comptime names: []const []const u8) bool {
+    if (!loaded) return false;
+    inline for (names) |name| if (@field(g, name) == null) return false;
+    return true;
+}
 
 var g: Api = undefined;
 var loaded = false;
@@ -352,6 +364,19 @@ pub const Context = struct {
         try check(g.cuCtxSynchronize(), error.SyncFailed);
     }
 
+    /// True when the driver has stream capture and graphs. When false, every
+    /// capture and graph call returns `error.Unsupported`; fall back to plain
+    /// launches.
+    pub fn hasGraphs(self: *const Context) bool {
+        _ = self;
+        return present(&graph_fns);
+    }
+    /// True when the driver has events. When false, every event call returns
+    /// `error.Unsupported`.
+    pub fn hasEvents(self: *const Context) bool {
+        _ = self;
+        return present(&event_fns);
+    }
     /// Caller owns the returned Stream and must `deinit` it.
     pub fn createStream(self: *Context) Error!Stream {
         try self.makeCurrent();
@@ -373,7 +398,7 @@ pub const Context = struct {
     pub fn createEvent(self: *Context, timing: bool) Error!Event {
         try self.makeCurrent();
         var e: Event = .{};
-        try check(g.cuEventCreate(&e.event, if (timing) 0 else CU_EVENT_DISABLE_TIMING), error.EventFailed);
+        try check((g.cuEventCreate orelse return error.Unsupported)(&e.event, if (timing) 0 else CU_EVENT_DISABLE_TIMING), error.EventFailed);
         return e;
     }
     /// Allocate device memory. Caller owns the returned Buffer and must `free`
@@ -559,7 +584,7 @@ pub const Stream = struct {
     /// Later work on this stream waits for `event`; the host does not.
     pub fn waitEvent(self: *Stream, event: *const Event) Error!void {
         ensureCurrent();
-        try check(g.cuStreamWaitEvent(self.stream, event.event, 0), error.EventFailed);
+        try check((g.cuStreamWaitEvent orelse return error.Unsupported)(self.stream, event.event, 0), error.EventFailed);
     }
     /// Start recording instead of running: work enqueued on this stream until
     /// `endCapture` becomes graph nodes. Use a `createStreamNonBlocking`
@@ -567,7 +592,7 @@ pub const Stream = struct {
     /// `synchronize`, or a blocking copy, invalidates the capture.
     pub fn beginCapture(self: *Stream, mode: CaptureMode) Error!void {
         ensureCurrent();
-        try check(g.cuStreamBeginCapture_v2(self.stream, mode), error.CaptureFailed);
+        try check((g.cuStreamBeginCapture_v2 orelse return error.Unsupported)(self.stream, mode), error.CaptureFailed);
     }
     /// Ends the capture begun on this stream and returns the recorded graph.
     /// Caller owns it and must `deinit` it. `error.CaptureFailed` if the capture
@@ -575,7 +600,7 @@ pub const Stream = struct {
     pub fn endCapture(self: *Stream) Error!Graph {
         ensureCurrent();
         var graph: Graph = .{};
-        try check(g.cuStreamEndCapture(self.stream, &graph.graph), error.CaptureFailed);
+        try check((g.cuStreamEndCapture orelse return error.Unsupported)(self.stream, &graph.graph), error.CaptureFailed);
         return graph;
     }
     /// True between `beginCapture` and `endCapture`, including after the
@@ -583,7 +608,7 @@ pub const Stream = struct {
     pub fn isCapturing(self: *Stream) Error!bool {
         ensureCurrent();
         var status: c_int = 0;
-        try check(g.cuStreamIsCapturing(self.stream, &status), error.CaptureFailed);
+        try check((g.cuStreamIsCapturing orelse return error.Unsupported)(self.stream, &status), error.CaptureFailed);
         return status != 0;
     }
     pub fn deinit(self: *Stream) void {
@@ -604,13 +629,13 @@ pub const Graph = struct {
     pub fn instantiate(self: *const Graph) Error!GraphExec {
         ensureCurrent();
         var exec: GraphExec = .{};
-        try check(g.cuGraphInstantiateWithFlags(&exec.exec, self.graph, 0), error.GraphFailed);
+        try check((g.cuGraphInstantiateWithFlags orelse return error.Unsupported)(&exec.exec, self.graph, 0), error.GraphFailed);
         return exec;
     }
     pub fn deinit(self: *Graph) void {
         if (!loaded or self.graph == null) return;
         ensureCurrent();
-        _ = g.cuGraphDestroy(self.graph);
+        if (g.cuGraphDestroy) |destroy| _ = destroy(self.graph);
         self.* = .{};
     }
 };
@@ -624,7 +649,7 @@ pub const GraphExec = struct {
     /// it was captured.
     pub fn launch(self: *GraphExec, stream: *Stream) Error!void {
         ensureCurrent();
-        try check(g.cuGraphLaunch(self.exec, stream.stream), error.GraphFailed);
+        try check((g.cuGraphLaunch orelse return error.Unsupported)(self.exec, stream.stream), error.GraphFailed);
     }
     /// Takes `graph`'s node parameters -- kernel arguments, copy addresses --
     /// into this exec in place. Returns false, leaving the exec as it was, when
@@ -634,7 +659,7 @@ pub const GraphExec = struct {
         ensureCurrent();
         var node: CUgraphNode = null;
         var result: c_int = 0;
-        const rc = g.cuGraphExecUpdate(self.exec, graph.graph, &node, &result);
+        const rc = (g.cuGraphExecUpdate orelse return error.Unsupported)(self.exec, graph.graph, &node, &result);
         if (rc == CUDA_ERROR_GRAPH_EXEC_UPDATE_FAILURE) {
             iface.recordDriverResult(.cuda, rc);
             return false;
@@ -645,7 +670,7 @@ pub const GraphExec = struct {
     pub fn deinit(self: *GraphExec) void {
         if (!loaded or self.exec == null) return;
         ensureCurrent();
-        _ = g.cuGraphExecDestroy(self.exec);
+        if (g.cuGraphExecDestroy) |destroy| _ = destroy(self.exec);
         self.* = .{};
     }
 };
@@ -657,29 +682,29 @@ pub const Event = struct {
 
     pub fn record(self: *Event, stream: *Stream) Error!void {
         ensureCurrent();
-        try check(g.cuEventRecord(self.event, stream.stream), error.EventFailed);
+        try check((g.cuEventRecord orelse return error.Unsupported)(self.event, stream.stream), error.EventFailed);
     }
     pub fn synchronize(self: *Event) Error!void {
         ensureCurrent();
-        try check(g.cuEventSynchronize(self.event), error.EventFailed);
+        try check((g.cuEventSynchronize orelse return error.Unsupported)(self.event), error.EventFailed);
     }
     /// True once the work before the last `record` has finished. Never blocks.
     pub fn query(self: *Event) Error!bool {
         ensureCurrent();
-        return ready(g.cuEventQuery(self.event), error.EventFailed);
+        return ready((g.cuEventQuery orelse return error.Unsupported)(self.event), error.EventFailed);
     }
     /// Microseconds from `start` to `end`. Both need `timing` true and both must
     /// have completed.
     pub fn elapsedUs(start: *const Event, end: *const Event) Error!f32 {
         ensureCurrent();
         var ms: f32 = 0;
-        try check(g.cuEventElapsedTime(&ms, start.event, end.event), error.EventFailed);
+        try check((g.cuEventElapsedTime orelse return error.Unsupported)(&ms, start.event, end.event), error.EventFailed);
         return ms * 1000;
     }
     pub fn deinit(self: *Event) void {
         if (!loaded or self.event == null) return;
         ensureCurrent();
-        _ = g.cuEventDestroy_v2(self.event);
+        if (g.cuEventDestroy_v2) |destroy| _ = destroy(self.event);
         self.* = .{};
     }
 };
@@ -879,4 +904,31 @@ test "events order two streams and time a replay" {
     try plain.record(&producer);
     try plain.synchronize();
     try std.testing.expectError(error.EventFailed, Event.elapsedUs(&start, &plain));
+}
+
+test "a driver without graphs or events says so and still runs the rest" {
+    var ctx = Context.init(0) catch return error.SkipZigTest;
+    defer ctx.deinit();
+    try std.testing.expect(ctx.hasGraphs());
+    try std.testing.expect(ctx.hasEvents());
+
+    // Stand in for a pre-11.4 driver: the loader leaves missing optional
+    // symbols null, which is all this does.
+    const saved = g;
+    defer g = saved;
+    g.cuGraphLaunch = null;
+    g.cuEventCreate = null;
+    try std.testing.expect(!ctx.hasGraphs());
+    try std.testing.expect(!ctx.hasEvents());
+    try std.testing.expectError(error.Unsupported, ctx.createEvent(false));
+    var exec: GraphExec = .{};
+    var stream = try ctx.createStreamNonBlocking();
+    defer stream.deinit();
+    try std.testing.expectError(error.Unsupported, exec.launch(&stream));
+
+    // Plain work is untouched.
+    var buf = try ctx.alloc(4);
+    defer buf.free();
+    try buf.fillAsync(0, 4, &stream);
+    try stream.synchronize();
 }
