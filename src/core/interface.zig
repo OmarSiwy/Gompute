@@ -45,7 +45,18 @@ pub const Error = error{
     InvalidArgument,
     BackendUnavailable,
     UnsupportedBackend,
+    /// Stream capture failed to begin or end, or was invalidated in between.
+    CaptureFailed,
+    /// A graph failed to instantiate, launch or update for a reason other than
+    /// a topology change (which `GraphExec.update` reports as `false`).
+    GraphFailed,
+    EventFailed,
 };
+
+/// Which host threads a stream capture constrains. The tags are in the order
+/// both drivers number them (`CU_STREAM_CAPTURE_MODE_*`,
+/// `hipStreamCaptureMode*`), so `@intFromEnum` is the driver value.
+pub const CaptureMode = enum(c_int) { global, thread_local, relaxed };
 
 /// A launch geometry: a grid measured in blocks, or a block measured in
 /// threads, depending on which argument it is.

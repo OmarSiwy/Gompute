@@ -41,6 +41,14 @@ fn GpuRaw(comptime entry_name: ?[:0]const u8, comptime gpu: host.Gpu) type {
         pub const Buffer = gpu.rt.Buffer;
         /// The queue type `createStream` returns and `launchOn` takes.
         pub const Stream = gpu.rt.Stream;
+        /// What `Stream.endCapture` records; `instantiate` it to replay.
+        pub const Graph = gpu.rt.Graph;
+        /// An instantiated `Graph`: `launch` it on a stream, `update` it in place.
+        pub const GraphExec = gpu.rt.GraphExec;
+        /// The type `createEvent` returns.
+        pub const Event = gpu.rt.Event;
+        /// `Stream.beginCapture`'s argument.
+        pub const CaptureMode = gpu.rt.CaptureMode;
 
         context: gpu.rt.Context = .{},
         module: gpu.rt.Module = .{},
@@ -99,6 +107,18 @@ fn GpuRaw(comptime entry_name: ?[:0]const u8, comptime gpu: host.Gpu) type {
         /// Caller owns the returned stream and must `deinit` it.
         pub fn createStream(self: *Self) iface.Error!Stream {
             return self.context.createStream();
+        }
+
+        /// A stream that does not synchronize with the NULL stream, which is
+        /// the kind a capture needs. Caller owns it and must `deinit` it.
+        pub fn createStreamNonBlocking(self: *Self) iface.Error!Stream {
+            return self.context.createStreamNonBlocking();
+        }
+
+        /// `timing` false makes an event that orders but cannot be timed.
+        /// Caller owns it and must `deinit` it.
+        pub fn createEvent(self: *Self, timing: bool) iface.Error!Event {
+            return self.context.createEvent(timing);
         }
 
         /// Launch on the NULL stream and return once the launch is queued. The

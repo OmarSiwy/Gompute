@@ -5,6 +5,8 @@ const builtin = @import("builtin");
 const iface = @import("../core/interface.zig");
 const Dim3 = iface.Dim3;
 const Error = iface.Error;
+/// See `core/interface.zig`; the same type on both backends.
+pub const CaptureMode = iface.CaptureMode;
 
 const CUresult = c_int;
 const CUdevice = c_int;
@@ -13,6 +15,15 @@ const CUmodule = ?*anyopaque;
 const CUfunction = ?*anyopaque;
 const CUstream = ?*anyopaque;
 const CUdeviceptr = c_ulonglong;
+const CUgraph = ?*anyopaque;
+const CUgraphExec = ?*anyopaque;
+const CUgraphNode = ?*anyopaque;
+const CUevent = ?*anyopaque;
+
+const CUDA_ERROR_NOT_READY: CUresult = 600;
+const CUDA_ERROR_GRAPH_EXEC_UPDATE_FAILURE: CUresult = 910;
+const CU_STREAM_NON_BLOCKING: c_uint = 1;
+const CU_EVENT_DISABLE_TIMING: c_uint = 2;
 
 const Api = struct {
     lib: std.DynLib,
@@ -46,6 +57,27 @@ const Api = struct {
     cuStreamCreate: *const fn (*CUstream, c_uint) callconv(.c) CUresult,
     cuStreamDestroy_v2: *const fn (CUstream) callconv(.c) CUresult,
     cuStreamSynchronize: *const fn (CUstream) callconv(.c) CUresult,
+    cuStreamQuery: *const fn (CUstream) callconv(.c) CUresult,
+    cuMemcpyDtoDAsync_v2: *const fn (CUdeviceptr, CUdeviceptr, usize, CUstream) callconv(.c) CUresult,
+    // Graphs. `cuStreamBeginCapture` is `_v2` in cuda.h since 10.1 (the mode
+    // argument); `cuGraphExecUpdate` is the pre-12 four-argument form, which
+    // every driver still exports and which matches `hipGraphExecUpdate`.
+    cuStreamBeginCapture_v2: *const fn (CUstream, CaptureMode) callconv(.c) CUresult,
+    cuStreamEndCapture: *const fn (CUstream, *CUgraph) callconv(.c) CUresult,
+    cuStreamIsCapturing: *const fn (CUstream, *c_int) callconv(.c) CUresult,
+    cuGraphInstantiateWithFlags: *const fn (*CUgraphExec, CUgraph, c_ulonglong) callconv(.c) CUresult,
+    cuGraphExecUpdate: *const fn (CUgraphExec, CUgraph, *CUgraphNode, *c_int) callconv(.c) CUresult,
+    cuGraphLaunch: *const fn (CUgraphExec, CUstream) callconv(.c) CUresult,
+    cuGraphExecDestroy: *const fn (CUgraphExec) callconv(.c) CUresult,
+    cuGraphDestroy: *const fn (CUgraph) callconv(.c) CUresult,
+    // Events
+    cuEventCreate: *const fn (*CUevent, c_uint) callconv(.c) CUresult,
+    cuEventRecord: *const fn (CUevent, CUstream) callconv(.c) CUresult,
+    cuEventSynchronize: *const fn (CUevent) callconv(.c) CUresult,
+    cuEventQuery: *const fn (CUevent) callconv(.c) CUresult,
+    cuEventElapsedTime: *const fn (*f32, CUevent, CUevent) callconv(.c) CUresult,
+    cuEventDestroy_v2: *const fn (CUevent) callconv(.c) CUresult,
+    cuStreamWaitEvent: *const fn (CUstream, CUevent, c_uint) callconv(.c) CUresult,
 };
 
 var g: Api = undefined;
@@ -268,6 +300,17 @@ inline fn check(rc: CUresult, err: Error) Error!void {
     if (rc != 0) return err;
 }
 
+/// `check` for the query calls, where "not finished yet" is an answer and not
+/// a failure.
+inline fn ready(rc: CUresult, err: Error) Error!bool {
+    if (rc == CUDA_ERROR_NOT_READY) {
+        iface.recordDriverResult(.cuda, 0);
+        return false;
+    }
+    try check(rc, err);
+    return true;
+}
+
 // ---- Public API ----
 
 /// One device. Cheap to copy; the expensive part -- the retained primary context
@@ -315,6 +358,23 @@ pub const Context = struct {
         var s: Stream = .{};
         try check(g.cuStreamCreate(&s.stream, 0), error.SyncFailed);
         return s;
+    }
+    /// A stream that does not synchronize implicitly with the legacy default
+    /// stream, which is what a stream being captured needs: an implicit sync
+    /// against it invalidates the capture. Caller owns it and must `deinit` it.
+    pub fn createStreamNonBlocking(self: *Context) Error!Stream {
+        try self.makeCurrent();
+        var s: Stream = .{};
+        try check(g.cuStreamCreate(&s.stream, CU_STREAM_NON_BLOCKING), error.SyncFailed);
+        return s;
+    }
+    /// `timing` false is the cheaper event: it can order and be waited on, but
+    /// `elapsedUs` rejects it. Caller owns it and must `deinit` it.
+    pub fn createEvent(self: *Context, timing: bool) Error!Event {
+        try self.makeCurrent();
+        var e: Event = .{};
+        try check(g.cuEventCreate(&e.event, if (timing) 0 else CU_EVENT_DISABLE_TIMING), error.EventFailed);
+        return e;
     }
     /// Allocate device memory. Caller owns the returned Buffer and must `free`
     /// it; nothing here tracks it.
@@ -417,6 +477,11 @@ pub const Buffer = struct {
         ensureCurrent();
         try check(g.cuMemcpyDtoD_v2(try self.offsetPtr(dst_offset), try src.offsetPtr(src_offset), n), error.CopyFailed);
     }
+    /// `copyFrom`, enqueued on `stream` and not waited on. Legal under capture.
+    pub fn copyFromAsync(self: *Buffer, src: *const Buffer, src_offset: usize, dst_offset: usize, n: usize, stream: *Stream) Error!void {
+        ensureCurrent();
+        try check(g.cuMemcpyDtoDAsync_v2(try self.offsetPtr(dst_offset), try src.offsetPtr(src_offset), n, stream.stream), error.CopyFailed);
+    }
     /// Enqueued on `stream` and not waited on; `host` must be `allocPinned`
     /// memory and must stay put until `stream.synchronize()` returns.
     pub fn downloadAtAsync(self: *Buffer, host: *anyopaque, offset: usize, n: usize, stream: *Stream) Error!void {
@@ -486,10 +551,135 @@ pub const Stream = struct {
         ensureCurrent();
         try check(g.cuStreamSynchronize(self.stream), error.SyncFailed);
     }
+    /// True once everything queued on this stream has finished. Never blocks.
+    pub fn query(self: *Stream) Error!bool {
+        ensureCurrent();
+        return ready(g.cuStreamQuery(self.stream), error.SyncFailed);
+    }
+    /// Later work on this stream waits for `event`; the host does not.
+    pub fn waitEvent(self: *Stream, event: *const Event) Error!void {
+        ensureCurrent();
+        try check(g.cuStreamWaitEvent(self.stream, event.event, 0), error.EventFailed);
+    }
+    /// Start recording instead of running: work enqueued on this stream until
+    /// `endCapture` becomes graph nodes. Use a `createStreamNonBlocking`
+    /// stream, and nothing that waits on the host in between -- a
+    /// `synchronize`, or a blocking copy, invalidates the capture.
+    pub fn beginCapture(self: *Stream, mode: CaptureMode) Error!void {
+        ensureCurrent();
+        try check(g.cuStreamBeginCapture_v2(self.stream, mode), error.CaptureFailed);
+    }
+    /// Ends the capture begun on this stream and returns the recorded graph.
+    /// Caller owns it and must `deinit` it. `error.CaptureFailed` if the capture
+    /// was invalidated along the way.
+    pub fn endCapture(self: *Stream) Error!Graph {
+        ensureCurrent();
+        var graph: Graph = .{};
+        try check(g.cuStreamEndCapture(self.stream, &graph.graph), error.CaptureFailed);
+        return graph;
+    }
+    /// True between `beginCapture` and `endCapture`, including after the
+    /// capture has been invalidated (it still needs its `endCapture`).
+    pub fn isCapturing(self: *Stream) Error!bool {
+        ensureCurrent();
+        var status: c_int = 0;
+        try check(g.cuStreamIsCapturing(self.stream, &status), error.CaptureFailed);
+        return status != 0;
+    }
     pub fn deinit(self: *Stream) void {
         if (!loaded) return;
         ensureCurrent();
         _ = g.cuStreamDestroy_v2(self.stream);
+        self.* = .{};
+    }
+};
+
+/// A recorded graph: the template `instantiate` compiles and `GraphExec.update`
+/// reads new node parameters from.
+pub const Graph = struct {
+    graph: CUgraph = null,
+
+    /// Caller owns the returned exec and must `deinit` it. The graph can be
+    /// freed right after: the exec does not borrow it.
+    pub fn instantiate(self: *const Graph) Error!GraphExec {
+        ensureCurrent();
+        var exec: GraphExec = .{};
+        try check(g.cuGraphInstantiateWithFlags(&exec.exec, self.graph, 0), error.GraphFailed);
+        return exec;
+    }
+    pub fn deinit(self: *Graph) void {
+        if (!loaded or self.graph == null) return;
+        ensureCurrent();
+        _ = g.cuGraphDestroy(self.graph);
+        self.* = .{};
+    }
+};
+
+/// An instantiated graph, ready to replay.
+pub const GraphExec = struct {
+    exec: CUgraphExec = null,
+
+    /// Enqueues one replay on `stream` and returns without waiting. A copy node
+    /// reads and writes its pinned host memory when the replay runs, not when
+    /// it was captured.
+    pub fn launch(self: *GraphExec, stream: *Stream) Error!void {
+        ensureCurrent();
+        try check(g.cuGraphLaunch(self.exec, stream.stream), error.GraphFailed);
+    }
+    /// Takes `graph`'s node parameters -- kernel arguments, copy addresses --
+    /// into this exec in place. Returns false, leaving the exec as it was, when
+    /// the driver rejects the update (a topology change, among others); the
+    /// caller then instantiates `graph` instead.
+    pub fn update(self: *GraphExec, graph: *const Graph) Error!bool {
+        ensureCurrent();
+        var node: CUgraphNode = null;
+        var result: c_int = 0;
+        const rc = g.cuGraphExecUpdate(self.exec, graph.graph, &node, &result);
+        if (rc == CUDA_ERROR_GRAPH_EXEC_UPDATE_FAILURE) {
+            iface.recordDriverResult(.cuda, rc);
+            return false;
+        }
+        try check(rc, error.GraphFailed);
+        return true;
+    }
+    pub fn deinit(self: *GraphExec) void {
+        if (!loaded or self.exec == null) return;
+        ensureCurrent();
+        _ = g.cuGraphExecDestroy(self.exec);
+        self.* = .{};
+    }
+};
+
+/// A marker in a stream: record it, then wait on it from the host or from
+/// another stream, or time the gap between two of them.
+pub const Event = struct {
+    event: CUevent = null,
+
+    pub fn record(self: *Event, stream: *Stream) Error!void {
+        ensureCurrent();
+        try check(g.cuEventRecord(self.event, stream.stream), error.EventFailed);
+    }
+    pub fn synchronize(self: *Event) Error!void {
+        ensureCurrent();
+        try check(g.cuEventSynchronize(self.event), error.EventFailed);
+    }
+    /// True once the work before the last `record` has finished. Never blocks.
+    pub fn query(self: *Event) Error!bool {
+        ensureCurrent();
+        return ready(g.cuEventQuery(self.event), error.EventFailed);
+    }
+    /// Microseconds from `start` to `end`. Both need `timing` true and both must
+    /// have completed.
+    pub fn elapsedUs(start: *const Event, end: *const Event) Error!f32 {
+        ensureCurrent();
+        var ms: f32 = 0;
+        try check(g.cuEventElapsedTime(&ms, start.event, end.event), error.EventFailed);
+        return ms * 1000;
+    }
+    pub fn deinit(self: *Event) void {
+        if (!loaded or self.event == null) return;
+        ensureCurrent();
+        _ = g.cuEventDestroy_v2(self.event);
         self.* = .{};
     }
 };
@@ -535,4 +725,158 @@ test "a handle-less Buffer errors instead of copying from address zero" {
     try std.testing.expectError(error.InvalidArgument, buffer.fillAsync(0, 1, &stream));
     buffer.free();
     buffer.free();
+}
+
+/// `data[i] += 1` for `i < n`: the smallest kernel a graph test can see run.
+/// PTX 6.0 for sm_52, which the driver JITs forward to whatever card is here.
+const add_one_ptx =
+    \\.version 6.0
+    \\.target sm_52
+    \\.address_size 64
+    \\.visible .entry add_one(.param .u64 data, .param .u32 n)
+    \\{
+    \\  .reg .pred %p;
+    \\  .reg .b32 %r<6>;
+    \\  .reg .b64 %rd<4>;
+    \\  ld.param.u64 %rd1, [data];
+    \\  ld.param.u32 %r1, [n];
+    \\  mov.u32 %r2, %ctaid.x;
+    \\  mov.u32 %r3, %ntid.x;
+    \\  mov.u32 %r4, %tid.x;
+    \\  mad.lo.s32 %r5, %r2, %r3, %r4;
+    \\  setp.ge.u32 %p, %r5, %r1;
+    \\  @%p bra DONE;
+    \\  cvta.to.global.u64 %rd2, %rd1;
+    \\  mul.wide.u32 %rd3, %r5, 4;
+    \\  add.s64 %rd2, %rd2, %rd3;
+    \\  ld.global.u32 %r2, [%rd2];
+    \\  add.s32 %r2, %r2, 1;
+    \\  st.global.u32 [%rd2], %r2;
+    \\DONE:
+    \\  ret;
+    \\}
+;
+
+test "a captured graph replays copies and a launch, and updates in place" {
+    var ctx = Context.init(0) catch return error.SkipZigTest; // no NVIDIA driver here
+    defer ctx.deinit();
+    var module = try ctx.loadModuleFromMemory(add_one_ptx);
+    defer module.deinit();
+    const kernel = try module.getKernel("add_one");
+
+    const n: u32 = 1000;
+    const bytes = n * @sizeOf(u32);
+    const pinned = try ctx.allocPinned(bytes);
+    defer ctx.freePinned(pinned);
+    const host: []u32 = @alignCast(std.mem.bytesAsSlice(u32, pinned));
+    var a = try ctx.alloc(bytes);
+    defer a.free();
+    var b = try ctx.alloc(bytes);
+    defer b.free();
+    var stream = try ctx.createStreamNonBlocking();
+    defer stream.deinit();
+
+    // upload -> add_one -> device copy -> download, all on `stream`. `buf` is
+    // what the kernel and the copies touch; the kernel's argument slots are
+    // read at capture time, so they only have to live through `endCapture`.
+    const Chain = struct {
+        fn capture(s: *Stream, k: Kernel, buf: *Buffer, out: *Buffer, h: []u32, count: u32, extra: bool) !Graph {
+            try s.beginCapture(.thread_local);
+            errdefer if (s.endCapture()) |gr| {
+                var x = gr;
+                x.deinit();
+            } else |_| {};
+            try buf.uploadAtAsync(h.ptr, 0, h.len * 4, s);
+            var len = count;
+            try k.launchOnStream(.{ .x = (count + 255) / 256 }, .{ .x = 256 }, 0, &.{ buf.argPtr(), iface.arg(&len) }, s.stream);
+            if (extra) try k.launchOnStream(.{ .x = (count + 255) / 256 }, .{ .x = 256 }, 0, &.{ buf.argPtr(), iface.arg(&len) }, s.stream);
+            try out.copyFromAsync(buf, 0, 0, h.len * 4, s);
+            try out.downloadAtAsync(h.ptr, 0, h.len * 4, s);
+            try std.testing.expect(try s.isCapturing());
+            return s.endCapture();
+        }
+    };
+
+    var graph = try Chain.capture(&stream, kernel, &a, &b, host, n, false);
+    defer graph.deinit();
+    try std.testing.expect(!try stream.isCapturing());
+    var exec = try graph.instantiate();
+    defer exec.deinit();
+
+    // Capture ran nothing: the copies read `host` when the graph runs.
+    for (host, 0..) |*v, i| v.* = @intCast(i);
+    try exec.launch(&stream);
+    try stream.synchronize();
+    for (host, 0..) |v, i| try std.testing.expectEqual(@as(u32, @intCast(i)) + 1, v);
+
+    // A replay picks up what the host wrote since.
+    try exec.launch(&stream);
+    try stream.synchronize();
+    for (host, 0..) |v, i| try std.testing.expectEqual(@as(u32, @intCast(i)) + 2, v);
+
+    // Same topology, different node parameters: the kernel covers only half the
+    // buffer and the chain runs through `b` and `a` the other way round.
+    var half = try Chain.capture(&stream, kernel, &b, &a, host, n / 2, false);
+    defer half.deinit();
+    try std.testing.expect(try exec.update(&half));
+    for (host) |*v| v.* = 7;
+    try exec.launch(&stream);
+    try stream.synchronize();
+    for (host, 0..) |v, i| try std.testing.expectEqual(@as(u32, if (i < n / 2) 8 else 7), v);
+
+    // One more node is a different topology: rejected, and the exec is intact.
+    var longer = try Chain.capture(&stream, kernel, &a, &b, host, n, true);
+    defer longer.deinit();
+    try std.testing.expect(!try exec.update(&longer));
+    for (host) |*v| v.* = 0;
+    try exec.launch(&stream);
+    try stream.synchronize();
+    try std.testing.expect(try stream.query());
+    for (host, 0..) |v, i| try std.testing.expectEqual(@as(u32, if (i < n / 2) 1 else 0), v);
+}
+
+test "events order two streams and time a replay" {
+    var ctx = Context.init(0) catch return error.SkipZigTest;
+    defer ctx.deinit();
+    var module = try ctx.loadModuleFromMemory(add_one_ptx);
+    defer module.deinit();
+    const kernel = try module.getKernel("add_one");
+
+    const n: u32 = 1 << 20;
+    var buf = try ctx.alloc(n * 4);
+    defer buf.free();
+    const pinned = try ctx.allocPinned(4);
+    defer ctx.freePinned(pinned);
+
+    var producer = try ctx.createStreamNonBlocking();
+    defer producer.deinit();
+    var consumer = try ctx.createStreamNonBlocking();
+    defer consumer.deinit();
+    var start = try ctx.createEvent(true);
+    defer start.deinit();
+    var end = try ctx.createEvent(true);
+    defer end.deinit();
+
+    try buf.fillAsync(0, n * 4, &producer);
+    try start.record(&producer);
+    var len = n;
+    for (0..8) |_| try kernel.launchOnStream(.{ .x = n / 256 }, .{ .x = 256 }, 0, &.{ buf.argPtr(), iface.arg(&len) }, producer.stream);
+    try end.record(&producer);
+
+    // Without the wait, this download could read the buffer mid-increment.
+    try consumer.waitEvent(&end);
+    try buf.downloadAtAsync(pinned.ptr, (n - 1) * 4, 4, &consumer);
+    try consumer.synchronize();
+    try std.testing.expectEqual(@as(u32, 8), std.mem.bytesToValue(u32, pinned[0..4]));
+
+    try end.synchronize();
+    try std.testing.expect(try end.query());
+    try std.testing.expect(try Event.elapsedUs(&start, &end) > 0);
+
+    // A timing-less event still orders, but cannot be timed.
+    var plain = try ctx.createEvent(false);
+    defer plain.deinit();
+    try plain.record(&producer);
+    try plain.synchronize();
+    try std.testing.expectError(error.EventFailed, Event.elapsedUs(&start, &plain));
 }

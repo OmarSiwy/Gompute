@@ -5,6 +5,8 @@ const builtin = @import("builtin");
 const iface = @import("../core/interface.zig");
 const Dim3 = iface.Dim3;
 const Error = iface.Error;
+/// See `core/interface.zig`; the same type on both backends.
+pub const CaptureMode = iface.CaptureMode;
 
 const hipError_t = c_int;
 const hipDevice_t = c_int;
@@ -13,6 +15,15 @@ const hipModule_t = ?*anyopaque;
 const hipFunction_t = ?*anyopaque;
 const hipStream_t = ?*anyopaque;
 const hipDeviceptr_t = ?*anyopaque;
+const hipGraph_t = ?*anyopaque;
+const hipGraphExec_t = ?*anyopaque;
+const hipGraphNode_t = ?*anyopaque;
+const hipEvent_t = ?*anyopaque;
+
+const hipErrorNotReady: hipError_t = 600;
+const hipErrorGraphExecUpdateFailure: hipError_t = 910;
+const hipStreamNonBlocking: c_uint = 1;
+const hipEventDisableTiming: c_uint = 2;
 
 const Api = struct {
     lib: std.DynLib,
@@ -44,6 +55,27 @@ const Api = struct {
     hipStreamCreate: *const fn (*hipStream_t, c_uint) callconv(.c) hipError_t,
     hipStreamDestroy: *const fn (hipStream_t) callconv(.c) hipError_t,
     hipStreamSynchronize: *const fn (hipStream_t) callconv(.c) hipError_t,
+    hipStreamCreateWithFlags: *const fn (*hipStream_t, c_uint) callconv(.c) hipError_t,
+    hipStreamQuery: *const fn (hipStream_t) callconv(.c) hipError_t,
+    hipMemcpyDtoDAsync: *const fn (hipDeviceptr_t, hipDeviceptr_t, usize, hipStream_t) callconv(.c) hipError_t,
+    // Graphs. The same shapes as cuda.zig's, down to `hipGraphExecUpdate`'s
+    // error-node and result out-parameters.
+    hipStreamBeginCapture: *const fn (hipStream_t, CaptureMode) callconv(.c) hipError_t,
+    hipStreamEndCapture: *const fn (hipStream_t, *hipGraph_t) callconv(.c) hipError_t,
+    hipStreamIsCapturing: *const fn (hipStream_t, *c_int) callconv(.c) hipError_t,
+    hipGraphInstantiateWithFlags: *const fn (*hipGraphExec_t, hipGraph_t, c_ulonglong) callconv(.c) hipError_t,
+    hipGraphExecUpdate: *const fn (hipGraphExec_t, hipGraph_t, *hipGraphNode_t, *c_int) callconv(.c) hipError_t,
+    hipGraphLaunch: *const fn (hipGraphExec_t, hipStream_t) callconv(.c) hipError_t,
+    hipGraphExecDestroy: *const fn (hipGraphExec_t) callconv(.c) hipError_t,
+    hipGraphDestroy: *const fn (hipGraph_t) callconv(.c) hipError_t,
+    // Events. `hipEventCreate` takes no flags; `WithFlags` is the cuEventCreate twin.
+    hipEventCreateWithFlags: *const fn (*hipEvent_t, c_uint) callconv(.c) hipError_t,
+    hipEventRecord: *const fn (hipEvent_t, hipStream_t) callconv(.c) hipError_t,
+    hipEventSynchronize: *const fn (hipEvent_t) callconv(.c) hipError_t,
+    hipEventQuery: *const fn (hipEvent_t) callconv(.c) hipError_t,
+    hipEventElapsedTime: *const fn (*f32, hipEvent_t, hipEvent_t) callconv(.c) hipError_t,
+    hipEventDestroy: *const fn (hipEvent_t) callconv(.c) hipError_t,
+    hipStreamWaitEvent: *const fn (hipStream_t, hipEvent_t, c_uint) callconv(.c) hipError_t,
 };
 
 var g: Api = undefined;
@@ -97,6 +129,17 @@ inline fn check(rc: hipError_t, err: Error) Error!void {
     // several calls ago.
     iface.recordDriverResult(.hip, rc);
     if (rc != 0) return err;
+}
+
+/// `check` for the query calls, where "not finished yet" is an answer and not
+/// a failure.
+inline fn ready(rc: hipError_t, err: Error) Error!bool {
+    if (rc == hipErrorNotReady) {
+        iface.recordDriverResult(.hip, 0);
+        return false;
+    }
+    try check(rc, err);
+    return true;
 }
 
 // ---- Process-wide device state ----
@@ -286,6 +329,20 @@ pub const Context = struct {
         try check(g.hipStreamCreate(&s.stream, 0), error.SyncFailed);
         return s;
     }
+    /// See `cuda.Context.createStreamNonBlocking`.
+    pub fn createStreamNonBlocking(self: *Context) Error!Stream {
+        try self.makeCurrent();
+        var s: Stream = .{};
+        try check(g.hipStreamCreateWithFlags(&s.stream, hipStreamNonBlocking), error.SyncFailed);
+        return s;
+    }
+    /// See `cuda.Context.createEvent`.
+    pub fn createEvent(self: *Context, timing: bool) Error!Event {
+        try self.makeCurrent();
+        var e: Event = .{};
+        try check(g.hipEventCreateWithFlags(&e.event, if (timing) 0 else hipEventDisableTiming), error.EventFailed);
+        return e;
+    }
 };
 
 /// Device memory. All-default fields on purpose -- a hand-built or already-freed
@@ -336,6 +393,11 @@ pub const Buffer = struct {
     pub fn copyFrom(self: *Buffer, src: *const Buffer, src_offset: usize, dst_offset: usize, n: usize) Error!void {
         ensureCurrent();
         try check(g.hipMemcpyDtoD(try self.offsetPtr(dst_offset), try src.offsetPtr(src_offset), n), error.CopyFailed);
+    }
+    /// `copyFrom`, enqueued on `stream` and not waited on. Legal under capture.
+    pub fn copyFromAsync(self: *Buffer, src: *const Buffer, src_offset: usize, dst_offset: usize, n: usize, stream: *Stream) Error!void {
+        ensureCurrent();
+        try check(g.hipMemcpyDtoDAsync(try self.offsetPtr(dst_offset), try src.offsetPtr(src_offset), n, stream.stream), error.CopyFailed);
     }
     pub fn downloadAt(self: *Buffer, host: *anyopaque, offset: usize, n: usize) Error!void {
         ensureCurrent();
@@ -408,12 +470,117 @@ pub const Stream = struct {
         ensureCurrent();
         try check(g.hipStreamSynchronize(self.stream), error.SyncFailed);
     }
+    /// See `cuda.Stream.query`.
+    pub fn query(self: *Stream) Error!bool {
+        ensureCurrent();
+        return ready(g.hipStreamQuery(self.stream), error.SyncFailed);
+    }
+    /// See `cuda.Stream.waitEvent`.
+    pub fn waitEvent(self: *Stream, event: *const Event) Error!void {
+        ensureCurrent();
+        try check(g.hipStreamWaitEvent(self.stream, event.event, 0), error.EventFailed);
+    }
+    /// See `cuda.Stream.beginCapture`.
+    pub fn beginCapture(self: *Stream, mode: CaptureMode) Error!void {
+        ensureCurrent();
+        try check(g.hipStreamBeginCapture(self.stream, mode), error.CaptureFailed);
+    }
+    /// See `cuda.Stream.endCapture`.
+    pub fn endCapture(self: *Stream) Error!Graph {
+        ensureCurrent();
+        var graph: Graph = .{};
+        try check(g.hipStreamEndCapture(self.stream, &graph.graph), error.CaptureFailed);
+        return graph;
+    }
+    /// See `cuda.Stream.isCapturing`.
+    pub fn isCapturing(self: *Stream) Error!bool {
+        ensureCurrent();
+        var status: c_int = 0;
+        try check(g.hipStreamIsCapturing(self.stream, &status), error.CaptureFailed);
+        return status != 0;
+    }
     pub fn deinit(self: *Stream) void {
         // Same reason as `Buffer.free`: `Stream{}` is a value any caller can
         // build, and `g` is undefined until something dlopen'd the runtime.
         if (!loaded) return;
         ensureCurrent();
         _ = g.hipStreamDestroy(self.stream);
+        self.* = .{};
+    }
+};
+
+/// See `cuda.Graph`.
+pub const Graph = struct {
+    graph: hipGraph_t = null,
+
+    pub fn instantiate(self: *const Graph) Error!GraphExec {
+        ensureCurrent();
+        var exec: GraphExec = .{};
+        try check(g.hipGraphInstantiateWithFlags(&exec.exec, self.graph, 0), error.GraphFailed);
+        return exec;
+    }
+    pub fn deinit(self: *Graph) void {
+        if (!loaded or self.graph == null) return;
+        ensureCurrent();
+        _ = g.hipGraphDestroy(self.graph);
+        self.* = .{};
+    }
+};
+
+/// See `cuda.GraphExec`.
+pub const GraphExec = struct {
+    exec: hipGraphExec_t = null,
+
+    pub fn launch(self: *GraphExec, stream: *Stream) Error!void {
+        ensureCurrent();
+        try check(g.hipGraphLaunch(self.exec, stream.stream), error.GraphFailed);
+    }
+    pub fn update(self: *GraphExec, graph: *const Graph) Error!bool {
+        ensureCurrent();
+        var node: hipGraphNode_t = null;
+        var result: c_int = 0;
+        const rc = g.hipGraphExecUpdate(self.exec, graph.graph, &node, &result);
+        if (rc == hipErrorGraphExecUpdateFailure) {
+            iface.recordDriverResult(.hip, rc);
+            return false;
+        }
+        try check(rc, error.GraphFailed);
+        return true;
+    }
+    pub fn deinit(self: *GraphExec) void {
+        if (!loaded or self.exec == null) return;
+        ensureCurrent();
+        _ = g.hipGraphExecDestroy(self.exec);
+        self.* = .{};
+    }
+};
+
+/// See `cuda.Event`.
+pub const Event = struct {
+    event: hipEvent_t = null,
+
+    pub fn record(self: *Event, stream: *Stream) Error!void {
+        ensureCurrent();
+        try check(g.hipEventRecord(self.event, stream.stream), error.EventFailed);
+    }
+    pub fn synchronize(self: *Event) Error!void {
+        ensureCurrent();
+        try check(g.hipEventSynchronize(self.event), error.EventFailed);
+    }
+    pub fn query(self: *Event) Error!bool {
+        ensureCurrent();
+        return ready(g.hipEventQuery(self.event), error.EventFailed);
+    }
+    pub fn elapsedUs(start: *const Event, end: *const Event) Error!f32 {
+        ensureCurrent();
+        var ms: f32 = 0;
+        try check(g.hipEventElapsedTime(&ms, start.event, end.event), error.EventFailed);
+        return ms * 1000;
+    }
+    pub fn deinit(self: *Event) void {
+        if (!loaded or self.event == null) return;
+        ensureCurrent();
+        _ = g.hipEventDestroy(self.event);
         self.* = .{};
     }
 };
@@ -453,4 +620,31 @@ test "a successful call clears the last driver error" {
     try std.testing.expectError(error.LaunchFailed, check(101, error.LaunchFailed));
     try std.testing.expectEqual(@as(i64, 101), iface.last_driver_error.code);
     iface.recordDriverResult(.hip, 0);
+}
+
+test "the graph and event surface matches cuda.zig's, and handle-less deinit is a no-op" {
+    // No AMD device has run this file. What can be checked without one: every
+    // new declaration compiles, each signature is cuda.zig's with the backend
+    // types swapped, and a default-built handle never reaches the runtime.
+    const cuda = @import("cuda.zig");
+    inline for (.{
+        .{ Graph, cuda.Graph },           .{ GraphExec, cuda.GraphExec }, .{ Event, cuda.Event },
+        .{ Stream, cuda.Stream },         .{ Buffer, cuda.Buffer },       .{ Context, cuda.Context },
+    }) |pair| {
+        std.testing.refAllDecls(pair[0]);
+        inline for (.{ "instantiate", "launch", "update", "record", "synchronize", "query", "elapsedUs", "waitEvent", "beginCapture", "endCapture", "isCapturing", "copyFromAsync", "createStreamNonBlocking", "createEvent" }) |name| {
+            if (@hasDecl(pair[1], name)) try std.testing.expectEqual(
+                @typeInfo(@TypeOf(@field(pair[1], name))).@"fn".params.len,
+                @typeInfo(@TypeOf(@field(pair[0], name))).@"fn".params.len,
+            );
+        }
+    }
+    try std.testing.expect(CaptureMode == cuda.CaptureMode);
+    if (loaded) return;
+    var graph: Graph = .{};
+    graph.deinit();
+    var exec: GraphExec = .{};
+    exec.deinit();
+    var event: Event = .{};
+    event.deinit();
 }
