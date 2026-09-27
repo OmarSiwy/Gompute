@@ -1,16 +1,29 @@
 //! Device-only thread-index builtins for Zig 0.16.0.
+//!
+//! No atomics here: Zig's own `@atomicRmw`, `@atomicLoad` and `@atomicStore`
+//! on `addrspace(.global)` pointers lower correctly on both targets, with one
+//! hole. On NVPTX, LLVM 21 drops the ordering of every read-modify-write:
+//! `@atomicRmw(.., .acq_rel)`, `.seq_cst` and `@cmpxchgStrong` all emit a plain
+//! relaxed `atom.global.*` with no fence. Pair a relaxed RMW with an
+//! `@atomicLoad(.acquire)` / `@atomicStore(.release)` instead, which do lower
+//! to `ld.acquire.sys` / `st.release.sys` -- system scope, stronger than the
+//! `.gpu` a kernel needs, since Zig cannot name a sync scope. `build.zig` pins
+//! these lowerings against `tests/device_entries.zig`.
 
+const std = @import("std");
 const builtin = @import("builtin");
 
 extern fn @"llvm.amdgcn.workitem.id.x"() callconv(.c) u32;
 extern fn @"llvm.amdgcn.workgroup.id.x"() callconv(.c) u32;
 extern fn @"llvm.amdgcn.s.barrier"() callconv(.c) void;
+extern fn @"llvm.amdgcn.s.sleep"(u32) callconv(.c) void;
 
 extern fn @"llvm.nvvm.read.ptx.sreg.tid.x"() callconv(.c) u32;
 extern fn @"llvm.nvvm.read.ptx.sreg.ctaid.x"() callconv(.c) u32;
 extern fn @"llvm.nvvm.read.ptx.sreg.ntid.x"() callconv(.c) u32;
 extern fn @"llvm.nvvm.read.ptx.sreg.nctaid.x"() callconv(.c) u32;
 extern fn @"llvm.nvvm.barrier0"() callconv(.c) void;
+extern fn @"llvm.nvvm.nanosleep"(u32) callconv(.c) void;
 
 /// The flat thread index, `blockIdx.x * blockDim.x + threadIdx.x`.
 ///
@@ -107,3 +120,37 @@ pub inline fn barrier() void {
         else => @compileError("device barrier used on a non-GPU target"),
     }
 }
+
+/// Back off for a moment inside a spin loop, so a waiting thread stops
+/// competing for issue slots with the one it is waiting on. Purely a hint:
+/// correctness never depends on it, and a loop without it is still correct.
+///
+/// ponytail: fixed ~64 ns (`nanosleep 64`, `s_sleep 1` = 64 clocks). Take the
+/// duration as a parameter if a profile shows the backoff is wrong.
+///
+/// A no-op on NVPTX below PTX 6.3 or sm_70, where `nanosleep` does not exist.
+/// That includes the default `sm_70` target, which Zig pins to PTX 6.0.
+pub inline fn spinPause() void {
+    switch (builtin.cpu.arch) {
+        .nvptx64 => if (comptime has_nanosleep) @"llvm.nvvm.nanosleep"(64),
+        .amdgcn => @"llvm.amdgcn.s.sleep"(1),
+        else => @compileError("device spinPause used on a non-GPU target"),
+    }
+}
+
+/// LLVM's own rule for `nanosleep`: PTX 6.3 and sm_70. Zig's `ptxNN` and `sm_NN`
+/// features do not imply each other, so take the highest of each.
+const has_nanosleep = blk: {
+    if (builtin.cpu.arch != .nvptx64) break :blk false;
+    var ptx: u32 = 0;
+    var sm: u32 = 0;
+    for (@typeInfo(std.Target.nvptx.Feature).@"enum".fields) |f| {
+        if (!builtin.cpu.features.isEnabled(f.value)) continue;
+        const digits = std.mem.trimEnd(u8, f.name, "af"); // sm_90a, sm_100f
+        if (std.mem.startsWith(u8, digits, "ptx"))
+            ptx = @max(ptx, std.fmt.parseInt(u32, digits[3..], 10) catch 0);
+        if (std.mem.startsWith(u8, digits, "sm_"))
+            sm = @max(sm, std.fmt.parseInt(u32, digits[3..], 10) catch 0);
+    }
+    break :blk ptx >= 63 and sm >= 70;
+};

@@ -113,3 +113,17 @@ fn rawDouble(data: g.GlobalPtr(f32), len: u64) callconv(g.kernel_callconv) void 
 comptime {
     if (g.is_device) g.exportRaw("t_raw_double", &rawDouble);
 }
+
+// Pins the atomic lowerings `builtins.zig` documents; `build.zig` checks the
+// emitted PTX and gfx1100 ISA for them.
+fn rawAtomics(ticket: *addrspace(.global) u32, flag: *addrspace(.global) u32, out: g.GlobalPtr(u32)) callconv(g.kernel_callconv) void {
+    const t = @atomicRmw(u32, ticket, .Add, 1, .monotonic);
+    _ = @atomicRmw(u32, ticket, .Min, t, .monotonic);
+    while (@atomicLoad(u32, flag, .acquire) != t) g.builtins.spinPause();
+    out[t] = t;
+    @atomicStore(u32, flag, t + 1, .release);
+}
+
+comptime {
+    if (g.is_device) g.exportRaw("t_raw_atomics", &rawAtomics);
+}

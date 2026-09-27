@@ -130,7 +130,13 @@ thread in the block must reach that barrier, or NVIDIA hangs and AMD is
 undefined.
 `gridDimX()` exists on NVPTX only, since AMDGCN has no portable way to read it;
 pass the stride as a kernel argument instead, which is what the generated
-`reduce` kernels do. `g.builtins` is only present in the device compilation.
+`reduce` kernels do. `spinPause()` backs off inside a spin loop; it compiles to
+nothing on NVPTX targets below sm_70 with PTX 6.3. `g.builtins` is only present
+in the device compilation.
+
+For atomics, use Zig's `@atomicRmw`, `@atomicLoad` and `@atomicStore` on global
+pointers. One caveat: on NVPTX every read-modify-write runs relaxed, whatever
+ordering you pass. Order through an acquire load or a release store instead.
 
 If the kernel to launch is named by a config file rather than by your source,
 `g.rawKernelByName(.cuda, name, 0)` resolves it against the same compiled set

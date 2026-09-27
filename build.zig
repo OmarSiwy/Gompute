@@ -377,7 +377,14 @@ pub fn build(b: *std.Build) void {
         "-Wno-unused-command-line-argument",
     });
     probe_ptx.addFileArg(probe_ir);
-    _ = probe_ptx.addPrefixedOutputFileArg("-o", "gompute_probe.ptx");
+    const probe_ptx_out = probe_ptx.addPrefixedOutputFileArg("-o", "gompute_probe.ptx");
+    // The lowerings `src/device/builtins.zig` promises for `t_raw_atomics`.
+    const ptx_atomics = b.addCheckFile(probe_ptx_out, .{ .expected_matches = &.{
+        "atom.global.add.u32",
+        "atom.global.min.u32",
+        "ld.acquire.sys.global.b32",
+        "st.release.sys.global.b32",
+    } });
 
     // AMDGCN is the other half of the same claim, and it is cheaper to check:
     // one `addObject` lowers all the way to ISA with no alias to rewrite and no
@@ -402,7 +409,15 @@ pub fn build(b: *std.Build) void {
     });
     // `globalIdX(256)` in the probe must keep its wide-launch trap; a silent
     // `s_endpgm` in its place is the bug this pins.
-    const amd_trap = b.addCheckFile(device_probe_amd.getEmittedAsm(), .{ .expected_matches = &.{"s_trap 2"} });
+    // `t_raw_atomics` adds the acquire invalidate, the release wait and the
+    // spin pause.
+    const amd_trap = b.addCheckFile(device_probe_amd.getEmittedAsm(), .{ .expected_matches = &.{
+        "s_trap 2",
+        "atomic_add_u32",
+        "buffer_gl0_inv",
+        "s_waitcnt_vscnt null, 0x0",
+        "s_sleep 1",
+    } });
 
     const test_step = b.step("test", "Run Gompute unit tests");
     test_step.dependOn(&run_unit_tests.step);
@@ -411,6 +426,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_check_tests.step);
     test_step.dependOn(&run_codegen_check.step);
     test_step.dependOn(&probe_ptx.step);
+    test_step.dependOn(&ptx_atomics.step);
     test_step.dependOn(&device_probe_amd.step);
     test_step.dependOn(&amd_trap.step);
 
