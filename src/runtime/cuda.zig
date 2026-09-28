@@ -24,12 +24,14 @@ const CUDA_ERROR_NOT_READY: CUresult = 600;
 const CUDA_ERROR_GRAPH_EXEC_UPDATE_FAILURE: CUresult = 910;
 const CU_STREAM_NON_BLOCKING: c_uint = 1;
 const CU_EVENT_DISABLE_TIMING: c_uint = 2;
+const CU_DEVICE_ATTRIBUTE_SINGLE_TO_DOUBLE_PRECISION_PERF_RATIO: c_int = 87;
 
 const Api = struct {
     lib: std.DynLib,
     // Core
     cuInit: *const fn (c_uint) callconv(.c) CUresult,
     cuDeviceGet: *const fn (*CUdevice, c_int) callconv(.c) CUresult,
+    cuDeviceGetAttribute: *const fn (*c_int, c_int, CUdevice) callconv(.c) CUresult,
     cuDevicePrimaryCtxRetain: *const fn (*CUcontext, CUdevice) callconv(.c) CUresult,
     cuDevicePrimaryCtxRelease_v2: *const fn (CUdevice) callconv(.c) CUresult,
     cuCtxSetCurrent: *const fn (CUcontext) callconv(.c) CUresult,
@@ -376,6 +378,14 @@ pub const Context = struct {
     pub fn hasEvents(self: *const Context) bool {
         _ = self;
         return present(&event_fns);
+    }
+    /// How many times faster this device runs FP32 than FP64: 64 on an RTX 4060
+    /// (FP64 at 1/64 rate), 2 on an A100 or V100.
+    pub fn fp64Ratio(self: *Context) Error!u32 {
+        try self.makeCurrent();
+        var v: c_int = 0;
+        try check(g.cuDeviceGetAttribute(&v, CU_DEVICE_ATTRIBUTE_SINGLE_TO_DOUBLE_PRECISION_PERF_RATIO, self.device), error.InvalidArgument);
+        return @intCast(v);
     }
     /// Caller owns the returned Stream and must `deinit` it.
     pub fn createStream(self: *Context) Error!Stream {
@@ -931,4 +941,12 @@ test "a driver without graphs or events says so and still runs the rest" {
     defer buf.free();
     try buf.fillAsync(0, 4, &stream);
     try stream.synchronize();
+}
+
+test "fp64Ratio reports a real FP32:FP64 ratio" {
+    var ctx = Context.init(0) catch return error.SkipZigTest;
+    defer ctx.deinit();
+    const r = try ctx.fp64Ratio();
+    // Every NVIDIA part since Kepler is 2 (datacenter) up to 64 (consumer).
+    try std.testing.expect(r >= 2 and r <= 64);
 }

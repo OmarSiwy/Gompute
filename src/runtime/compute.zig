@@ -84,6 +84,16 @@ pub const Compute = struct {
         }
     }
 
+    /// How many times faster the device runs FP32 than FP64, e.g. 64 on an RTX
+    /// 4060. `error.Unsupported` on HIP (see `hip.Context.fp64Ratio`) and `.cpu`.
+    pub fn fp64Ratio(self: *Compute) Error!u32 {
+        return switch (self.backend) {
+            .cuda => self.cuda_ctx.fp64Ratio(),
+            .hip => self.hip_ctx.fp64Ratio(),
+            .cpu => error.Unsupported,
+        };
+    }
+
     /// Allocate device memory. Caller owns the returned Buffer and must
     /// `free` it. Returns `error.AllocFailed` on the `.cpu` backend, which has
     /// no device to allocate on.
@@ -290,6 +300,7 @@ test "the .cpu arm fails politely instead of pretending" {
     try std.testing.expectError(error.AllocFailed, c.alloc(16));
     try std.testing.expectError(error.ModuleLoadFailed, c.loadModule(""));
     try std.testing.expectError(error.InitFailed, c.createStream());
+    try std.testing.expectError(error.Unsupported, c.fp64Ratio());
 }
 
 test "Compute.init picks a backend and never fails" {

@@ -347,6 +347,17 @@ pub const Context = struct {
         _ = self;
         return present(&event_fns);
     }
+    /// See `cuda.Context.fp64Ratio`. Always `error.Unsupported` for now.
+    ///
+    /// ponytail: HIP has no stable way to ask. The CUDA-compat attribute is not
+    /// implemented on AMD, `hipDeviceAttribute_t` values moved between ROCm 5
+    /// and 6, and the gfx name lives in `hipDeviceProp_t`, whose layout moved
+    /// too (`hipGetDevicePropertiesR0600`). Map the gfx name to a ratio once
+    /// someone has a ROCm box to check the layout on.
+    pub fn fp64Ratio(self: *Context) Error!u32 {
+        _ = self;
+        return error.Unsupported;
+    }
     /// Caller owns the returned Stream and must `deinit` it.
     pub fn createStream(self: *Context) Error!Stream {
         try self.makeCurrent();
