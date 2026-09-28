@@ -1,14 +1,15 @@
 //! Device-only thread-index builtins for Zig 0.16.0.
 //!
-//! No atomics here: Zig's own `@atomicRmw`, `@atomicLoad` and `@atomicStore`
+//! Almost no atomics here: Zig's own `@atomicRmw`, `@atomicLoad` and `@atomicStore`
 //! on `addrspace(.global)` pointers lower correctly on both targets, with one
 //! hole. On NVPTX, LLVM 21 drops the ordering of every read-modify-write:
 //! `@atomicRmw(.., .acq_rel)`, `.seq_cst` and `@cmpxchgStrong` all emit a plain
 //! relaxed `atom.global.*` with no fence. Pair a relaxed RMW with an
 //! `@atomicLoad(.acquire)` / `@atomicStore(.release)` instead, which do lower
 //! to `ld.acquire.sys` / `st.release.sys` -- system scope, stronger than the
-//! `.gpu` a kernel needs, since Zig cannot name a sync scope. `build.zig` pins
-//! these lowerings against `tests/device_entries.zig`.
+//! `.gpu` a kernel needs, since Zig cannot name a sync scope --
+//! `loadAcquireDevice` / `storeReleaseDevice` below are the `.gpu` pair.
+//! `build.zig` pins these lowerings against `tests/device_entries.zig`.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -107,19 +108,52 @@ pub inline fn gridDimX() usize {
     };
 }
 
-/// Block-wide execution barrier plus a shared-memory fence: every thread in the
-/// block reaches it before any thread passes, and shared writes made before it
-/// are visible to the whole block after it.
+/// Block-wide execution barrier plus a block-scope memory fence: every thread in
+/// the block reaches it before any thread passes, and shared *and* global writes
+/// made before it are visible to the whole block after it -- `__syncthreads`.
 ///
 /// Must be reached by every thread in the block. Calling it inside a branch that
 /// only some threads take hangs the block on NVIDIA and is undefined on AMD.
+///
+/// NVPTX `bar.sync` orders memory by itself. AMDGCN `s_barrier` does not, so
+/// the fences HIP puts around it are spelled out; see `wg_fence`.
 pub inline fn barrier() void {
     switch (builtin.cpu.arch) {
         .nvptx64 => @"llvm.nvvm.barrier0"(),
-        .amdgcn => @"llvm.amdgcn.s.barrier"(),
+        .amdgcn => {
+            asm volatile (wg_fence.release ::: .{ .memory = true });
+            @"llvm.amdgcn.s.barrier"();
+            asm volatile (wg_fence.acquire ::: .{ .memory = true });
+        },
         else => @compileError("device barrier used on a non-GPU target"),
     }
 }
+
+/// What LLVM 21 emits for `fence syncscope("workgroup") release` / `acquire`
+/// -- the pair clang puts around `s_barrier` for `__syncthreads` -- per gfx
+/// family, in WGP mode, read off `clang -mcpu=gfx906/gfx90a/gfx1030/gfx1100/
+/// gfx1201`. Zig has no fence and cannot name a sync scope, so it is inline asm.
+/// gfx9 also waits `vmcnt` on release, which LLVM skips on gfx90a; harmless.
+///
+/// ponytail: tgsplit (gfx90a/gfx94x, off by default) spreads a workgroup over
+/// CUs and needs an L1 invalidate on acquire; refused rather than guessed.
+const wg_fence: struct { release: []const u8, acquire: []const u8 = "" } = if (builtin.cpu.arch != .amdgcn) .{ .release = "" } else blk: {
+    const has = struct {
+        fn f(comptime feature: std.Target.amdgcn.Feature) bool {
+            return builtin.cpu.features.isEnabled(@intFromEnum(feature));
+        }
+    }.f;
+    if (has(.tgsplit)) @compileError("barrier: tgsplit is not supported");
+    if (has(.gfx12_insts)) break :blk .{
+        .release = "s_wait_loadcnt 0x0\n\ts_wait_storecnt 0x0\n\ts_wait_dscnt 0x0",
+        .acquire = "global_inv scope:SCOPE_SE",
+    };
+    if (has(.gfx10_insts)) break :blk .{
+        .release = "s_waitcnt vmcnt(0) lgkmcnt(0)\n\ts_waitcnt_vscnt null, 0x0",
+        .acquire = "buffer_gl0_inv",
+    };
+    break :blk .{ .release = "s_waitcnt vmcnt(0) lgkmcnt(0)" };
+};
 
 /// Back off for a moment inside a spin loop, so a waiting thread stops
 /// competing for issue slots with the one it is waiting on. Purely a hint:
@@ -132,25 +166,54 @@ pub inline fn barrier() void {
 /// That includes the default `sm_70` target, which Zig pins to PTX 6.0.
 pub inline fn spinPause() void {
     switch (builtin.cpu.arch) {
-        .nvptx64 => if (comptime has_nanosleep) @"llvm.nvvm.nanosleep"(64),
+        .nvptx64 => if (comptime nv.ptx >= 63 and nv.sm >= 70) @"llvm.nvvm.nanosleep"(64),
         .amdgcn => @"llvm.amdgcn.s.sleep"(1),
         else => @compileError("device spinPause used on a non-GPU target"),
     }
 }
 
-/// LLVM's own rule for `nanosleep`: PTX 6.3 and sm_70. Zig's `ptxNN` and `sm_NN`
-/// features do not imply each other, so take the highest of each.
-const has_nanosleep = blk: {
-    if (builtin.cpu.arch != .nvptx64) break :blk false;
-    var ptx: u32 = 0;
-    var sm: u32 = 0;
+/// `@atomicLoad(.acquire)` at device (`.gpu` / agent) scope instead of Zig's
+/// `.sys`: the other half of a flag another block publishes with
+/// `storeReleaseDevice`. On NVPTX it skips the system-scope fence, which is the
+/// whole point (an LU publish/acquire refactor went from 7.1 to 3.7 ms).
+///
+/// ponytail: AMDGCN uses Zig's system-scope atomics. LLVM emits the same code
+/// for agent and system scope on gfx9, gfx10 and gfx11; only gfx90a, gfx94x
+/// and gfx12 pay extra (an L2 writeback/invalidate). Hand-written agent-scope
+/// asm for those when someone has one to test on. NVPTX below sm_70 has no
+/// `ld.acquire` and falls back the same way.
+pub inline fn loadAcquireDevice(p: *addrspace(.global) const u32) u32 {
+    if (builtin.cpu.arch == .nvptx64 and comptime nv.sm >= 70)
+        return asm volatile ("ld.acquire.gpu.global.u32 %[v], [%[p]];"
+            : [v] "=r" (-> u32),
+            : [p] "l" (@intFromPtr(p)),
+            : .{ .memory = true });
+    return @atomicLoad(u32, p, .acquire);
+}
+
+/// `@atomicStore(.release)` at device scope; see `loadAcquireDevice`.
+pub inline fn storeReleaseDevice(p: *addrspace(.global) u32, v: u32) void {
+    if (builtin.cpu.arch == .nvptx64 and comptime nv.sm >= 70)
+        return asm volatile ("st.release.gpu.global.u32 [%[p]], %[v];"
+            :
+            : [p] "l" (@intFromPtr(p)),
+              [v] "r" (v),
+            : .{ .memory = true });
+    @atomicStore(u32, p, v, .release);
+}
+
+/// The target's PTX ISA and SM versions, e.g. 60 and 70. Zig's `ptxNN` and
+/// `sm_NN` features do not imply each other, so take the highest of each.
+const nv = blk: {
+    var v: struct { ptx: u32 = 0, sm: u32 = 0 } = .{};
+    if (builtin.cpu.arch != .nvptx64) break :blk v;
     for (@typeInfo(std.Target.nvptx.Feature).@"enum".fields) |f| {
         if (!builtin.cpu.features.isEnabled(f.value)) continue;
         const digits = std.mem.trimEnd(u8, f.name, "af"); // sm_90a, sm_100f
         if (std.mem.startsWith(u8, digits, "ptx"))
-            ptx = @max(ptx, std.fmt.parseInt(u32, digits[3..], 10) catch 0);
+            v.ptx = @max(v.ptx, std.fmt.parseInt(u32, digits[3..], 10) catch 0);
         if (std.mem.startsWith(u8, digits, "sm_"))
-            sm = @max(sm, std.fmt.parseInt(u32, digits[3..], 10) catch 0);
+            v.sm = @max(v.sm, std.fmt.parseInt(u32, digits[3..], 10) catch 0);
     }
-    break :blk ptx >= 63 and sm >= 70;
+    break :blk v;
 };

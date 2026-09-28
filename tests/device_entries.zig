@@ -122,6 +122,8 @@ fn rawAtomics(ticket: *addrspace(.global) u32, flag: *addrspace(.global) u32, ou
     while (@atomicLoad(u32, flag, .acquire) != t) g.builtins.spinPause();
     out[t] = t;
     @atomicStore(u32, flag, t + 1, .release);
+    while (g.builtins.loadAcquireDevice(flag) != t + 1) g.builtins.spinPause();
+    g.builtins.storeReleaseDevice(flag, t + 2);
 }
 
 comptime {

@@ -384,6 +384,8 @@ pub fn build(b: *std.Build) void {
         "atom.global.min.u32",
         "ld.acquire.sys.global.b32",
         "st.release.sys.global.b32",
+        "ld.acquire.gpu.global.u32",
+        "st.release.gpu.global.u32",
     } });
 
     // AMDGCN is the other half of the same claim, and it is cheaper to check:
@@ -410,13 +412,16 @@ pub fn build(b: *std.Build) void {
     // `globalIdX(256)` in the probe must keep its wide-launch trap; a silent
     // `s_endpgm` in its place is the bug this pins.
     // `t_raw_atomics` adds the acquire invalidate, the release wait and the
-    // spin pause.
+    // spin pause. The last two are `barrier()` in `t_reduce`: `s_barrier` alone
+    // orders no memory, so it must sit between `__syncthreads`' fences.
     const amd_trap = b.addCheckFile(device_probe_amd.getEmittedAsm(), .{ .expected_matches = &.{
         "s_trap 2",
         "atomic_add_u32",
         "buffer_gl0_inv",
         "s_waitcnt_vscnt null, 0x0",
         "s_sleep 1",
+        "s_waitcnt_vscnt null, 0x0\n\t;;#ASMEND",
+        "s_barrier\n\t;;#ASMSTART\n\tbuffer_gl0_inv",
     } });
 
     const test_step = b.step("test", "Run Gompute unit tests");
