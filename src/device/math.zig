@@ -16,59 +16,50 @@
 //! a register no GPU exposes, so the idiom is dead weight on device and a hard
 //! error there. See `expm1` for the port and `atan` for the cheaper dodge.
 //!
-//! `exp exp2 log log2 log10 pow` are ports of ARM optimized-routines, ONE body
-//! each for host and device, f32 and f64 (only f32 `exp2` still uses hardware).
-//! Table-driven, branch-light, no libm and no f64 builtin beyond `+ - * /` and
-//! bit casts, so the same source survives NVPTX and AMDGCN unchanged.
+//! `exp exp2 log log2 log10 pow` are ports of ARM optimized-routines (what
+//! glibc >= 2.28 ships), f32 sin/cos follow musl's `sinf` in binary64, f32
+//! tanh/sinh/cosh/pow are binary64 arithmetic on the f64 exp/log2 rounded
+//! once, and f64 sin/cos/tanh/sinh/cosh/expm1 are musl's. Table-driven, no
+//! libm and no float builtin beyond `+ - * /`, `@sqrt` and bit casts.
 //!
-//! That is a correctness decision before it is a speed one. glibc >= 2.28 IS
-//! ARM optimized-routines for exactly these functions, and the simulators that
-//! consume this module are scored against ngspice, which links glibc. What Zig
-//! gives you instead — `@exp` and friends, and `extern "c" fn exp` too, since
-//! compiler_rt's static definition beats the shared libm — is musl: a
-//! DIFFERENT algorithm that disagrees with the reference in the low bits of
-//! every model evaluation. Porting moves the arithmetic toward the reference,
-//! not away from it. (Measured: compiler_rt's `log2` is ~23 ulp out on
-//! subnormals, where glibc's and this one are exact.)
+//! ONE body per function on every target: no FMA, no hardware approximation,
+//! no inline asm, no intrinsic. The same input gives the same bits on the
+//! host (with or without FMA hardware), NVPTX, AMDGCN and at comptime, which
+//! is what VerA's constant folding and ESPice's CPU/GPU comparison rely on;
+//! `examples/exhaustive` checks CUDA against the CPU bit for bit.
 //!
-//! Measured against the real glibc (dlsym'd past compiler_rt) at the bottom of
-//! this file, >=1e6 points each over the full domain including subnormals, the
-//! saturation thresholds and the near-1 window:
+//! Accuracy, as tested at the bottom of this file:
 //!
-//!   exp exp2 log log2 pow        <=1 ulp, f32 and f64
-//!   expf logf log2f log10f       <=1 ulp
-//!   log10 f64                    <=2 ulp against glibc, but 0.52 ulp against
-//!                                a 60-digit reference: the slack is glibc's,
-//!                                whose log10 is not optimized-routines.
+//!   f64 exp log pow              0.505 / 0.502 / 0.502 ulp vs an f128
+//!                                oracle; faithful, and monotone.
+//!   f64 exp2 log2 log10          <=1 / <=1 / <=2 ulp vs glibc (log10's
+//!                                slack is glibc's own).
+//!   f64 sin cos                  musl's bits, = compiler_rt's `@sin`/`@cos`.
+//!   f64 tanh sinh / cosh         musl's bits (2.05 / 1.75 ulp) / 0.998 ulp.
+//!   f32 everything               faithful over ALL 2^32 inputs: exp exp2
+//!                                tanh cosh 0.50, sin cos sinh 0.501, log
+//!                                log2 log10 <= 0.82 ulp.
 //!
-//! What is still hardware, and still not IEEE (measured on an RTX 4060 / sm_89
-//! over x in (0, 8], 1024 samples):
-//!
-//!   f32 exp2       `ex2.approx.f32` / `v_exp_f32`, <=1 ulp RELATIVE, kept.
-//!   f32/f64 sin cos  `sin.approx.f32` is ~1e-6 ABSOLUTE, so it has no
-//!                  relative accuracy near k*pi; f64 goes through the musl
-//!                  ports below, <=1.4 ulp. See `sin` and `remPio2`.
-//!
-//! Want IEEE-grade f32 for something not in the list? Compute in f64 and
-//! `@floatCast` — that path is software and correct, just slow (1/64 rate on
-//! consumer NVIDIA).
-//!
-//! Every entry point takes a scalar `f32`/`f64` or a `@Vector` of either. That
-//! is not decoration: the CPU backend instantiates a generic map body at
-//! `@Vector` width, so a kernel written the way the guide recommends hands
-//! these functions vectors. Only the builtins are elementwise (`sin`, `cos`,
-//! `tan`, `sqrt`, `rsqrt`, f32 `exp2`); the ported bodies run lane by lane.
-//! See `apply`.
+//! Every entry point takes a scalar `f32`/`f64` or a `@Vector` of either. The
+//! CPU backend instantiates a generic map body at `@Vector` width, so a kernel
+//! written the way the guide recommends hands these functions vectors. Real
+//! SIMD, lane for lane the scalar's bits: exp, exp2, log, log2, log10 and pow
+//! at f32 and f64, f32 sin/cos/tanh/sinh/cosh, sqrt and rsqrt. The vector form
+//! is the scalar's own width-generic main path (`expMain`, `logMain`, ...);
+//! a vector holding any special lane takes the scalar body lane by lane. f64
+//! sin/cos/tanh/sinh/cosh/expm1, log1p and atan still run lane by lane.
 //!
 //! Already safe everywhere and deliberately absent here: `@abs @trunc @round
 //! @floor @ceil @copysign @min @max`, `std.math.scalbn/frexp/modf`. `sqrt` and
 //! `rsqrt` ARE here despite being safe, so that a kernel need not keep two
 //! lists in its head — they are `@sqrt` with the argument checked.
 //!
-//! `@mulAdd` is NOT in that list. It is one instruction only where the target
-//! actually has an FMA; anywhere else it lowers to a `fma()` CALL into libm,
-//! which is slow on the host and a link error on device. Gate it on `fast_fma`
-//! below, never use it unconditionally.
+//! `@mulAdd` is NOT in that list, and nothing here uses it. Every body is the
+//! reference's no-FMA variant, so the bits are the same on every target: host
+//! with or without FMA hardware, NVPTX and AMDGCN. That bit-identity is the
+//! contract VerA's constant folding and ESPice's CPU/GPU comparison rely on.
+//! `@mulAdd` would also lower to a `fma()` libm CALL where there is no FMA,
+//! which is a link error on device.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -143,19 +134,23 @@ inline fn apply2(comptime f: anytype, x: anytype, y: @TypeOf(x)) @TypeOf(x) {
 /// `exp`/`expf`, which is what glibc >= 2.28 ships. See the note on `pow` for
 /// why matching the reference's arithmetic is worth more than the speed.
 pub inline fn exp(x: anytype) @TypeOf(x) {
-    if (Elem(@TypeOf(x)) == f32) return apply(softExpf, x);
-    return apply(softExp, x);
+    if (Elem(@TypeOf(x)) == f32) return if (comptime isVec(@TypeOf(x))) expfVec(x) else softExpf(x);
+    if (comptime isVec(@TypeOf(x))) return expVec(x, false);
+    return softExp(x);
 }
 
-/// 2^x, exact for integer x. Same table as `exp`, its own reduction.
-///
-/// ponytail: f32 stays on `@exp2`. `ex2.approx.f32`/`v_exp_f32` are RELATIVE
-/// error devices measured at <=1 ulp, so unlike log there is no hole to close,
-/// and one instruction beats ten f64 ops at 1/64 rate. Port `exp2f.c` if an
-/// f32 caller ever needs the last half ulp.
+/// 2^x, exact for integer x. Same table as `exp`, its own reduction. f32 is
+/// one rounding of the f64 body, so the bits are the same on every target --
+/// `@exp2` would be `ex2.approx.f32` on NVIDIA and something else elsewhere.
 pub inline fn exp2(x: anytype) @TypeOf(x) {
-    if (Elem(@TypeOf(x)) == f32) return @exp2(x); // elementwise on a vector
-    return apply(softExp2, x);
+    if (Elem(@TypeOf(x)) == f32) {
+        if (comptime !isVec(@TypeOf(x))) return viaF64(softExp2)(x);
+        // Widen, run the f64 vector path, round once: each lane is exactly
+        // the scalar's `viaF64`.
+        return @floatCast(expVec(@as(At(@TypeOf(x), f64), @floatCast(x)), true));
+    }
+    if (comptime isVec(@TypeOf(x))) return expVec(x, true);
+    return softExp2(x);
 }
 
 /// Natural log, <=1 ulp on host AND device from one body: ARM
@@ -166,16 +161,18 @@ pub inline fn exp2(x: anytype) @TypeOf(x) {
 /// not relatively — so log(x) for x near 1 was 2^-21 of noise on a near-zero
 /// answer, which is exactly where a SPICE junction sits.
 pub inline fn log(x: anytype) @TypeOf(x) {
-    if (Elem(@TypeOf(x)) == f32) return apply(softLnf, x);
-    return apply(softLog, x);
+    if (Elem(@TypeOf(x)) == f32) return if (comptime isVec(@TypeOf(x))) logfVec(x, .ln) else softLnf(x);
+    if (comptime isVec(@TypeOf(x))) return logVec(x, .ln);
+    return softLog(x);
 }
 
 /// Base-2 log, <=1 ulp on host AND device: ARM optimized-routines
 /// `log2`/`log2f`, with its own 64-entry table rather than `log * 1/ln2`.
 /// Powers of two come back exact, which the scaled form could not manage.
 pub inline fn log2(x: anytype) @TypeOf(x) {
-    if (Elem(@TypeOf(x)) == f32) return apply(softLog2f, x);
-    return apply(softLog2, x);
+    if (Elem(@TypeOf(x)) == f32) return if (comptime isVec(@TypeOf(x))) logfVec(x, .log2) else softLog2f(x);
+    if (comptime isVec(@TypeOf(x))) return logVec(x, .log2);
+    return softLog2(x);
 }
 
 /// Base-10 log.
@@ -191,96 +188,50 @@ pub inline fn log2(x: anytype) @TypeOf(x) {
 /// the bottom of this file). ponytail: the fix, if a caller ever needs it, is
 /// to have `softLog` hand back its hi/lo pair and scale THAT, not a new table.
 pub inline fn log10(x: anytype) @TypeOf(x) {
-    if (Elem(@TypeOf(x)) == f32) return apply(softLog10f, x);
-    return apply(softLog10, x);
+    if (Elem(@TypeOf(x)) == f32) return if (comptime isVec(@TypeOf(x))) logfVec(x, .log10) else softLog10f(x);
+    if (comptime isVec(@TypeOf(x))) return logVec(x, .log10);
+    return softLog10(x);
 }
 
-/// Measured sm_89 f32: ~1e-6 ABSOLUTE, which is <=29 ulp relative away from the
-/// zeros and unbounded at them — `sin.approx.f32`/`v_sin_f32` are absolute-error
-/// devices, and their own range reduction gives out for large |x|. f64 matched
-/// glibc bit-for-bit over (0,8]; see `remPio2` for its ceiling.
+/// musl's sin (via `softSin`), one body on every target; f32 is one rounding
+/// of it. Not `@sin`: that is compiler_rt on the host and `sin.approx.f32`
+/// (~1e-6 ABSOLUTE, no relative accuracy near k*pi) on NVIDIA, so the same
+/// kernel gave different bits per target.
 pub inline fn sin(x: anytype) @TypeOf(x) {
-    const E = Elem(@TypeOf(x));
-    if (!dev) return @sin(x); // elementwise on a vector
-    if (E == f32) return apply(hwSin, x);
+    if (Elem(@TypeOf(x)) == f32) return trigf(x, false);
     return apply(softSin, x);
 }
 
-/// Accuracy as `sin`.
+/// musl's cos, as `sin`.
 pub inline fn cos(x: anytype) @TypeOf(x) {
-    const E = Elem(@TypeOf(x));
-    if (!dev) return @cos(x); // elementwise on a vector
-    if (E == f32) return apply(hwCos, x);
+    if (Elem(@TypeOf(x)) == f32) return trigf(x, true);
     return apply(softCos, x);
 }
 
-/// ponytail: sin/cos, so error blows up near the poles where cos goes to zero
-/// (measured 0.16 absolute at x = 3pi/2 in f32). A dedicated tan with its own
-/// argument reduction is worth writing only if someone is actually near pi/2.
+/// ponytail: sin/cos, so error blows up near the poles where cos goes to zero.
+/// A dedicated tan with its own argument reduction is worth writing only if
+/// someone is actually near pi/2.
 pub inline fn tan(x: anytype) @TypeOf(x) {
     _ = Elem(@TypeOf(x));
     return sin(x) / cos(x); // both already handle a vector
 }
 
-/// Cephes rational below 0.625, else 1 - 2/(e^2|x| + 1).
-/// Measured sm_89: f32 <=1.8 ulp, f64 <=1 ulp.
+/// musl's tanh (std's `tanh64`), with expm1 the one-body `softExpm1`.
 pub inline fn tanh(x: anytype) @TypeOf(x) {
-    _ = Elem(@TypeOf(x));
-    return apply(tanhBody, x);
+    if (Elem(@TypeOf(x)) == f32) return hypf(x, .tanh);
+    return apply(softTanh, x);
 }
 
-inline fn tanhBody(x: anytype) @TypeOf(x) {
-    const T = @TypeOf(x);
-    if (!dev) return std.math.tanh(x);
-    const ax = @abs(x);
-    if (ax < 0.625) {
-        const z = x * x;
-        const p = ((@as(T, -9.64399179425052238628e-1) * z +
-            @as(T, -9.92877231001918586564e1)) * z + @as(T, -1.61468768441708447952e3)) * z;
-        const q = ((z + @as(T, 1.12811678491632931402e2)) * z +
-            @as(T, 2.23548839060100448583e3)) * z + @as(T, 4.84406305325125486048e3);
-        return x + x * (p / q);
-    }
-    // exp overflows to inf for large ax, which lands on exactly +-1. No branch.
-    const r = 1 - @as(T, 2) / (exp(2 * ax) + 1);
-    return if (x < 0) -r else r;
-}
-
-/// Taylor in x^2 below 0.5 (the (e^x - e^-x)/2 cancellation region), else the
-/// exponentials. Measured sm_89: f32 <=3.7 ulp, f64 <=1.4 ulp.
+/// musl's sinh (std's `sinh64`), with expm1 and exp the one-body ports.
 pub inline fn sinh(x: anytype) @TypeOf(x) {
-    _ = Elem(@TypeOf(x));
-    return apply(sinhBody, x);
+    if (Elem(@TypeOf(x)) == f32) return hypf(x, .sinh);
+    return apply(softSinh, x);
 }
 
-inline fn sinhBody(x: anytype) @TypeOf(x) {
-    const T = @TypeOf(x);
-    if (!dev) return std.math.sinh(x);
-    const ax = @abs(x);
-    if (ax < 0.5) {
-        const z = x * x;
-        return x * (1 + z * (@as(T, 1.0 / 6.0) + z * (@as(T, 1.0 / 120.0) +
-            z * (@as(T, 1.0 / 5040.0) + z * (@as(T, 1.0 / 362880.0) +
-                z * (@as(T, 1.0 / 39916800.0) + z * @as(T, 1.0 / 6227020800.0)))))));
-    }
-    const e = exp(ax);
-    const r = @as(T, 0.5) * e - @as(T, 0.5) / e;
-    return if (x < 0) -r else r;
-}
-
-/// ponytail: overflows to inf just under |x| = 710 (f64) instead of 710.48 —
-/// musl splits the exponential to buy those last ulps of range. Split it too if
-/// anything ever survives a cosh that large.
+/// musl's cosh (std's `cosh64`), as `sinh`.
 pub inline fn cosh(x: anytype) @TypeOf(x) {
-    _ = Elem(@TypeOf(x));
-    return apply(coshBody, x);
-}
-
-inline fn coshBody(x: anytype) @TypeOf(x) {
-    const T = @TypeOf(x);
-    if (!dev) return std.math.cosh(x);
-    const e = exp(@abs(x));
-    return @as(T, 0.5) * e + @as(T, 0.5) / e;
+    if (Elem(@TypeOf(x)) == f32) return hypf(x, .cosh);
+    return apply(softCosh, x);
 }
 
 /// e^x - 1, without the cancellation `exp(x) - 1` suffers near zero.
@@ -288,59 +239,148 @@ inline fn coshBody(x: anytype) @TypeOf(x) {
 /// Here because `std.math.expm1` DOES NOT COMPILE FOR AMDGCN. Its tiny-argument
 /// branch raises the underflow flag through `std.mem.doNotOptimizeAway`, which
 /// for a float lowers to `asm volatile ("" :: "rm" (v))`, and the AMDGPU backend
-/// cannot match the `m` alternative: `LLVM ERROR: Could not match memory
-/// address. Inline asm failure!`. NVPTX assembles the same source to PTX
-/// without complaint, so the hole is AMD-only and invisible on an NVIDIA box.
-///
-/// The body is std's own musl port with that one line dropped. The line only
-/// ever set an IEEE exception flag, and no GPU exposes one to read, so nothing
-/// on either target loses a value it could have observed — every return here is
-/// bit-identical to `std.math.expm1`.
-///
-/// ponytail: `log1p` is std's on both targets. Its port happens not to contain
-/// the idiom, so it compiles for AMDGCN today; bring it here if that changes.
-/// Upstream, the real fix is AMDGPU joining the carve-out list `doNotOptimizeAway`
-/// already keeps for LoongArch and stage2_c.
+/// cannot match the `m` alternative. The body is std's own musl port with that
+/// one line dropped, so every return is bit-identical to `std.math.expm1`.
 pub inline fn expm1(x: anytype) @TypeOf(x) {
-    if (Elem(@TypeOf(x)) == f32) return apply(expm1f, x);
+    if (Elem(@TypeOf(x)) == f32) return apply(viaF64(softExpm1), x);
     return apply(softExpm1, x);
 }
 
-/// f32 through the f64 body, per the module header: one rounding of a correctly
-/// rounded f64 result is itself correctly rounded, and it saves porting the
-/// second half of the reference.
-fn expm1f(x: f32) f32 {
-    return @floatCast(softExpm1(x));
+/// log(1 + x), std's musl port, which is plain f64 arithmetic and so already
+/// one body on every target. Here so callers have one module for all of it.
+pub inline fn log1p(x: anytype) @TypeOf(x) {
+    if (Elem(@TypeOf(x)) == f32) return apply(viaF64(log1pBody), x);
+    return apply(log1pBody, x);
 }
 
-/// arctangent.
-///
-/// Same AMDGCN hole as `expm1` — std's SCALAR atan raises the subnormal
-/// underflow flag through `doNotOptimizeAway` — but the fix is different,
-/// because `std.math.atan` carries a VECTOR path that never reaches it.
-///
-/// The two paths are not bit-identical: over 400k samples in [-200, 200] they
-/// disagree on 32% of inputs, by at most 2.22e-16 relative — one ulp, the
-/// ordinary gap between two polynomial approximations. The host therefore keeps
-/// the scalar body, so nothing already shipped moves.
+fn log1pBody(x: f64) f64 {
+    return std.math.log1p(x);
+}
+
+/// arctangent: `std.math.atan`'s VECTOR body on every target, scalars as a
+/// two-lane splat. std's scalar body raises the underflow flag through
+/// `doNotOptimizeAway`, which does not compile for AMDGCN; the vector body
+/// never reaches it. Two lanes because `@Vector(1, f64)` crashes the AMDGPU
+/// backend. Within an ulp of std's scalar atan.
 pub inline fn atan(x: anytype) @TypeOf(x) {
     _ = Elem(@TypeOf(x));
-    return apply(atanBody, x);
-}
-
-inline fn atanBody(x: anytype) @TypeOf(x) {
-    if (!dev) return std.math.atan(x);
-    // ponytail: TWO lanes, and the width is the whole point. `@Vector(1, f64)`
-    // does not merely fail to select — it SEGVs the AMDGPU backend, so one lane
-    // is not an option and two is the cheapest that is. The second result is
-    // discarded, so device `atan` costs twice what it should. No GPU-eligible
-    // device calls `atan` today; if one ever does, port std's `atanBinary64`
-    // and `atanBinary32` minus their `doNotOptimizeAway` line, the way
-    // `softExpm1` does. `tests/device_entries.zig` compiles this for AMDGCN, so
-    // if the backend's handling of narrow vectors shifts again, the build says
-    // so rather than a GPU silently returning the wrong angle.
+    if (comptime isVec(@TypeOf(x))) return std.math.atan(x);
     const v: @Vector(2, @TypeOf(x)) = @splat(x);
     return std.math.atan(v)[0];
+}
+
+/// f32 tanh, sinh and cosh: binary64 arithmetic on one f64 `exp`, rounded
+/// once. Branch-free -- both sides of each split are computed and selected --
+/// so the scalar and every vector width are this one function, and a vector
+/// gets `exp`'s SIMD path. Near 0 an odd series replaces the cancelling
+/// difference; its first dropped term is under 2^-30 relative, and the
+/// exponential side loses at most ~3 bits to cancellation, so the f32 result
+/// is faithful with ~25 bits to spare.
+inline fn hypf(x: anytype, comptime which: enum { tanh, sinh, cosh }) @TypeOf(x) {
+    const T = @TypeOf(x);
+    const D = At(T, f64);
+    const U = At(T, u64);
+    const xd: D = @floatCast(x);
+    const ax = @abs(xd);
+    const x2 = xd * xd;
+    const sign = @as(U, @bitCast(xd)) & sp(U, 1 << 63);
+    // Every NaN returns x itself, explicitly: NVPTX gave -inf for a
+    // negative-NaN sinh when the NaN was left to propagate through the
+    // arithmetic, and the bits must not depend on the backend.
+    const r: D = switch (which) {
+        .tanh => blk: {
+            const small = xd + xd * x2 * (sp(D, -1.0 / 3.0) + x2 * (sp(D, 2.0 / 15.0) + x2 * sp(D, -17.0 / 315.0)));
+            // tanh(10) rounds to 1 in f32; clamping keeps e finite.
+            const e = exp(sp(D, 2) * @min(ax, sp(D, 10)));
+            const big: D = @bitCast(@as(U, @bitCast((e - sp(D, 1)) / (e + sp(D, 1)))) | sign);
+            // @min drops a NaN, so put it back.
+            // The sign bit again so -0 stays -0: the series sums -0 and +0.
+            const near: D = @bitCast(@as(U, @bitCast(small)) | sign);
+            break :blk sel(xd != xd, xd, sel(ax < sp(D, 0.0625), near, big));
+        },
+        .sinh => blk: {
+            const small = xd + xd * x2 * (sp(D, 1.0 / 6.0) + x2 * (sp(D, 1.0 / 120.0) + x2 * sp(D, 1.0 / 5040.0)));
+            const e = exp(ax);
+            const big: D = @bitCast(@as(U, @bitCast(sp(D, 0.5) * e - sp(D, 0.5) / e)) | sign);
+            break :blk sel(xd != xd, xd, sel(ax < sp(D, 0.25), small, big));
+        },
+        .cosh => blk: {
+            const e = exp(ax);
+            break :blk sel(xd != xd, xd, sp(D, 0.5) * e + sp(D, 0.5) / e);
+        },
+    };
+    return @floatCast(r);
+}
+
+/// f32 sin or cos, musl's `sinf`/`cosf` design in binary64: n = round(x*2/pi),
+/// y = x - n*pi/2 in two parts (exact first product: pio2_1 has 25 bits and
+/// |n| < 2^28), then musl's double-precision `__sindf`/`__cosdf` polynomials,
+/// picked by the quadrant with a select. One rounding to f32 at the end.
+/// |x| >= 2^28*pi/2, inf and NaN take Payne-Hanek through `rem`, lane by lane.
+inline fn trigf(x: anytype, comptime is_cos: bool) @TypeOf(x) {
+    @setEvalBranchQuota(100_000);
+    const T = @TypeOf(x);
+    const D = At(T, f64);
+    const xd: D = @floatCast(x);
+    if (comptime !isVec(T)) {
+        if (!(@abs(xd) < 0x1p28 * 1.5707963267948966)) return @floatCast(trigfLarge(xd, is_cos));
+    } else if (!@reduce(.And, @abs(xd) < sp(D, 0x1p28 * 1.5707963267948966))) {
+        @branchHint(.unlikely);
+        return apply(if (is_cos) cosfLane else sinfLane, x);
+    }
+    const U = At(T, u64);
+    const shifted = xd * sp(D, 6.36619772367581382433e-01) + sp(D, 0x1.8p52); // round to nearest even
+    const n: U = @bitCast(shifted);
+    const nd = shifted - sp(D, 0x1.8p52);
+    const y = (xd - nd * sp(D, 1.57079631090164184570e+00)) - nd * sp(D, 1.58932547735281966916e-08);
+    return @floatCast(trigfQuadrant(D, U, y, n, is_cos));
+}
+
+/// sin(y) or cos(y) by the quadrant `n` (the low two bits), |y| <= ~pi/4.
+inline fn trigfQuadrant(comptime D: type, comptime U: type, y: D, n: U, comptime is_cos: bool) D {
+    const z = y * y;
+    const w = z * z;
+    // musl k_sinf.c: |sin(y)/y - s(y)| < 2^-37.5.
+    const s3 = sp(D, -0x1a00f9e2cae774.0p-65) + z * sp(D, 0x16cd878c3b46a7.0p-71);
+    const sz = z * y;
+    const sv = (y + sz * (sp(D, -0x15555554cbac77.0p-55) + z * sp(D, 0x111110896efbb2.0p-59))) + sz * w * s3;
+    // musl k_cosf.c: |cos(y) - c(y)| < 2^-34.1.
+    const c3 = sp(D, -0x16c087e80f1e27.0p-62) + z * sp(D, 0x199342e0ee5069.0p-68);
+    const cv = ((sp(D, 1.0) + z * sp(D, -0x1ffffffd0c5e81.0p-54)) + w * sp(D, 0x155553e1053a42.0p-57)) + (w * z) * c3;
+    // cos(x) = sin(x + pi/2): one more quarter turn.
+    const q = n +% sp(U, @intFromBool(is_cos));
+    const odd = q & sp(U, 1) != sp(U, 0);
+    const neg = q & sp(U, 2) != sp(U, 0);
+    const v = sel(odd, cv, sv);
+    return sel(neg, -v, v);
+}
+
+fn sinfLane(x: f32) f32 {
+    return trigf(x, false);
+}
+fn cosfLane(x: f32) f32 {
+    return trigf(x, true);
+}
+
+/// The scalar route for |x| >= 2^28*pi/2, inf and NaN.
+fn trigfLarge(xd: f64, comptime is_cos: bool) f64 {
+    var y: [2]f64 = undefined;
+    const n = rem.remPio2(xd, &y); // nan for inf/nan
+    return trigfQuadrant(f64, u64, y[0], @bitCast(@as(i64, n)), is_cos);
+}
+
+/// `c ? a : b` lane-wise, or the plain choice for a scalar.
+inline fn sel(c: anytype, a: anytype, b: @TypeOf(a)) @TypeOf(a) {
+    return if (comptime isVec(@TypeOf(a))) @select(ElemOf(@TypeOf(a)), c, a, b) else if (c) a else b;
+}
+
+/// An f64 body as an f32 one: widen, run, round once.
+fn viaF64(comptime f: fn (f64) f64) fn (f32) f32 {
+    return struct {
+        fn g(x: f32) f32 {
+            return @floatCast(f(x));
+        }
+    }.g;
 }
 
 /// x^y, <=0.52 ulp on host AND device, from one body.
@@ -368,16 +408,15 @@ inline fn atanBody(x: anytype) @TypeOf(x) {
 /// has to build for NVPTX/AMDGCN, where there is no libm at all; and one Zig
 /// body can later be inlined and vectorized where a libm call cannot.
 ///
-/// Two fast paths stay in front of it, because they beat it on their own
-/// inputs:
+/// One fast path stays in front of it: y == 0 or x == 1 is 1, as C99 says,
+/// even when the other operand is NaN.
 ///
-///   y == 0 or x == 1   C99 says 1 even when the other operand is NaN. One
-///           compare each, and it takes the commonest exits off the table path.
-///   integer |y| <= 64  square-and-multiply. `x*x` is a single correctly
-///           rounded multiply where the table route is 0.52 ulp, `**2`/`**3`
-///           are everywhere in device models, and matching what the naive
-///           expression computes is worth more there than the 0.02 ulp
-///           `softPow` would buy back on `**3` — at ~130 instructions less.
+/// Integer y goes through the table route like every other y. It used to take
+/// square-and-multiply for |y| <= 64, which is faster but rounds differently:
+/// pow stepped DOWN across y = -64 (a prover evaluating at interval ends
+/// relies on monotone pow), and six squarings are not faithful. The table
+/// route is faithful (0.50 ulp measured), so an exact x^y still comes back
+/// exact: pow(2, 10) is 1024.
 ///
 /// f32 goes through the f64 body: one algorithm, one test surface, and a
 /// single f32 rounding of a 0.52-ulp f64 result is correctly rounded. Nothing
@@ -386,28 +425,41 @@ inline fn atanBody(x: anytype) @TypeOf(x) {
 /// ponytail: if an f32 kernel ever wants a cheap pow, `exp2(y * log2 x)` on
 /// the f32 hardware path is the thing to bring back, for f32 only.
 pub inline fn pow(x: anytype, y: @TypeOf(x)) @TypeOf(x) {
-    _ = Elem(@TypeOf(x));
-    return apply2(powBody, x, y);
+    const T = @TypeOf(x);
+    if (Elem(T) == f32) return powf(x, y);
+    if (comptime !isVec(T)) return powBody(x, y);
+    return powVec(x, y);
+}
+
+/// f32 x^y: exp2(y * log2(x)) in binary64 for x positive and finite and y
+/// finite. f64 log2 and exp2 are faithful and |y*log2 x| < ~150 anywhere the
+/// f32 result is finite and non-zero, so the double result is good to ~2^-46
+/// relative and its one rounding to f32 is faithful -- correctly rounded but
+/// for inputs within 2^-46 of a midpoint, which no exact case is. Everything
+/// else (x <= 0, inf, NaN) goes the f64 `pow` way, so C99's table holds.
+inline fn powf(x: anytype, y: @TypeOf(x)) @TypeOf(x) {
+    @setEvalBranchQuota(100_000);
+    const T = @TypeOf(x);
+    const D = At(T, f64);
+    const xd: D = @floatCast(x);
+    const yd: D = @floatCast(y);
+    const inf = sp(D, std.math.inf(f64));
+    const ok = if (comptime isVec(T))
+        @reduce(.And, xd > sp(D, 0)) and @reduce(.And, xd < inf) and @reduce(.And, @abs(yd) < inf)
+    else
+        xd > 0 and xd < inf and @abs(yd) < inf;
+    if (ok) return @floatCast(exp2(yd * log2(xd)));
+    if (comptime !isVec(T)) return @floatCast(powBody(xd, yd));
+    return apply2(powfLane, x, y);
+}
+
+fn powfLane(x: f32, y: f32) f32 {
+    return powf(x, y);
 }
 
 inline fn powBody(x: anytype, y: @TypeOf(x)) @TypeOf(x) {
     const T = @TypeOf(x);
     if (y == 0 or x == 1) return 1;
-    if (y == @trunc(y) and @abs(y) <= 64) {
-        var n: u32 = @intFromFloat(@abs(y));
-        var base = x;
-        var acc: T = 1;
-        while (n != 0) : (n >>= 1) {
-            if (n & 1 != 0) acc *= base;
-            base *= base;
-        }
-        if (y > 0) return acc;
-        // `1/acc` is the answer only if acc neither overflowed nor underflowed
-        // on the way there: pow(1e160, -2) squares to inf and 1/inf = 0 throws
-        // away a perfectly representable subnormal. When it did, fall through —
-        // softPow scales in the exponent field and gets it right.
-        if (acc != 0 and !std.math.isInf(acc)) return 1 / acc;
-    }
     if (T == f32) return @floatCast(softPow(@floatCast(x), @floatCast(y)));
     return softPow(x, y);
 }
@@ -426,21 +478,6 @@ pub inline fn rsqrt(x: anytype) @TypeOf(x) {
     _ = Elem(T);
     const one: T = if (comptime isVec(T)) @splat(1) else 1;
     return one / @sqrt(x); // elementwise on a vector
-}
-
-// ---------------------------------------------------------------------------
-// f32 device primitives — hardware approximations. Only sin/cos still use
-// them; log2 lost its `lg2.approx.f` when `softLog2f` landed below.
-// ---------------------------------------------------------------------------
-
-extern fn @"llvm.nvvm.sin.approx.f"(f32) callconv(.c) f32;
-extern fn @"llvm.nvvm.cos.approx.f"(f32) callconv(.c) f32;
-
-inline fn hwSin(x: f32) f32 {
-    return if (arch == .nvptx64) @"llvm.nvvm.sin.approx.f"(x) else @sin(x);
-}
-inline fn hwCos(x: f32) f32 {
-    return if (arch == .nvptx64) @"llvm.nvvm.cos.approx.f"(x) else @cos(x);
 }
 
 /// 1/ln10, correctly rounded, for the f32 `log10` — ARM's `log10f` folds it
@@ -465,21 +502,208 @@ const l10lo = 0x1.49b9438ca9aaep-28;
 // ---------------------------------------------------------------------------
 
 const md = @import("math_data.zig");
-
-/// True where `@mulAdd(f64, ...)` is one instruction. Anywhere else it lowers
-/// to a `fma()` CALL into libm, which is both catastrophic for speed and a
-/// link error on device — so the reference's `#if __FP_FAST_FMA` split is a
-/// correctness gate here, not just a tuning knob. Both variants are ported.
-const fast_fma = switch (arch) {
-    .x86_64 => std.Target.x86.featureSetHas(builtin.cpu.features, .fma),
-    .aarch64, .aarch64_be => true,
-    .nvptx64, .amdgcn => true,
-    else => false,
-};
+const rem = @import("math_pio2.zig");
 
 /// Top 12 bits of a double: sign and biased exponent.
 inline fn top12(x: f64) u32 {
     return @truncate(@as(u64, @bitCast(x)) >> 52);
+}
+
+// ---------------------------------------------------------------------------
+// Width-generic arithmetic. `expMain` and `logMain` are the ordinary-input
+// halves of `exp` and `log`, written once for `f64` and `@Vector(n, f64)`.
+// The scalar bodies call them at width 1 and the vector entry points at width
+// n, so a vector lane is the scalar call's result bit for bit by construction,
+// not by a test that happens to pass. Special inputs never reach them: the
+// scalar body branches around them, the vector entry falls back to the scalar
+// body lane by lane when any lane is special.
+// ---------------------------------------------------------------------------
+
+/// `u64` for `f64`, `@Vector(n, u64)` for `@Vector(n, f64)`.
+fn Bits(comptime T: type) type {
+    return if (isVec(T)) @Vector(@typeInfo(T).vector.len, u64) else u64;
+}
+/// `i64` likewise.
+fn SBits(comptime T: type) type {
+    return if (isVec(T)) @Vector(@typeInfo(T).vector.len, i64) else i64;
+}
+/// `c` at `T`'s width.
+inline fn sp(comptime T: type, c: anytype) T {
+    return if (comptime isVec(T)) @splat(c) else c;
+}
+/// A shift amount at `U`'s width: Zig wants a vector of `u6` for a vector shift.
+inline fn shamt(comptime U: type, comptime n: comptime_int) At(U, std.math.Log2Int(ElemOf(U))) {
+    return sp(At(U, std.math.Log2Int(ElemOf(U))), n);
+}
+/// `E` at the width of `T`: itself for a scalar, `@Vector(n, E)` for n lanes.
+fn At(comptime T: type, comptime E: type) type {
+    return if (isVec(T)) @Vector(@typeInfo(T).vector.len, E) else E;
+}
+fn ElemOf(comptime T: type) type {
+    return if (isVec(T)) @typeInfo(T).vector.child else T;
+}
+/// `tab[idx]` for each lane, as one array of K columns. Each lane is one
+/// K-wide load of its row and the rows are transposed in registers: K loads
+/// for W lanes instead of K*W scalar loads, which was a third of vector `log`.
+inline fn gatherRows(comptime E: type, comptime K: usize, comptime tab: []const [K]E, idx: anytype) [K]if (isVec(@TypeOf(idx))) @Vector(@typeInfo(@TypeOf(idx)).vector.len, E) else E {
+    if (comptime !isVec(@TypeOf(idx))) return tab[@intCast(idx)];
+    const W = @typeInfo(@TypeOf(idx)).vector.len;
+    var cols: [K]@Vector(W, E) = undefined;
+    if (comptime W % 4 != 0 or (K != 2 and K != 4)) {
+        inline for (0..W) |l| {
+            const row: @Vector(K, E) = tab[@intCast(idx[l])];
+            inline for (0..K) |c| cols[c][l] = row[c];
+        }
+        return cols;
+    }
+    // Four lanes at a time: four whole-row loads, then an explicit transpose.
+    // Element-by-element assembly let LLVM split every row into scalar loads.
+    inline for (0..W / 4) |g| {
+        const r: [4]@Vector(K, E) = .{
+            tab[@intCast(idx[4 * g + 0])], tab[@intCast(idx[4 * g + 1])],
+            tab[@intCast(idx[4 * g + 2])], tab[@intCast(idx[4 * g + 3])],
+        };
+        const q: [K]@Vector(4, E) = if (K == 2) blk: {
+            // {r0, r1} and {r2, r3} side by side, then split even/odd.
+            const a = @shuffle(E, r[0], r[1], [4]i32{ 0, 1, -1, -2 });
+            const b = @shuffle(E, r[2], r[3], [4]i32{ 0, 1, -1, -2 });
+            break :blk .{
+                @shuffle(E, a, b, [4]i32{ 0, 2, -1, -3 }),
+                @shuffle(E, a, b, [4]i32{ 1, 3, -2, -4 }),
+            };
+        } else blk: {
+            // The AVX 4x4 transpose: unpack lo/hi pairs, then swap 128-bit halves.
+            const t0 = @shuffle(E, r[0], r[1], [4]i32{ 0, -1, 2, -3 });
+            const t1 = @shuffle(E, r[0], r[1], [4]i32{ 1, -2, 3, -4 });
+            const t2 = @shuffle(E, r[2], r[3], [4]i32{ 0, -1, 2, -3 });
+            const t3 = @shuffle(E, r[2], r[3], [4]i32{ 1, -2, 3, -4 });
+            break :blk .{
+                @shuffle(E, t0, t2, [4]i32{ 0, 1, -1, -2 }),
+                @shuffle(E, t1, t3, [4]i32{ 0, 1, -1, -2 }),
+                @shuffle(E, t0, t2, [4]i32{ 2, 3, -3, -4 }),
+                @shuffle(E, t1, t3, [4]i32{ 2, 3, -3, -4 }),
+            };
+        };
+        inline for (0..K) |c| inline for (0..4) |l| {
+            cols[c][4 * g + l] = q[c][l];
+        };
+    }
+    return cols;
+}
+
+/// The f32 tables as rows: `expf_tab` one entry wide, the two f32 log tables
+/// their (invc, logc) pairs.
+const expf_rows: *const [32][1]u64 = @ptrCast(&md.expf_tab);
+const logf_rows: *const [16][2]f64 = @ptrCast(&md.logf_tab);
+const log2f_rows: *const [16][2]f64 = @ptrCast(&md.log2f_tab);
+
+/// log2's two tables fused the same way.
+const log2_rows: [64][4]f64 align(32) = blk: {
+    var t: [64][4]f64 = undefined;
+    for (&t, md.log2_tab, md.log2_tab2) |*r, a, c| r.* = .{ a.invc, a.logc, c.chi, c.clo };
+    break :blk t;
+};
+
+/// `exp_tab` as the (tail, sbits) pairs `expMain` reads together.
+const exp_rows: *const [128][2]u64 = @ptrCast(&md.exp_tab);
+
+/// `log_tab` and `log_tab2` fused into the one row `logMain` reads:
+/// invc, logc, chi, clo. Built at comptime, so the data is unchanged.
+const log_rows: [128][4]f64 align(32) = blk: {
+    var t: [128][4]f64 = undefined;
+    for (&t, md.log_tab, md.log_tab2) |*r, a, c| r.* = .{ a.invc, a.logc, c.chi, c.clo };
+    break :blk t;
+};
+
+/// exp(x + xtail) ~= scale * (1 + tmp), scale = `sbits` as a double. The
+/// reduction exp(x) = 2^(k/128) * exp(r), r in [-ln2/256, ln2/256].
+inline fn expMain(comptime T: type, x: T, xtail: T, sign_bias: u64) struct { tmp: T, sbits: Bits(T), ki: Bits(T) } {
+    const U = Bits(T);
+    const z = sp(T, md.invln2N) * x;
+    const shifted = z + sp(T, md.shift); // forces the round-to-nearest-int
+    const ki: U = @bitCast(shifted);
+    const kd = shifted - sp(T, md.shift);
+    const r = x + kd * sp(T, md.negln2hiN) + kd * sp(T, md.negln2loN) + xtail;
+
+    const row = gatherRows(u64, 2, exp_rows, ki & sp(U, 127));
+    const top = (ki +% sp(U, sign_bias)) << shamt(U, 52 - 7);
+    const tail: T = @bitCast(row[0]);
+    const sbits = row[1] +% top; // valid while -1023*128 < k < 1024*128
+
+    const c = md.exp_poly;
+    const r2 = r * r;
+    const tmp = tail + r + r2 * (sp(T, c[0]) + r * sp(T, c[1])) + r2 * r2 * (sp(T, c[2]) + r * sp(T, c[3]));
+    return .{ .tmp = tmp, .sbits = sbits, .ki = ki };
+}
+
+/// log(x) as an unnormalized `hi + lo` for a positive, normal, finite x off
+/// the band around 1, where the table path applies.
+inline fn logMain(comptime T: type, ix: Bits(T)) struct { hi: T, lo: T } {
+    const U = Bits(T);
+    // x = 2^k z with z in [OFF, 2*OFF) exactly, z near c = 1/invc.
+    const tmp = ix -% sp(U, log_off);
+    const i = (tmp >> shamt(U, 52 - 7)) & sp(U, 127);
+    const k = @as(SBits(T), @bitCast(tmp)) >> shamt(U, 52); // arithmetic
+    const z: T = @bitCast(ix -% (tmp & sp(U, @as(u64, 0xfff) << 52)));
+
+    // r = z/c - 1, |r| < 1/256. Without an FMA the reference subtracts c as a
+    // double-double first, which is why `log_tab2` exists.
+    const row = gatherRows(f64, 4, &log_rows, i);
+    const r = (z - row[2] - row[3]) * row[0];
+
+    // hi + lo = r + log(c) + k*ln2, exactly -- that is what the table's
+    // rounding of logc buys.
+    const kd = kAsF64(T, k);
+    const w = kd * sp(T, md.log_ln2hi) + row[1];
+    const hi = w + r;
+    const t = w - hi + r + kd * sp(T, md.log_ln2lo);
+
+    const a = md.log_poly;
+    const r2 = r * r;
+    const lo = t + r2 * sp(T, a[0]) + r * r2 * (sp(T, a[1]) + r * sp(T, a[2]) + r2 * (sp(T, a[3]) + r * sp(T, a[4])));
+    return .{ .hi = hi, .lo = lo };
+}
+
+/// `exp` at vector width: one `expMain` over the whole vector when every lane
+/// is ordinary, which is the scalar body's own main path, so the lanes match it
+/// bit for bit. Any tiny, huge, inf or NaN lane sends the vector to the scalar
+/// body lane by lane.
+inline fn expVec(x: anytype, comptime two: bool) @TypeOf(x) {
+    @setEvalBranchQuota(100_000); // the lane unrolls at W = 16
+    const T = @TypeOf(x);
+    const U = Bits(T);
+    const abstop = (@as(U, @bitCast(x)) >> shamt(U, 52)) & sp(U, 0x7ff);
+    const tiny = comptime top12(0x1p-54);
+    if (!@reduce(.And, abstop -% sp(U, tiny) < sp(U, comptime top12(512.0) - tiny))) {
+        @branchHint(.unlikely);
+        return apply(if (two) softExp2 else softExp, x);
+    }
+    const m = if (two) exp2Main(T, x) else expMain(T, x, sp(T, 0.0), 0);
+    const scale: T = @bitCast(m.sbits);
+    return scale + scale * m.tmp;
+}
+
+/// `log` at vector width, by the same rule as `expVec`: the table path over
+/// the whole vector when every lane takes it, the scalar body otherwise.
+inline fn logVec(x: anytype, comptime which: enum { ln, log2, log10 }) @TypeOf(x) {
+    @setEvalBranchQuota(100_000); // the lane unrolls at W = 16
+    const T = @TypeOf(x);
+    const U = Bits(T);
+    const ix: U = @bitCast(x);
+    const lo_band, const hi_band = if (which == .log2) .{ log2_near1_lo, log2_near1_hi } else .{ log_near1_lo, log_near1_hi };
+    const normal = (ix >> shamt(U, 48)) -% sp(U, 0x0010) < sp(U, 0x7ff0 - 0x0010);
+    const near1 = ix -% sp(U, lo_band) < sp(U, hi_band - lo_band);
+    if (!@reduce(.And, normal) or @reduce(.Or, near1)) {
+        @branchHint(.unlikely);
+        return apply(switch (which) {
+            .ln => softLog,
+            .log2 => softLog2,
+            .log10 => softLog10,
+        }, x);
+    }
+    if (which == .log2) return log2Main(T, ix);
+    const p = logMain(T, ix);
+    return if (which == .ln) p.lo + p.hi else log10Tail(T, p.hi, p.lo);
 }
 
 /// 0 if not an integer, 1 if an odd integer, 2 if an even one. `iy` must be
@@ -504,56 +728,95 @@ const one_bits: u64 = 0x3ff0000000000000;
 /// log(x) as y + tail, carrying about 15 bits past the double. `ix` is x's bit
 /// pattern, already normalized out of the subnormal range by the caller.
 fn logInline(ix: u64, tail: *f64) f64 {
+    const l = powLogMain(f64, ix);
+    tail.* = l.tail;
+    return l.y;
+}
+
+/// `md.powlog_tab` as rows: invc, pad, logc, logctail -- already the 32 bytes
+/// one lane reads.
+const powlog_rows: *const [128][4]f64 = @ptrCast(&md.powlog_tab);
+
+/// pow's log(x) as `y + tail` to ~68 bits, at any width.
+inline fn powLogMain(comptime T: type, ix: Bits(T)) struct { y: T, tail: T } {
+    const U = Bits(T);
     // x = 2^k z with z in [OFF, 2*OFF) exactly; the range is cut into 128
     // subintervals and c sits near the centre of the one z lands in.
     const off: u64 = 0x3fe6955500000000;
-    const tmp = ix -% off;
-    const i: usize = @intCast((tmp >> (52 - 7)) & 127);
-    const k = @as(i64, @bitCast(tmp)) >> 52; // arithmetic
-    const iz = ix -% (tmp & (@as(u64, 0xfff) << 52));
-    const z: f64 = @bitCast(iz);
-    const kd: f64 = @floatFromInt(k);
+    const tmp = ix -% sp(U, off);
+    const i = (tmp >> shamt(U, 52 - 7)) & sp(U, 127);
+    const k = @as(SBits(T), @bitCast(tmp)) >> shamt(U, 52); // arithmetic
+    const iz = ix -% (tmp & sp(U, @as(u64, 0xfff) << 52));
+    const z: T = @bitCast(iz);
+    const kd = kAsF64(T, k);
 
-    const e = md.powlog_tab[i];
-    const invc = e.invc;
+    const row = gatherRows(f64, 4, powlog_rows, i);
+    const invc = row[0];
 
     // 1/c is j/128 or j/256 for integer j, and |z/c - 1| < 1/128, so
     // r = z/c - 1 is exactly representable. Without an FMA it takes a split of
-    // z into halves whose products are exact. Both are computed; the unused
-    // half of the pair is dead code the backend drops.
-    const zhi: f64 = @bitCast((iz +% (1 << 31)) & (~@as(u64, 0) << 32));
+    // z into halves whose products are exact.
+    const zhi: T = @bitCast((iz +% sp(U, 1 << 31)) & sp(U, ~@as(u64, 0) << 32));
     const zlo = z - zhi;
-    const rhi = zhi * invc - 1.0;
+    const rhi = zhi * invc - sp(T, 1.0);
     const rlo = zlo * invc;
-    const r = if (fast_fma) @mulAdd(f64, z, invc, -1.0) else rhi + rlo;
+    const r = rhi + rlo;
 
     // k*ln2 + log(c) + r, in double-double.
-    const t1 = kd * md.powlog_ln2hi + e.logc;
+    const t1 = kd * sp(T, md.powlog_ln2hi) + row[2];
     const t2 = t1 + r;
-    const lo1 = kd * md.powlog_ln2lo + e.logctail;
+    const lo1 = kd * sp(T, md.powlog_ln2lo) + row[3];
     const lo2 = t1 - t2 + r;
 
     // Ordered for a superscalar pipeline, not for readability.
     const a = md.powlog_poly;
-    const ar = a[0] * r; // a[0] = -0.5
+    const ar = sp(T, a[0]) * r; // a[0] = -0.5
     const ar2 = r * ar;
     const ar3 = r * ar2;
-    const hi, const lo3, const lo4 = if (fast_fma) blk: {
-        const hi = t2 + ar2;
-        break :blk .{ hi, @mulAdd(f64, ar, r, -ar2), t2 - hi + ar2 };
-    } else blk: {
-        const arhi = a[0] * rhi;
-        const arhi2 = rhi * arhi;
-        const hi = t2 + arhi2;
-        break :blk .{ hi, rlo * (ar + arhi), t2 - hi + arhi2 };
-    };
+    const arhi = sp(T, a[0]) * rhi;
+    const arhi2 = rhi * arhi;
+    const hi = t2 + arhi2;
+    const lo3 = rlo * (ar + arhi);
+    const lo4 = t2 - hi + arhi2;
     // p = log1p(r) - r - a[0]*r*r.
-    const p = ar3 * (a[1] + r * a[2] + ar2 * (a[3] + r * a[4] + ar2 * (a[5] + r * a[6])));
+    const p = ar3 * (sp(T, a[1]) + r * sp(T, a[2]) + ar2 * (sp(T, a[3]) + r * sp(T, a[4]) + ar2 * (sp(T, a[5]) + r * sp(T, a[6]))));
 
     const lo = lo1 + lo2 + lo3 + lo4 + p;
     const y = hi + lo;
-    tail.* = hi - y + lo;
-    return y;
+    return .{ .y = y, .tail = hi - y + lo };
+}
+
+/// f64 `pow` at vector width: log, the y split and exp over the whole vector
+/// when every lane is ordinary (x positive, normal and finite, |y| in the
+/// table range, y*log(x) inside exp's main range), which is softPow's own
+/// main path; the scalar body lane by lane otherwise.
+inline fn powVec(x: anytype, y: @TypeOf(x)) @TypeOf(x) {
+    @setEvalBranchQuota(100_000); // the lane unrolls at W = 16
+    const T = @TypeOf(x);
+    const U = Bits(T);
+    const ix: U = @bitCast(x);
+    const iy: U = @bitCast(y);
+    const topy = (iy >> shamt(U, 52)) & sp(U, 0x7ff);
+    const ok_x = (ix >> shamt(U, 52)) -% sp(U, 1) < sp(U, 0x7ff - 1);
+    const ok_y = topy -% sp(U, 0x3be) < sp(U, 0x43e - 0x3be);
+    if (@reduce(.And, ok_x) and @reduce(.And, ok_y)) {
+        const l = powLogMain(T, ix);
+        const mask27 = sp(U, ~@as(u64, 0) << 27);
+        const yhi: T = @bitCast(iy & mask27);
+        const ylo = y - yhi;
+        const lhi: T = @bitCast(@as(U, @bitCast(l.y)) & mask27);
+        const llo = l.y - lhi + l.tail;
+        const ehi = yhi * lhi;
+        const elo = ylo * lhi + y * llo; // |elo| < |ehi| * 2^-25
+        const abstop = (@as(U, @bitCast(ehi)) >> shamt(U, 52)) & sp(U, 0x7ff);
+        const tiny = comptime top12(0x1p-54);
+        if (@reduce(.And, abstop -% sp(U, tiny) < sp(U, comptime top12(512.0) - tiny))) {
+            const m = expMain(T, ehi, elo, 0);
+            const scale: T = @bitCast(m.sbits);
+            return scale + scale * m.tmp;
+        }
+    }
+    return apply2(powBody, x, y);
 }
 
 const sign_bias_bit: u32 = 0x800 << 7;
@@ -611,23 +874,10 @@ fn expInline(x: f64, xtail: f64, sign_bias: u32) f64 {
         abstop = 0; // large x: special-cased after the polynomial
     }
 
-    // exp(x) = 2^(k/128) * exp(r), r in [-ln2/256, ln2/256].
-    const z = md.invln2N * x;
-    const shifted = z + md.shift; // forces the round-to-nearest-int
-    const ki: u64 = @bitCast(shifted);
-    const kd = shifted - md.shift;
-    const r = x + kd * md.negln2hiN + kd * md.negln2loN + xtail;
-
-    const idx: usize = @intCast(2 * (ki & 127));
-    const top = (ki +% sign_bias) << (52 - 7);
-    const tail: f64 = @bitCast(md.exp_tab[idx]);
-    const sbits = md.exp_tab[idx + 1] +% top; // valid while -1023*128 < k < 1024*128
-
-    const c = md.exp_poly;
-    const r2 = r * r;
-    const tmp = tail + r + r2 * (c[0] + r * c[1]) + r2 * r2 * (c[2] + r * c[3]);
-    if (abstop == 0) return expSpecial(1009, tmp, sbits, ki);
-    const scale: f64 = @bitCast(sbits);
+    const m = expMain(f64, x, xtail, sign_bias);
+    if (abstop == 0) return expSpecial(1009, m.tmp, m.sbits, m.ki);
+    const scale: f64 = @bitCast(m.sbits);
+    const tmp = m.tmp;
     // tmp is 0 or |tmp| > 2^-200 and scale > 2^-739, so no spurious underflow.
     return scale + scale * tmp;
 }
@@ -683,16 +933,12 @@ fn softPow(x: f64, y: f64) f64 {
 
     var lo: f64 = undefined;
     const hi = logInline(ix, &lo);
-    const ehi, const elo = if (fast_fma) blk: {
-        const e = y * hi;
-        break :blk .{ e, y * lo + @mulAdd(f64, y, hi, -e) };
-    } else blk: {
-        const yhi: f64 = @bitCast(iy & (~@as(u64, 0) << 27));
-        const ylo = y - yhi;
-        const lhi: f64 = @bitCast(@as(u64, @bitCast(hi)) & (~@as(u64, 0) << 27));
-        const llo = hi - lhi + lo;
-        break :blk .{ yhi * lhi, ylo * lhi + y * llo }; // |elo| < |ehi| * 2^-25
-    };
+    const yhi: f64 = @bitCast(iy & (~@as(u64, 0) << 27));
+    const ylo = y - yhi;
+    const lhi: f64 = @bitCast(@as(u64, @bitCast(hi)) & (~@as(u64, 0) << 27));
+    const llo = hi - lhi + lo;
+    const ehi = yhi * lhi;
+    const elo = ylo * lhi + y * llo; // |elo| < |ehi| * 2^-25
     return expInline(ehi, elo, sign_bias);
 }
 
@@ -717,6 +963,74 @@ fn softExp(x: f64) f64 {
         if (abstop >= comptime top12(std.math.inf(f64))) return 1.0 + x; // nan, +inf
     }
     return expInline(x, 0, 0);
+}
+
+/// musl `tanh.c`, by way of std's `tanh64`, with `softExpm1` for expm1. The
+/// subnormal branch's `doNotOptimizeAway` only raised a flag and is dropped.
+fn softTanh(x: f64) f64 {
+    const u: u64 = @bitCast(x);
+    const ux = u & 0x7FFFFFFFFFFFFFFF;
+    const w: u32 = @intCast(ux >> 32);
+    const ax: f64 = @bitCast(ux);
+    var t: f64 = undefined;
+    if (w > 0x3FE193EA) { // |x| > log(3)/2 ~= 0.5493, or nan
+        if (w > 0x40340000) { // |x| > 20, or nan
+            t = 1.0 - 0 / ax;
+        } else {
+            t = softExpm1(2 * ax);
+            t = 1 - 2 / (t + 2);
+        }
+    } else if (w > 0x3FD058AE) { // |x| > log(5/3)/2 ~= 0.2554
+        t = softExpm1(2 * ax);
+        t = t / (t + 2);
+    } else if (w >= 0x00100000) { // |x| >= 0x1p-1022
+        t = softExpm1(-2 * ax);
+        t = -t / (t + 2);
+    } else t = ax; // subnormal
+    return if (u >> 63 != 0) -t else t;
+}
+
+/// musl `sinh.c` (std's `sinh64`), with the one-body expm1 and exp.
+fn softSinh(x: f64) f64 {
+    const u: u64 = @bitCast(x);
+    const w: u32 = @as(u32, @intCast(u >> 32)) & 0x7FFFFFFF;
+    const ax: f64 = @bitCast(u & 0x7FFFFFFFFFFFFFFF);
+    if (x == 0.0 or std.math.isNan(x)) return x;
+    const h: f64 = if (u >> 63 != 0) -0.5 else 0.5;
+    if (w < 0x40862E42) { // |x| < log(DBL_MAX)
+        const t = softExpm1(ax);
+        if (w < 0x3FF00000) {
+            if (w < 0x3FF00000 - (26 << 20)) return x;
+            return h * (2 * t - t * t / (t + 1));
+        }
+        return h * (t + t / (t + 1));
+    }
+    return 2 * h * expo2(ax);
+}
+
+/// musl `cosh.c` (std's `cosh64`), with the one-body expm1 and exp.
+fn softCosh(x: f64) f64 {
+    const u: u64 = @bitCast(x);
+    const w: u32 = @as(u32, @intCast(u >> 32)) & 0x7FFFFFFF;
+    const ax: f64 = @bitCast(u & 0x7FFFFFFFFFFFFFFF);
+    if (x == 0.0) return 1.0;
+    if (w < 0x3FE62E42) { // |x| < log(2)
+        if (w < 0x3FF00000 - (26 << 20)) return 1.0;
+        const t = softExpm1(ax);
+        return 1 + t * t / (2 * (1 + t));
+    }
+    if (w < 0x40862E42) { // |x| < log(DBL_MAX)
+        const t = softExp(ax);
+        return 0.5 * (t + 1 / t);
+    }
+    return expo2(ax);
+}
+
+/// exp(x)/2 without overflowing for x past log(DBL_MAX): musl `__expo2`.
+fn expo2(x: f64) f64 {
+    const kln2 = 0x1.62066151ADD8BP+10; // k = 2043
+    const scale: f64 = @bitCast(@as(u64, 0x3FF + 2043 / 2) << 52);
+    return softExp(x - kln2) * scale * scale;
 }
 
 /// e^x - 1 — musl `expm1.c`, by way of `std.math.expm1`, MINUS the one line
@@ -821,6 +1135,22 @@ fn softExpm1(x_: f64) f64 {
 /// 2^x. Not `softExp(x * ln2)`: reducing on k/N directly keeps integer x
 /// exact and leaves r in [-1/256, 1/256] with no rounding at all, where the
 /// scaled-argument route would spend a whole rounding on `x * ln2` first.
+/// 2^x = 2^(k/128) * 2^r with integer k and |r| <= 1/256, both exact; at
+/// any width, as `expMain`.
+inline fn exp2Main(comptime T: type, x: T) struct { tmp: T, sbits: Bits(T), ki: Bits(T) } {
+    const U = Bits(T);
+    const shifted = x + sp(T, md.exp2_shift);
+    const ki: U = @bitCast(shifted);
+    const r = x - (shifted - sp(T, md.exp2_shift));
+    const row = gatherRows(u64, 2, exp_rows, ki & sp(U, 127));
+    const tail: T = @bitCast(row[0]);
+    const sbits = row[1] +% (ki << shamt(U, 52 - 7));
+    const c = md.exp2_poly;
+    const r2 = r * r;
+    const tmp = tail + r * sp(T, c[0]) + r2 * (sp(T, c[1]) + r * sp(T, c[2])) + r2 * r2 * (sp(T, c[3]) + r * sp(T, c[4]));
+    return .{ .tmp = tmp, .sbits = sbits, .ki = ki };
+}
+
 fn softExp2(x: f64) f64 {
     const tiny_top = comptime top12(0x1p-54);
     const ix: u64 = @bitCast(x);
@@ -840,20 +1170,10 @@ fn softExp2(x: f64) f64 {
         if (2 *% ix > comptime 2 *% @as(u64, @bitCast(@as(f64, 928.0)))) abstop = 0;
     }
 
-    // 2^x = 2^(k/128) * 2^r with integer k and |r| <= 1/256, both exact.
-    const shifted = x + md.exp2_shift;
-    const ki: u64 = @bitCast(shifted);
-    const r = x - (shifted - md.exp2_shift);
-
-    const idx: usize = @intCast(2 * (ki & 127));
-    const tail: f64 = @bitCast(md.exp_tab[idx]);
-    const sbits = md.exp_tab[idx + 1] +% (ki << (52 - 7));
-
-    const c = md.exp2_poly;
-    const r2 = r * r;
-    const tmp = tail + r * c[0] + r2 * (c[1] + r * c[2]) + r2 * r2 * (c[3] + r * c[4]);
-    if (abstop == 0) return expSpecial(1, tmp, sbits, ki);
-    const scale: f64 = @bitCast(sbits);
+    const m = exp2Main(f64, x);
+    if (abstop == 0) return expSpecial(1, m.tmp, m.sbits, m.ki);
+    const scale: f64 = @bitCast(m.sbits);
+    const tmp = m.tmp;
     // tmp is 0 or |tmp| > 2^-65 and scale > 2^-928: no spurious underflow.
     return scale + scale * tmp;
 }
@@ -875,6 +1195,11 @@ fn softExp2(x: f64) f64 {
 /// subintervals. Note this is NOT pow's OFF — pow centres its split
 /// differently because it needs log(c) as a double-double.
 const log_off: u64 = 0x3fe6000000000000;
+
+/// The band around 1, [LO, HI) as bit patterns, where log switches from the
+/// table to a direct series in x - 1.
+const log_near1_lo: u64 = @bitCast(@as(f64, 1.0 - 0x1p-4));
+const log_near1_hi: u64 = @bitCast(@as(f64, 1.0 + 0x1.09p-4));
 
 /// Shared special-value prologue for the two f64 logs. Returns the value to
 /// return, or null with `ix` normalized out of the subnormals.
@@ -898,9 +1223,7 @@ inline fn logSpecial(x: f64, ix: *u64) ?f64 {
 inline fn logCore(x: f64, hi: *f64, lo: *f64) ?f64 {
     var ix: u64 = @bitCast(x);
 
-    const near1_lo = comptime @as(u64, @bitCast(@as(f64, 1.0 - 0x1p-4)));
-    const near1_hi = comptime @as(u64, @bitCast(@as(f64, 1.0 + 0x1.09p-4)));
-    if (ix -% near1_lo < near1_hi - near1_lo) {
+    if (ix -% log_near1_lo < log_near1_hi - log_near1_lo) {
         // |log x| < 2^-4, where log(c) + poly(r) would cancel: a 12th-order
         // log1p series in x - 1 instead. This is the branch a SPICE junction
         // lives in.
@@ -925,31 +1248,9 @@ inline fn logCore(x: f64, hi: *f64, lo: *f64) ?f64 {
         return null;
     }
     if (logSpecial(x, &ix)) |v| return v;
-
-    // x = 2^k z with z in [OFF, 2*OFF) exactly, z near c = 1/invc.
-    const tmp = ix -% log_off;
-    const i: usize = @intCast((tmp >> (52 - 7)) & 127);
-    const k = @as(i64, @bitCast(tmp)) >> 52; // arithmetic
-    const z: f64 = @bitCast(ix -% (tmp & (@as(u64, 0xfff) << 52)));
-    const e = md.log_tab[i];
-
-    // r = z/c - 1, |r| < 1/256. Without an FMA the reference subtracts c as a
-    // double-double first, which is why `log_tab2` exists.
-    const r = if (fast_fma)
-        @mulAdd(f64, z, e.invc, -1.0)
-    else
-        (z - md.log_tab2[i].chi - md.log_tab2[i].clo) * e.invc;
-
-    // hi + lo = r + log(c) + k*ln2, exactly — that is what the table's
-    // rounding of logc buys.
-    const kd: f64 = @floatFromInt(k);
-    const w = kd * md.log_ln2hi + e.logc;
-    hi.* = w + r;
-    const t = w - hi.* + r + kd * md.log_ln2lo;
-
-    const a = md.log_poly;
-    const r2 = r * r;
-    lo.* = t + r2 * a[0] + r * r2 * (a[1] + r * a[2] + r2 * (a[3] + r * a[4]));
+    const m = logMain(f64, ix);
+    hi.* = m.hi;
+    lo.* = m.lo;
     return null;
 }
 
@@ -963,8 +1264,7 @@ fn softLog(x: f64) f64 {
 /// log10(x) = (hi + lo)/ln10, with the leading product kept EXACT.
 ///
 /// `l10hi` carries 25 significant bits and a 27-bit Dekker split of `y` leaves
-/// 26, so `y1 * l10hi` fits in 51 bits: no rounding, no FMA, and no `fast_fma`
-/// branch. Everything after it is 2^-27 of the answer, so the only rounding
+/// 26, so `y1 * l10hi` fits in 51 bits: no rounding and no FMA. Everything after it is 2^-27 of the answer, so the only rounding
 /// that reaches the result is the final add.
 ///
 /// The Knuth two-sum first is not decoration. `logCore`'s pair is NOT
@@ -979,31 +1279,31 @@ fn softLog10(x: f64) f64 {
     var hi: f64 = undefined;
     var lo: f64 = undefined;
     if (logCore(x, &hi, &lo)) |v| return v;
+    return log10Tail(f64, hi, lo);
+}
+
+/// (hi + lo)/ln10 at any width; see `softLog10`.
+inline fn log10Tail(comptime T: type, hi: T, lo: T) T {
+    const U = Bits(T);
     const y = hi + lo;
     const b = y - hi;
     const yl = (hi - (y - b)) + (lo - b); // y + yl = hi + lo, exactly
-    const y1: f64 = @bitCast(@as(u64, @bitCast(y)) & (~@as(u64, 0) << 27));
+    const y1: T = @bitCast(@as(U, @bitCast(y)) & sp(U, ~@as(u64, 0) << 27));
     const y2 = y - y1;
-    return y1 * l10hi + (y2 * l10hi + (y * l10lo + yl * invln10));
+    return y1 * sp(T, l10hi) + (y2 * sp(T, l10hi) + (y * sp(T, l10lo) + yl * sp(T, invln10)));
 }
 
 fn softLog2(x: f64) f64 {
     var ix: u64 = @bitCast(x);
 
-    const near1_lo = comptime @as(u64, @bitCast(@as(f64, 1.0 - 0x1.5b51p-5)));
-    const near1_hi = comptime @as(u64, @bitCast(@as(f64, 1.0 + 0x1.6ab2p-5)));
-    if (ix -% near1_lo < near1_hi - near1_lo) {
+    if (ix -% log2_near1_lo < log2_near1_hi - log2_near1_lo) {
         if (ix == one_bits) return 0;
         const r = x - 1.0;
         // r/ln2 in double-double.
-        const h, const l = if (fast_fma) blk: {
-            const h = r * md.log2_invln2hi;
-            break :blk .{ h, r * md.log2_invln2lo + @mulAdd(f64, r, md.log2_invln2hi, -h) };
-        } else blk: {
-            const rhi: f64 = @bitCast(@as(u64, @bitCast(r)) & (~@as(u64, 0) << 32));
-            const rlo = r - rhi;
-            break :blk .{ rhi * md.log2_invln2hi, rlo * md.log2_invln2hi + r * md.log2_invln2lo };
-        };
+        const rhi: f64 = @bitCast(@as(u64, @bitCast(r)) & (~@as(u64, 0) << 32));
+        const rlo = r - rhi;
+        const h = rhi * md.log2_invln2hi;
+        const l = rlo * md.log2_invln2hi + r * md.log2_invln2lo;
         const r2 = r * r;
         const r4 = r2 * r2;
         const b = md.log2_poly1;
@@ -1016,38 +1316,50 @@ fn softLog2(x: f64) f64 {
     }
     if (logSpecial(x, &ix)) |v| return v;
 
-    // 64 subintervals here, not 128: log2's k folds in as an exact integer
-    // rather than through a k*ln2 double-double, so half the table reaches
-    // the same accuracy.
-    const tmp = ix -% log_off;
-    const i: usize = @intCast((tmp >> (52 - 6)) & 63);
-    const k = @as(i64, @bitCast(tmp)) >> 52;
-    const z: f64 = @bitCast(ix -% (tmp & (@as(u64, 0xfff) << 52)));
-    const e = md.log2_tab[i];
+    return log2Main(f64, ix);
+}
 
-    const r, const t1, const t2 = if (fast_fma) blk: {
-        const r = @mulAdd(f64, z, e.invc, -1.0);
-        const t1 = r * md.log2_invln2hi;
-        break :blk .{ r, t1, r * md.log2_invln2lo + @mulAdd(f64, r, md.log2_invln2hi, -t1) };
-    } else blk: {
-        const r = (z - md.log2_tab2[i].chi - md.log2_tab2[i].clo) * e.invc;
-        const rhi: f64 = @bitCast(@as(u64, @bitCast(r)) & (~@as(u64, 0) << 32));
-        const rlo = r - rhi;
-        break :blk .{ r, rhi * md.log2_invln2hi, rlo * md.log2_invln2hi + r * md.log2_invln2lo };
-    };
+/// log2's table path at any width, for x positive, normal, finite and off
+/// its band around 1. 64 subintervals here, not 128: log2's k folds in as an
+/// exact integer rather than through a k*ln2 double-double, so half the
+/// table reaches the same accuracy.
+inline fn log2Main(comptime T: type, ix: Bits(T)) T {
+    const U = Bits(T);
+    const tmp = ix -% sp(U, log_off);
+    const i = (tmp >> shamt(U, 52 - 6)) & sp(U, 63);
+    const k = @as(SBits(T), @bitCast(tmp)) >> shamt(U, 52);
+    const z: T = @bitCast(ix -% (tmp & sp(U, @as(u64, 0xfff) << 52)));
+    const row = gatherRows(f64, 4, &log2_rows, i);
+
+    const r = (z - row[2] - row[3]) * row[0];
+    const rhi: T = @bitCast(@as(U, @bitCast(r)) & sp(U, ~@as(u64, 0) << 32));
+    const rlo = r - rhi;
+    const t1 = rhi * sp(T, md.log2_invln2hi);
+    const t2 = rlo * sp(T, md.log2_invln2hi) + r * sp(T, md.log2_invln2lo);
 
     // hi + lo = r/ln2 + log2(c) + k, exactly: `k + logc` is why logc is
     // rounded so that 1024 + logc has no rounding error.
-    const t3 = @as(f64, @floatFromInt(k)) + e.logc;
+    const t3 = kAsF64(T, k) + row[1];
     const hi = t3 + t1;
     const lo = t3 - hi + t1 + t2;
 
     const a = md.log2_poly;
     const r2 = r * r;
     const r4 = r2 * r2;
-    const p = a[0] + r * a[1] + r2 * (a[2] + r * a[3]) + r4 * (a[4] + r * a[5]);
+    const p = sp(T, a[0]) + r * sp(T, a[1]) + r2 * (sp(T, a[2]) + r * sp(T, a[3])) + r4 * (sp(T, a[4]) + r * sp(T, a[5]));
     return lo + r2 * p + hi;
 }
+
+/// An exponent k (|k| < 2^51) as a double, exactly, by the magic-number trick:
+/// AVX2 has no i64 -> f64 vector convert, and `@floatFromInt` went lane by lane.
+inline fn kAsF64(comptime T: type, k: SBits(T)) T {
+    const magic = comptime @as(u64, @bitCast(@as(f64, 0x1.8p52)));
+    return @as(T, @bitCast(@as(Bits(T), @bitCast(k)) +% sp(Bits(T), magic))) - sp(T, 0x1.8p52);
+}
+
+/// log2's band around 1, where it switches to a series in x - 1.
+const log2_near1_lo: u64 = @bitCast(@as(f64, 1.0 - 0x1.5b51p-5));
+const log2_near1_hi: u64 = @bitCast(@as(f64, 1.0 + 0x1.6ab2p-5));
 
 // ---------------------------------------------------------------------------
 // f32 exp / log / log2 / log10 — ARM optimized-routines math/expf.c,
@@ -1079,17 +1391,37 @@ fn softExpf(x: f32) f32 {
         if (x < -0x1.9fe368p6) return 0; // < log(2^-150)
     }
 
-    // x*32/ln2 = k + r with integer k and |r| <= 1/2; the 32-entry table is
-    // every 4th entry of the f64 one.
-    const z = md.expf_invln2N * @as(f64, x);
-    const shifted = z + md.expf_shift;
-    const ki: u64 = @bitCast(shifted);
-    const r = z - (shifted - md.expf_shift);
+    return expfMain(f32, x);
+}
 
-    const s: f64 = @bitCast(md.expf_tab[@intCast(ki & 31)] +% (ki << (52 - 5)));
+/// expf's ordinary path, |x| < 88, at any width: in binary64, rounded once.
+/// x*32/ln2 = k + r with integer k and |r| <= 1/2; the 32-entry table is
+/// every 4th entry of the f64 one.
+inline fn expfMain(comptime T: type, x: T) T {
+    const D = At(T, f64);
+    const U = At(T, u64);
+    const z = sp(D, md.expf_invln2N) * @as(D, @floatCast(x));
+    const shifted = z + sp(D, md.expf_shift);
+    const ki: U = @bitCast(shifted);
+    const r = z - (shifted - sp(D, md.expf_shift));
+
+    const s: D = @bitCast(gatherRows(u64, 1, expf_rows, ki & sp(U, 31))[0] +% (ki << shamt(U, 52 - 5)));
     const c = md.expf_poly;
     const r2 = r * r;
-    return @floatCast(((c[0] * r + c[1]) * r2 + (c[2] * r + 1)) * s);
+    return @floatCast(((sp(D, c[0]) * r + sp(D, c[1])) * r2 + (sp(D, c[2]) * r + sp(D, 1))) * s);
+}
+
+/// f32 `exp` at vector width: `expfMain` over the whole vector when no lane
+/// is past 88 in magnitude, the scalar body lane by lane otherwise.
+inline fn expfVec(x: anytype) @TypeOf(x) {
+    @setEvalBranchQuota(100_000); // the lane unrolls at W = 16
+    const U = At(@TypeOf(x), u32);
+    const abstop = (@as(U, @bitCast(x)) >> shamt(U, 20)) & sp(U, 0x7ff);
+    if (!@reduce(.And, abstop < sp(U, comptime top12f(88.0) & 0x7ff))) {
+        @branchHint(.unlikely);
+        return apply(softExpf, x);
+    }
+    return expfMain(@TypeOf(x), x);
 }
 
 /// Everything ARM's logf.c and log2f.c do before their polynomials, which is
@@ -1121,15 +1453,57 @@ inline fn logfSplit(
         ix -%= 23 << 23;
     }
 
-    const tmp = ix -% 0x3f330000;
-    const i: usize = @intCast((tmp >> (23 - 4)) & 15);
-    const k = @as(i32, @bitCast(tmp)) >> 23; // arithmetic
-    const z: f64 = @as(f32, @bitCast(ix -% (tmp & 0xff800000)));
-    const e = tab[i];
-
-    r.* = z * e.invc - 1;
-    y0.* = e.logc + @as(f64, @floatFromInt(k)) * kscale;
+    const m = logfMain(f32, ix, @ptrCast(tab), kscale);
+    r.* = m.r;
+    y0.* = m.y0;
     return null;
+}
+
+/// logfSplit's ordinary path (x positive, normal, finite) at any width:
+/// x = 2^k z, r = z/c - 1 off a 16-entry table, y0 = log(c) + k*kscale.
+inline fn logfMain(comptime T: type, ix: At(T, u32), comptime tab: *const [16][2]f64, comptime kscale: f64) struct { r: At(T, f64), y0: At(T, f64) } {
+    const D = At(T, f64);
+    const U = At(T, u32);
+    const tmp = ix -% sp(U, 0x3f330000);
+    const i = (tmp >> shamt(U, 23 - 4)) & sp(U, 15);
+    const k = @as(At(T, i32), @bitCast(tmp)) >> shamt(U, 23); // arithmetic
+    const z: D = @floatCast(@as(T, @bitCast(ix -% (tmp & sp(U, 0xff800000)))));
+    const row = gatherRows(f64, 2, tab, i);
+    return .{
+        .r = z * row[0] - sp(D, 1),
+        .y0 = row[1] + @as(D, @floatFromInt(k)) * sp(D, kscale),
+    };
+}
+
+/// f32 log, log2 or log10 at vector width: the table path over the whole
+/// vector when every lane is positive, normal and finite, the scalar body
+/// lane by lane otherwise. x = 1 takes the table path too, and gives the +0
+/// the scalar's own early exit does.
+inline fn logfVec(x: anytype, comptime which: enum { ln, log2, log10 }) @TypeOf(x) {
+    @setEvalBranchQuota(100_000); // the lane unrolls at W = 16
+    const T = @TypeOf(x);
+    const D = At(T, f64);
+    const U = At(T, u32);
+    const ix: U = @bitCast(x);
+    if (!@reduce(.And, ix -% sp(U, 0x00800000) < sp(U, 0x7f800000 - 0x00800000))) {
+        @branchHint(.unlikely);
+        return apply(switch (which) {
+            .ln => softLnf,
+            .log2 => softLog2f,
+            .log10 => softLog10f,
+        }, x);
+    }
+    if (which == .log2) {
+        const m = logfMain(T, ix, log2f_rows, 1.0);
+        const a = md.log2f_poly;
+        const r2 = m.r * m.r;
+        return @floatCast((sp(D, a[0]) * r2 + (sp(D, a[1]) * m.r + sp(D, a[2]))) * r2 + (sp(D, a[3]) * m.r + m.y0));
+    }
+    const m = logfMain(T, ix, logf_rows, md.logf_ln2);
+    const a = md.logf_poly;
+    const r2 = m.r * m.r;
+    const y = (sp(D, a[0]) * r2 + (sp(D, a[1]) * m.r + sp(D, a[2]))) * r2 + (m.y0 + m.r);
+    return @floatCast(if (which == .ln) y else y * sp(D, invln10));
 }
 
 /// The two scales `softLogf` is ever called at. `apply` takes a one-argument
@@ -1169,20 +1543,11 @@ fn softLog2f(x: f32) f32 {
 }
 
 // ---------------------------------------------------------------------------
-// sin / cos — musl k_sin.c, k_cos.c, and the medium branch of __rem_pio2
+// sin / cos -- musl k_sin.c and k_cos.c here, __rem_pio2 (with Payne-Hanek
+// for large |x|) in math_pio2.zig
 // ---------------------------------------------------------------------------
 
 const pio4 = 0x1.921fb54442d18p-1;
-const pio2 = 0x1.921fb54442d18p+0;
-const invpio2 = 6.36619772367581382433e-01;
-const pio2_1 = 1.57079632673412561417e+00;
-const pio2_1t = 6.07710050650619224932e-11;
-const pio2_2 = 6.07710050630396597660e-11;
-const pio2_2t = 2.02226624879595063154e-21;
-const pio2_3 = 2.02226624871116645580e-21;
-const pio2_3t = 8.47842766036889956997e-32;
-const tau_hi = 6.28318530717958623200e+00;
-const tau_lo = 2.44929359829470635445e-16;
 
 const S1 = -1.66666666666666324348e-01;
 const S2 = 8.33333333332248946124e-03;
@@ -1218,64 +1583,12 @@ fn kernelCos(x: f64, y: f64) f64 {
     return w + (((1.0 - w) - hz) + (z * r - x * y));
 }
 
-/// x = y[0] + y[1] + n*(pi/2), with |y[0]| <= pi/4. Returns n.
-fn remPio2(x: f64, y: *[2]f64) i32 {
-    // ponytail: no Payne-Hanek. Past 2^20*(pi/2) ~= 1.6e6 rad the Cody-Waite
-    // splits stop being exact, so pre-reduce mod 2pi in double-double instead;
-    // phase accuracy then decays ~1 bit per octave. A source that needs exact
-    // phase beyond that wants musl's __rem_pio2_large table.
-    var xr = x;
-    if (@abs(xr) >= 0x1p20 * pio2) {
-        const q = @round(xr / (tau_hi + tau_lo));
-        xr = (xr - q * tau_hi) - q * tau_lo;
-    }
-
-    var q: f64 = @round(xr * invpio2);
-    var n: i32 = @intFromFloat(q);
-    var r = xr - q * pio2_1;
-    var w = q * pio2_1t; // 1st round, good to 85 bits
-    if (r - w < -pio4) {
-        n -= 1;
-        q -= 1;
-        r = xr - q * pio2_1;
-        w = q * pio2_1t;
-    } else if (r - w > pio4) {
-        n += 1;
-        q += 1;
-        r = xr - q * pio2_1;
-        w = q * pio2_1t;
-    }
-    y[0] = r - w;
-
-    const ex = expOf(xr);
-    if (ex - expOf(y[0]) > 16) { // 2nd round, good to 118 bits
-        const t = r;
-        w = q * pio2_2;
-        r = t - w;
-        w = q * pio2_2t - ((t - r) - w);
-        y[0] = r - w;
-        if (ex - expOf(y[0]) > 49) { // 3rd round, covers the rest
-            const t3 = r;
-            w = q * pio2_3;
-            r = t3 - w;
-            w = q * pio2_3t - ((t3 - r) - w);
-            y[0] = r - w;
-        }
-    }
-    y[1] = (r - y[0]) - w;
-    return n;
-}
-
-fn expOf(x: f64) i32 {
-    return @intCast(@as(u64, @bitCast(x)) >> 52 & 0x7ff);
-}
-
 fn softSin(x: f64) f64 {
     const ax = @abs(x);
     if (ax < pio4) return if (ax < 0x1p-27) x else kernelSin(x, 0.0, false);
     if (!std.math.isFinite(x)) return std.math.nan(f64);
     var y: [2]f64 = undefined;
-    const n = remPio2(x, &y);
+    const n = rem.remPio2(x, &y);
     return switch (@as(u32, @bitCast(n)) & 3) {
         0 => kernelSin(y[0], y[1], true),
         1 => kernelCos(y[0], y[1]),
@@ -1289,7 +1602,7 @@ fn softCos(x: f64) f64 {
     if (ax < pio4) return if (ax < 0x1p-27) 1.0 else kernelCos(x, 0.0);
     if (!std.math.isFinite(x)) return std.math.nan(f64);
     var y: [2]f64 = undefined;
-    const n = remPio2(x, &y);
+    const n = rem.remPio2(x, &y);
     return switch (@as(u32, @bitCast(n)) & 3) {
         0 => kernelCos(y[0], y[1]),
         1 => -kernelSin(y[0], y[1], true),
@@ -1342,7 +1655,7 @@ test "ported cores agree with the builtins" {
     for ([_]f64{ 1e-30, 0.5, 0.7071, 0.94, 1.0, 1.06, 1.5, 2.0, 1e6, 1e300 }) |x| {
         try std.testing.expect(ulp(softLog(x), @log(x)) <= 2);
         try std.testing.expect(ulp(softLog2(x), @log2(x)) <= 2);
-        try std.testing.expect(ulpErr(f32, softLogf(@floatCast(x), 1.0), @log(@as(f32, @floatCast(x)))) <= 2);
+        try std.testing.expect(ulpErr(f32, softLnf(@floatCast(x)), @log(@as(f32, @floatCast(x)))) <= 2);
         try std.testing.expect(ulpErr(f32, softLog2f(@floatCast(x)), @log2(@as(f32, @floatCast(x)))) <= 2);
     }
     // Every power of two exact, against the integer rather than a builtin,
@@ -1367,7 +1680,7 @@ test "ported cores agree with the builtins" {
     for ([_]f64{ 0, -0.0 }) |x| {
         try std.testing.expect(std.math.isNegativeInf(softLog(x)));
         try std.testing.expect(std.math.isNegativeInf(softLog2(x)));
-        try std.testing.expect(std.math.isNegativeInf(softLogf(@floatCast(x), 1.0)));
+        try std.testing.expect(std.math.isNegativeInf(softLnf(@floatCast(x))));
         try std.testing.expect(std.math.isNegativeInf(softLog2f(@floatCast(x))));
     }
     for ([_]f64{ -1, -0x1p-1074, -std.math.inf(f64), std.math.nan(f64) }) |x| {
@@ -1377,7 +1690,7 @@ test "ported cores agree with the builtins" {
     // -0x1p-1074 casts to -0.0 in f32, which is a -inf not a nan, so the f32
     // list is its own.
     for ([_]f32{ -1, -0x1p-149, -std.math.inf(f32), std.math.nan(f32) }) |x| {
-        try std.testing.expect(std.math.isNan(softLogf(x, 1.0)));
+        try std.testing.expect(std.math.isNan(softLnf(x)));
         try std.testing.expect(std.math.isNan(softLog2f(x)));
     }
     try std.testing.expectEqual(std.math.inf(f64), softLog(std.math.inf(f64)));
@@ -1392,8 +1705,12 @@ test "ported cores agree with the builtins" {
         try std.testing.expect(ulp(softSin(x), @sin(x)) <= 4);
         try std.testing.expect(ulp(softCos(x), @cos(x)) <= 4);
     }
-    // Past the Cody-Waite ceiling accuracy is only asserted loosely.
-    try std.testing.expectApproxEqAbs(@sin(1e9), softSin(1e9), 1e-6);
+    // Large arguments take Payne-Hanek, the same reduction as compiler_rt's
+    // `@sin`, so they agree bit for bit all the way up.
+    for ([_]f64{ 1e9, 0x1p20 * 1.5707963267948966, 1e22, 1e100, 1e300, -1e308, std.math.floatMax(f64) }) |x| {
+        try std.testing.expectEqual(@as(u64, @bitCast(@sin(x))), @as(u64, @bitCast(softSin(x))));
+        try std.testing.expectEqual(@as(u64, @bitCast(@cos(x))), @as(u64, @bitCast(softCos(x))));
+    }
 }
 
 test "expm1 is bit-identical to std, and atan is within an ulp" {
@@ -1660,7 +1977,7 @@ fn Diff(comptime T: type) type {
 
 test "exp, exp2, log, log2 and log10 match libm to 1 ulp" {
     if (dev or !builtin.link_libc) return error.SkipZigTest;
-    const c_exp = libm.real(Fn64, "exp") orelse return error.SkipZigTest;
+    if (libm.real(Fn64, "exp") == null) return error.SkipZigTest;
     const D = Diff(f64);
     var prng = std.Random.DefaultPrng.init(0x5EED_C0FFEE);
     const rnd = prng.random();
@@ -1717,21 +2034,12 @@ test "exp, exp2, log, log2 and log10 match libm to 1 ulp" {
         try d.specials(&edges, spec[3]);
         try d.report(spec[3]);
     }
-    _ = c_exp;
 }
 
 test "f32 exp, log, log2 and log10 match libm to 1 ulp" {
     if (dev or !builtin.link_libc) return error.SkipZigTest;
-    const c_expf = libm.real(Fn32, "expf") orelse return error.SkipZigTest;
+    if (libm.real(Fn32, "expf") == null) return error.SkipZigTest;
     const D = Diff(f32);
-    const wrap = struct {
-        fn logf_(x: f32) f32 {
-            return softLogf(x, 1.0);
-        }
-        fn log10f_(x: f32) f32 {
-            return softLogf(x, invln10);
-        }
-    };
 
     var prng = std.Random.DefaultPrng.init(0xF32_5EED);
     const rnd = prng.random();
@@ -1748,9 +2056,9 @@ test "f32 exp, log, log2 and log10 match libm to 1 ulp" {
     // negative half (nan for the logs, underflow for exp) all in proportion.
     inline for (.{
         .{ "expf", softExpf, "expf", false },
-        .{ "logf", wrap.logf_, "logf", true },
+        .{ "logf", softLnf, "logf", true },
         .{ "log2f", softLog2f, "log2f", true },
-        .{ "log10f", wrap.log10f_, "log10f", true },
+        .{ "log10f", softLog10f, "log10f", true },
     }) |spec| {
         const mine: *const fn (f32) f32 = spec[1];
         var d = D{ .name = spec[0], .mine = mine, .theirs = libm.real(Fn32, spec[2]).? };
@@ -1766,7 +2074,6 @@ test "f32 exp, log, log2 and log10 match libm to 1 ulp" {
         try d.specials(&edges, 1.0);
         try d.report(1.0);
     }
-    _ = c_expf;
 }
 
 test "pow matches libm to 1 ulp" {
@@ -1859,54 +2166,466 @@ test "pow matches libm to 1 ulp" {
     try std.testing.expect(worst <= 1.0);
 }
 
-test "tables keep the exactness the algorithms assume" {
+// The tables' exactness, checked at compile time on every target -- device
+// builds included -- rather than only by a host `zig build test`. One digit
+// wrong in a pasted table breaks these before it breaks an ulp bound.
+comptime {
+    @setEvalBranchQuota(20_000);
+    const need = struct {
+        fn f(ok: bool, comptime what: []const u8) void {
+            if (!ok) @compileError("math tables: " ++ what);
+        }
+    }.f;
     // pow: 1/c must have at most 8 fractional mantissa bits, or z/c - 1 is not
     // exactly representable and logInline's whole error budget is void.
     for (md.powlog_tab) |e| {
-        const m: u64 = @bitCast(e.invc);
-        try std.testing.expectEqual(@as(u64, 0), m & ((1 << 44) - 1));
+        need(@as(u64, @bitCast(e.invc)) & ((1 << 44) - 1) == 0, "powlog invc has more than 8 fraction bits");
         // logc is rounded to a multiple of 2^-43 so k*ln2hi + logc is exact.
-        try std.testing.expectEqual(e.logc, @trunc(e.logc * 0x1p43) * 0x1p-43);
+        need(e.logc == @trunc(e.logc * 0x1p43) * 0x1p-43, "powlog logc is not a multiple of 2^-43");
     }
     // ln2hi and negln2hiN have their low bits cleared for the same reason.
     // negln2hiN keeps 36 significant bits, so kd*negln2hiN is exact for every
     // |kd| < 2^17 = 131072 -- exactly the 1024*128 the exp reduction reaches.
-    try std.testing.expectEqual(@as(u64, 0), @as(u64, @bitCast(md.powlog_ln2hi)) & ((1 << 11) - 1));
-    try std.testing.expectEqual(@as(u64, 0), @as(u64, @bitCast(md.negln2hiN)) & ((1 << 17) - 1));
+    need(@as(u64, @bitCast(md.powlog_ln2hi)) & ((1 << 11) - 1) == 0, "ln2hi has low bits set");
+    need(@as(u64, @bitCast(md.negln2hiN)) & ((1 << 17) - 1) == 0, "negln2hiN has low bits set");
     // Entry 0 of the exp table is exactly 1.0 with a zero tail, and the f32
     // table is its every-4th-entry slice.
-    try std.testing.expectEqual(@as(u64, 0), md.exp_tab[0]);
-    try std.testing.expectEqual(one_bits, md.exp_tab[1]);
-    for (md.expf_tab, 0..) |t, i| try std.testing.expectEqual(md.exp_tab[8 * i + 1], t);
+    need(md.exp_tab[0] == 0 and md.exp_tab[1] == one_bits, "exp_tab[0] is not 1.0");
+    for (md.expf_tab, 0..) |t, i| need(md.exp_tab[8 * i + 1] == t, "expf_tab is not exp_tab's slice");
 
     // log: `k*ln2hi + logc` is error-free only because logc was rounded so
-    // that `0x1.8p9 + logc` is, and ln2hi's low 11 bits are clear. log2 wants
-    // `k + logc` error-free, hence 0x1.8p10 there. One digit wrong in either
-    // table breaks these before it breaks the ulp bound.
-    try std.testing.expectEqual(@as(u64, 0), @as(u64, @bitCast(md.log_ln2hi)) & ((1 << 11) - 1));
-    for (md.log_tab) |e| {
-        try std.testing.expectEqual(e.logc, (0x1.8p9 + e.logc) - 0x1.8p9);
-    }
-    for (md.log2_tab) |e| {
-        try std.testing.expectEqual(e.logc, (0x1.8p10 + e.logc) - 0x1.8p10);
-    }
+    // that `0x1.8p9 + logc` is. log2 wants `k + logc` error-free, hence 0x1.8p10.
+    for (md.log_tab) |e| need(e.logc == (0x1.8p9 + e.logc) - 0x1.8p9, "log_tab logc is not exact");
+    for (md.log2_tab) |e| need(e.logc == (0x1.8p10 + e.logc) - 0x1.8p10, "log2_tab logc is not exact");
     // The non-fma paths need chi + clo to reproduce c = 1/invc; chi alone is
     // the rounded c, so chi*invc must land within a rounding of 1.
-    for (md.log_tab, md.log_tab2) |e, c| {
-        try std.testing.expectApproxEqAbs(@as(f64, 1), (c.chi + c.clo) * e.invc, 0x1p-50);
-    }
-    for (md.log2_tab, md.log2_tab2) |e, c| {
-        try std.testing.expectApproxEqAbs(@as(f64, 1), (c.chi + c.clo) * e.invc, 0x1p-50);
-    }
+    for (md.log_tab, md.log_tab2) |e, c| need(@abs((c.chi + c.clo) * e.invc - 1) <= 0x1p-50, "log_tab2 does not invert log_tab");
+    for (md.log2_tab, md.log2_tab2) |e, c| need(@abs((c.chi + c.clo) * e.invc - 1) <= 0x1p-50, "log2_tab2 does not invert log2_tab");
     // Both f32 log tables split the same 16 subintervals, so they share invc
     // and differ only in the base of logc. Entry 9 is the one holding x = 1.
-    for (md.logf_tab, md.log2f_tab) |a, b| try std.testing.expectEqual(a.invc, b.invc);
-    try std.testing.expectEqual(@as(f64, 1), md.logf_tab[9].invc);
-    try std.testing.expectEqual(@as(f64, 0), md.logf_tab[9].logc);
-    try std.testing.expectEqual(@as(f64, 0), md.log2f_tab[9].logc);
+    for (md.logf_tab, md.log2f_tab) |a, b| need(a.invc == b.invc, "logf and log2f tables disagree on invc");
+    need(md.logf_tab[9].invc == 1 and md.logf_tab[9].logc == 0 and md.log2f_tab[9].logc == 0, "entry 9 does not hold x = 1");
 
     // l10hi keeps 25 significant bits so `y1 * l10hi` in softLog10 is exact,
     // and l10hi + l10lo is 1/ln10 to 2^-82.
-    try std.testing.expectEqual(@as(u64, 0), @as(u64, @bitCast(@as(f64, l10hi))) & ((1 << 28) - 1));
-    try std.testing.expectEqual(@as(f64, invln10), @as(f64, l10hi) + @as(f64, l10lo));
+    need(@as(u64, @bitCast(@as(f64, l10hi))) & ((1 << 28) - 1) == 0, "l10hi has more than 25 bits");
+    need(@as(f64, invln10) == @as(f64, l10hi) + @as(f64, l10lo), "l10hi + l10lo is not 1/ln10");
+}
+
+test "vector f64 exp, exp2, log, log2 and log10 are the scalar call, lane for lane" {
+    var prng = std.Random.DefaultPrng.init(0x1A4E_E4AC);
+    const rnd = prng.random();
+    const specials = [_]f64{ 0, -0.0, 1, -1, 0x1p-1074, 0x1p-1022, 0x1p-60, 709.78, 710, -745.2, -746, 1e308, std.math.inf(f64), -std.math.inf(f64), std.math.nan(f64), 1.0 + 0x1p-5, 1.0 - 0x1p-5 };
+    inline for (.{ 2, 4, 8 }) |w| {
+        const V = @Vector(w, f64);
+        for (0..50_000) |n| {
+            var xe: V = undefined;
+            var xl: V = undefined;
+            inline for (0..w) |l| {
+                // Mostly all-ordinary vectors (the vector path), every 8th with
+                // a special lane (the fallback), which must agree just the same.
+                xe[l] = (rnd.float(f64) - 0.5) * 1400;
+                xl[l] = @exp((rnd.float(f64) - 0.5) * 1400);
+                if (n % 8 == 0 and rnd.boolean()) {
+                    xe[l] = specials[rnd.uintLessThan(usize, specials.len)];
+                    xl[l] = specials[rnd.uintLessThan(usize, specials.len)];
+                }
+            }
+            const ye = exp(xe);
+            const y2 = exp2(xe);
+            const yl = log(xl);
+            const yl2 = log2(xl);
+            const yl10 = log10(xl);
+            inline for (0..w) |l| {
+                try std.testing.expectEqual(@as(u64, @bitCast(softExp(xe[l]))), @as(u64, @bitCast(ye[l])));
+                try std.testing.expectEqual(@as(u64, @bitCast(softExp2(xe[l]))), @as(u64, @bitCast(y2[l])));
+                try std.testing.expectEqual(@as(u64, @bitCast(softLog(xl[l]))), @as(u64, @bitCast(yl[l])));
+                try std.testing.expectEqual(@as(u64, @bitCast(softLog2(xl[l]))), @as(u64, @bitCast(yl2[l])));
+                try std.testing.expectEqual(@as(u64, @bitCast(softLog10(xl[l]))), @as(u64, @bitCast(yl10[l])));
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The contract VerA's constant folding and prover rely on, from VerA's own
+// harness (tools/contract.zig): faithful against an f128 oracle, comptime ==
+// runtime, C99 F.10 special and exact values, and monotone.
+// ---------------------------------------------------------------------------
+
+/// Measured-and-promised max error against the f128 oracle, per function.
+/// Faithful (< 1) is the contract; these are the tighter numbers we keep.
+pub const max_ulp = struct {
+    pub const exp: f64 = 0.52;
+    pub const log: f64 = 0.52;
+    pub const pow: f64 = 0.55;
+};
+
+const oracle = struct {
+    const ln2: f128 = 0x1.62e42fefa39ef35793c7673007e6p-1;
+    fn expQ(t: f128) f128 {
+        const k = @round(t / ln2);
+        const r = t - k * ln2;
+        var term: f128 = 1;
+        var sum: f128 = 1;
+        var n: f128 = 1;
+        while (n < 36) : (n += 1) {
+            term = term * r / n;
+            sum += term;
+        }
+        return std.math.ldexp(sum, @intFromFloat(k));
+    }
+    fn logQ(x: f64) f128 {
+        const fr = std.math.frexp(@as(f128, x));
+        var m = fr.significand;
+        var e: f128 = @floatFromInt(fr.exponent);
+        if (m < 0.70710678) {
+            m *= 2;
+            e -= 1;
+        }
+        const u = (m - 1) / (m + 1);
+        const uu = u * u;
+        var term = u;
+        var sum: f128 = 0;
+        var k: f128 = 1;
+        while (k < 100) : (k += 2) {
+            sum += term / k;
+            term *= uu;
+        }
+        return 2 * sum + e * ln2;
+    }
+    /// |got - ref| in ulps of the double nearest ref.
+    fn ulp(got: f64, ref: f128) f64 {
+        const rd: f64 = @floatCast(ref);
+        const e = @max(std.math.ilogb(rd) - 52, -1074);
+        return @floatCast(@abs(@as(f128, got) - ref) / std.math.ldexp(@as(f128, 1.0), e));
+    }
+};
+
+test "exp, log and pow stay inside max_ulp of an f128 oracle" {
+    if (dev) return error.SkipZigTest;
+    var prng = std.Random.DefaultPrng.init(0x7a11);
+    const r = prng.random();
+    var worst = [3]f64{ 0, 0, 0 };
+    for (0..20_000) |_| {
+        const x = r.float(f64) * 1440.0 - 735.0;
+        worst[0] = @max(worst[0], oracle.ulp(exp(x), oracle.expQ(x)));
+        const lx: f64 = @bitCast((r.int(u64) % 0x7fe0000000000000) + 0x0010000000000000);
+        worst[1] = @max(worst[1], oracle.ulp(log(lx), oracle.logQ(lx)));
+        const nx = 1.0 + (r.float(f64) - 0.5) * 0x1p-3; // log's band around 1
+        worst[1] = @max(worst[1], oracle.ulp(log(nx), oracle.logQ(nx)));
+        const px = std.math.pow(f64, 10.0, r.float(f64) * 15.0 - 3.0);
+        const py = r.float(f64) * 21.0 - 3.0;
+        worst[2] = @max(worst[2], oracle.ulp(pow(px, py), oracle.expQ(@as(f128, py) * oracle.logQ(px))));
+    }
+    std.debug.print("\n  f128 oracle: exp {d:.3}, log {d:.3}, pow {d:.3} ulp\n", .{ worst[0], worst[1], worst[2] });
+    try std.testing.expect(worst[0] < max_ulp.exp);
+    try std.testing.expect(worst[1] < max_ulp.log);
+    try std.testing.expect(worst[2] < max_ulp.pow);
+}
+
+test "exp, log and pow fold at comptime to the bits they run to" {
+    // No FMA and no target intrinsic in any body, so comptime IEEE f64 is the
+    // same arithmetic every backend runs.
+    const S = struct {
+        fn rt(x: f64) f64 {
+            var v = x;
+            std.mem.doNotOptimizeAway(&v);
+            return v;
+        }
+    };
+    const xs = [_]f64{ -744.9, -700.25, -20.5, -0.75, -1e-9, 0.0, 3e-17, 0.693, 1.0, 22.0, 512.5, 709.7 };
+    const ls = [_]f64{ 0x1p-1060, 1e-300, 1e-9, 0.5, 0.999999, 1.0, 1.0000001, 3.0, 1e18, 1e308 };
+    inline for (xs) |x| {
+        const folded = comptime blk: {
+            @setEvalBranchQuota(1_000_000);
+            break :blk exp(x);
+        };
+        try std.testing.expectEqual(@as(u64, @bitCast(folded)), @as(u64, @bitCast(exp(S.rt(x)))));
+    }
+    inline for (ls) |x| {
+        const fl, const fp = comptime blk: {
+            @setEvalBranchQuota(1_000_000);
+            break :blk .{ log(x), pow(x, 1.4552480184709202) };
+        };
+        try std.testing.expectEqual(@as(u64, @bitCast(fl)), @as(u64, @bitCast(log(S.rt(x)))));
+        try std.testing.expectEqual(@as(u64, @bitCast(fp)), @as(u64, @bitCast(pow(S.rt(x), 1.4552480184709202))));
+    }
+}
+
+test "exp, log and pow: C99 F.10 special values and exact cases" {
+    const inf = std.math.inf(f64);
+    const nan = std.math.nan(f64);
+    try std.testing.expectEqual(@as(f64, 1), exp(@as(f64, 0)));
+    try std.testing.expectEqual(@as(f64, 1), exp(@as(f64, -0.0)));
+    try std.testing.expectEqual(inf, exp(inf));
+    try std.testing.expectEqual(@as(u64, 0), @as(u64, @bitCast(exp(-inf))));
+    try std.testing.expect(std.math.isNan(exp(nan)));
+    try std.testing.expectEqual(@as(f64, 0x1p-1074), exp(@as(f64, -0x1.74910d52d3051p9)));
+    try std.testing.expectEqual(@as(f64, 0), exp(@as(f64, -0x1.74910d52d3052p9)));
+    try std.testing.expect(exp(@as(f64, 0x1.62e42fefa39efp9)) < inf);
+    try std.testing.expectEqual(inf, exp(@as(f64, 0x1.62e42fefa39f0p9)));
+    try std.testing.expectEqual(std.math.e, exp(@as(f64, 1)));
+
+    try std.testing.expectEqual(@as(u64, 0), @as(u64, @bitCast(log(@as(f64, 1))))); // +0
+    try std.testing.expectEqual(-inf, log(@as(f64, 0)));
+    try std.testing.expectEqual(-inf, log(@as(f64, -0.0)));
+    try std.testing.expectEqual(inf, log(inf));
+    try std.testing.expect(std.math.isNan(log(@as(f64, -1))));
+    try std.testing.expect(std.math.isNan(log(nan)));
+
+    try std.testing.expectEqual(@as(f64, 1), pow(@as(f64, -3), 0));
+    try std.testing.expectEqual(@as(f64, 1), pow(@as(f64, 1), nan));
+    try std.testing.expectEqual(@as(f64, 1024), pow(@as(f64, 2), 10));
+    try std.testing.expectEqual(@as(f64, -8), pow(@as(f64, -2), 3));
+    try std.testing.expectEqual(@as(f64, 0.0625), pow(@as(f64, -2), -4));
+    try std.testing.expectEqual(@as(f64, 2), pow(@as(f64, 4), 0.5));
+    try std.testing.expectEqual(@as(f64, 0.1), pow(@as(f64, 0.1), 1));
+    try std.testing.expect(std.math.isNan(pow(@as(f64, -2), 0.5)));
+    try std.testing.expectEqual(inf, pow(@as(f64, 0), -1));
+    try std.testing.expectEqual(-inf, pow(@as(f64, -0.0), -1));
+    try std.testing.expectEqual(@as(u64, 1 << 63), @as(u64, @bitCast(pow(@as(f64, -0.0), 3))));
+    try std.testing.expectEqual(@as(f64, 0), pow(@as(f64, 0.5), inf));
+    try std.testing.expectEqual(inf, pow(@as(f64, 2), inf));
+    try std.testing.expectEqual(inf, pow(@as(f64, 10), 400));
+    try std.testing.expectEqual(@as(f64, 0), pow(@as(f64, 10), -400));
+}
+
+/// f(x) <= f(next(x)) for `n` adjacent-ulp steps either side of `x0`.
+fn nonDecreasingAround(comptime f: fn (f64) f64, x0: f64, n: usize) !void {
+    var x = x0;
+    for (0..n) |_| x = std.math.nextAfter(f64, x, -std.math.inf(f64));
+    var prev = f(x);
+    for (0..2 * n) |_| {
+        x = std.math.nextAfter(f64, x, std.math.inf(f64));
+        const y = f(x);
+        if (std.math.isNan(y) or std.math.isNan(prev)) {
+            prev = y;
+            continue;
+        }
+        if (y < prev) {
+            std.debug.print("not monotone at {e}: {e} after {e}\n", .{ x, y, prev });
+            return error.NotMonotone;
+        }
+        prev = y;
+    }
+}
+
+test "exp, log, pow, expm1, log1p and sinh are monotone across every table seam and branch" {
+    if (dev) return error.SkipZigTest;
+    const F = struct {
+        fn e(x: f64) f64 {
+            return exp(x);
+        }
+        fn l(x: f64) f64 {
+            return log(x);
+        }
+        fn m1(x: f64) f64 {
+            return expm1(x);
+        }
+        fn sh(x: f64) f64 {
+            return sinh(x);
+        }
+        fn l1p(x: f64) f64 {
+            return log1p(x);
+        }
+        var py: f64 = 0;
+        var px: f64 = 0;
+        fn powX(x: f64) f64 {
+            return pow(x, py);
+        }
+        fn powY(y: f64) f64 {
+            return pow(px, y);
+        }
+    };
+    // exp: every k/128 rounding seam over the whole range, plus the branch
+    // edges (2^-54, 512, the overflow and underflow ends).
+    var j: f64 = -1075 * 128;
+    while (j < 1024 * 128) : (j += 37) try nonDecreasingAround(F.e, (j + 0.5) / md.invln2N, 3);
+    for ([_]f64{ 0x1p-54, -0x1p-54, 512, -512, 709.78, -708.4, -745.13, 0 }) |b| try nonDecreasingAround(F.e, b, 64);
+    // log: every table subinterval edge in a few binades, both band edges,
+    // and powers of two.
+    for ([_]i32{ -1022, -300, -1, 0, 1, 300, 1023 }) |e2| {
+        for (0..128) |i| {
+            const bits = (log_off + (@as(u64, i) << 45)) & 0x000fffffffffffff | (@as(u64, @intCast(1023 + e2)) << 52);
+            try nonDecreasingAround(F.l, @bitCast(bits), 3);
+        }
+        try nonDecreasingAround(F.l, std.math.ldexp(@as(f64, 1), e2), 32);
+    }
+    for ([_]f64{ 1.0 - 0x1p-4, 1.0 + 0x1.09p-4, 1, 0x1p-1022 }) |b| try nonDecreasingAround(F.l, b, 64);
+    // expm1 and sinh at their reduction and branch edges.
+    for ([_]f64{ 0, 0x1p-54, -0x1p-54, 0.3465, -0.3465, 1.0397, -1.0397, 38.8, -38.8, 709.78 }) |b| try nonDecreasingAround(F.m1, b, 32);
+    for ([_]f64{ 0, 0.5, -0.5, 22, -22, 709.78 }) |b| try nonDecreasingAround(F.sh, b, 32);
+    // log1p: musl switches at sqrt(2)/2-1, sqrt(2)-1, 2^-29 and 2^53.
+    for ([_]f64{ -0.29289321881345254, 0.41421356237309503, 0x1p-29, -0x1p-29, 0, 0x1p53, -0.9999999999, 1e-300 }) |b| try nonDecreasingAround(F.l1p, b, 32);
+    // pow in x for fixed y >= 0 (and decreasing in x for y < 0, checked as
+    // increasing in 1/x... kept to y >= 0 here), and in y for fixed x > 1.
+    for ([_]f64{ 0.5, 1.4552480184709202, 2, 3, 0.693, 7.25 }) |y| {
+        F.py = y;
+        for ([_]f64{ 0x1p-1022, 1e-10, 0.5, 1, 1.0 - 0x1p-4, 1.0 + 0x1.09p-4, 2, 1e10 }) |b| try nonDecreasingAround(F.powX, b, 32);
+    }
+    for ([_]f64{ 1.0000001, 1.5, 2, 10, 1e10 }) |x| {
+        F.px = x;
+        for ([_]f64{ -64.5, -64, -1, -0.5, 0, 0.5, 1, 63.5, 64, 64.5, 100 }) |b| try nonDecreasingAround(F.powY, b, 32);
+    }
+    // Dense random sample, sorted: exp and log over their whole domains.
+    var prng = std.Random.DefaultPrng.init(0x3070_7070);
+    const r = prng.random();
+    var xs: [20_000]f64 = undefined;
+    for (&xs) |*x| x.* = r.float(f64) * 1440.0 - 735.0;
+    std.mem.sort(f64, &xs, {}, std.sort.asc(f64));
+    for (xs[1..], xs[0 .. xs.len - 1]) |b, a| try std.testing.expect(exp(b) >= exp(a));
+    for (&xs) |*x| x.* = @bitCast((r.int(u64) % 0x7fe0000000000000) + 0x0010000000000000);
+    std.mem.sort(f64, &xs, {}, std.sort.asc(f64));
+    for (xs[1..], xs[0 .. xs.len - 1]) |b, a| try std.testing.expect(log(b) >= log(a));
+}
+
+test "tanh, sinh, cosh, sin and cos keep std's values on the host" {
+    if (dev) return error.SkipZigTest;
+    // tanh and sinh are std's musl bodies with std's own expm1 algorithm, so
+    // they are std's bits (f128-measured: tanh 2.05, sinh 1.75 ulp -- musl's
+    // own error, not faithful). cosh's middle range calls our 0.505-ulp exp
+    // where std calls compiler_rt's, so they part by up to 2 ulp and ours is
+    // the closer: 0.998 ulp against f128, std 1.131. sin/cos are musl against
+    // compiler_rt's musl, and agree on every bit sampled.
+    var prng = std.Random.DefaultPrng.init(0x7a4b);
+    const r = prng.random();
+    var cosh_diff: usize = 0;
+    var trig_diff: usize = 0;
+    for (0..200_000) |n| {
+        const x = if (n % 2 == 0) (r.float(f64) - 0.5) * 60 else (r.float(f64) - 0.5) * 1440;
+        try std.testing.expectEqual(@as(u64, @bitCast(std.math.tanh(x))), @as(u64, @bitCast(tanh(x))));
+        if (@abs(x) < 709) try std.testing.expectEqual(@as(u64, @bitCast(std.math.sinh(x))), @as(u64, @bitCast(sinh(x))));
+        const c = ulpErr(f64, cosh(x), std.math.cosh(x));
+        try std.testing.expect(c <= 2);
+        if (c != 0) cosh_diff += 1;
+        const s = ulpErr(f64, sin(x), @sin(x));
+        const k = ulpErr(f64, cos(x), @cos(x));
+        try std.testing.expect(s <= 1 and k <= 1);
+        if (s != 0 or k != 0) trig_diff += 1;
+    }
+    std.debug.print("\n  vs host std/compiler_rt over 200k: cosh differs on {d}, sin/cos on {d}\n", .{ cosh_diff, trig_diff });
+}
+
+test "vector f32 exp, exp2, log, log2, log10, sin, cos and pow are the scalar call, lane for lane" {
+    var prng = std.Random.DefaultPrng.init(0xF32_1A4E);
+    const rnd = prng.random();
+    const specials = [_]f32{ 0, -0.0, 1, -1, 0x1p-149, 0x1p-126, 88, 89, -104, -105, std.math.floatMax(f32), std.math.inf(f32), -std.math.inf(f32), std.math.nan(f32) };
+    inline for (.{ 4, 8, 16 }) |w| {
+        const V = @Vector(w, f32);
+        for (0..50_000) |n| {
+            var xe: V = undefined;
+            var xl: V = undefined;
+            inline for (0..w) |l| {
+                xe[l] = (rnd.float(f32) - 0.5) * 200;
+                xl[l] = @bitCast(rnd.int(u32) & 0x7fffffff);
+                if (n % 8 == 0 and rnd.boolean()) {
+                    xe[l] = specials[rnd.uintLessThan(usize, specials.len)];
+                    xl[l] = specials[rnd.uintLessThan(usize, specials.len)];
+                }
+            }
+            const e = exp(xe);
+            const e2 = exp2(xe);
+            inline for (0..w) |l| try std.testing.expectEqual(@as(u32, @bitCast(viaF64(softExp2)(xe[l]))), @as(u32, @bitCast(e2[l])));
+            const sn = sin(xl);
+            const cs = cos(xe);
+            const pw = pow(xl, xe);
+            inline for (0..w) |l| {
+                try std.testing.expectEqual(@as(u32, @bitCast(sinfLane(xl[l]))), @as(u32, @bitCast(sn[l])));
+                try std.testing.expectEqual(@as(u32, @bitCast(cosfLane(xe[l]))), @as(u32, @bitCast(cs[l])));
+                const pl = powfLane(xl[l], xe[l]);
+                if (!(std.math.isNan(pl) and std.math.isNan(pw[l])))
+                    try std.testing.expectEqual(@as(u32, @bitCast(pl)), @as(u32, @bitCast(pw[l])));
+            }
+            const l1 = log(xl);
+            const l2 = log2(xl);
+            const l10 = log10(xl);
+            inline for (0..w) |l| {
+                try std.testing.expectEqual(@as(u32, @bitCast(softExpf(xe[l]))), @as(u32, @bitCast(e[l])));
+                try std.testing.expectEqual(@as(u32, @bitCast(softLnf(xl[l]))), @as(u32, @bitCast(l1[l])));
+                try std.testing.expectEqual(@as(u32, @bitCast(softLog2f(xl[l]))), @as(u32, @bitCast(l2[l])));
+                try std.testing.expectEqual(@as(u32, @bitCast(softLog10f(xl[l]))), @as(u32, @bitCast(l10[l])));
+            }
+        }
+    }
+}
+
+test "vector pow is the scalar call, lane for lane, f64 and f32" {
+    var prng = std.Random.DefaultPrng.init(0x9013_1A4E);
+    const rnd = prng.random();
+    const sx = [_]f64{ 0, -0.0, 1, -1, -2, 0x1p-1074, std.math.inf(f64), std.math.nan(f64), 1e300 };
+    const sy = [_]f64{ 0, 1, -1, 2, 3, 0.5, 1e300, -1e300, std.math.nan(f64), 0x1p-70 };
+    inline for (.{ f64, f32 }) |T| inline for (.{ 4, 8 }) |w| {
+        const V = @Vector(w, T);
+        for (0..30_000) |n| {
+            var x: V = undefined;
+            var y: V = undefined;
+            inline for (0..w) |l| {
+                x[l] = @floatCast(std.math.pow(f64, 10.0, rnd.float(f64) * 30 - 15));
+                y[l] = @floatCast(rnd.float(f64) * 40 - 20);
+                if (n % 8 == 0 and rnd.boolean()) {
+                    x[l] = @floatCast(sx[rnd.uintLessThan(usize, sx.len)]);
+                    y[l] = @floatCast(sy[rnd.uintLessThan(usize, sy.len)]);
+                }
+            }
+            const got = pow(x, y);
+            const U = std.meta.Int(.unsigned, @bitSizeOf(T));
+            inline for (0..w) |l| {
+                const want = pow(x[l], y[l]);
+                if (!(std.math.isNan(want) and std.math.isNan(got[l])))
+                    try std.testing.expectEqual(@as(U, @bitCast(want)), @as(U, @bitCast(got[l])));
+            }
+        }
+    };
+}
+
+test "f32 tanh, sinh and cosh are faithful, and the vector is the scalar lane for lane" {
+    if (dev) return error.SkipZigTest;
+    var prng = std.Random.DefaultPrng.init(0xF32_4A11);
+    const r = prng.random();
+    var worst = [3]f64{ 0, 0, 0 };
+    for (0..300_000) |n| {
+        const x: f32 = switch (n % 3) {
+            0 => (r.float(f32) - 0.5) * 2,
+            1 => (r.float(f32) - 0.5) * 200,
+            else => @bitCast(r.int(u32)),
+        };
+        if (std.math.isNan(x)) continue;
+        const xd: f64 = x;
+        // The f64 musl bodies are ~1e-16 relative: an exact oracle at f32.
+        inline for (.{ .{ tanh(x), softTanh(xd) }, .{ sinh(x), softSinh(xd) }, .{ cosh(x), softCosh(xd) } }, 0..) |c, k| {
+            const got: f32 = c[0];
+            const want: f64 = c[1];
+            if (std.math.isInf(want) or @abs(want) > std.math.floatMax(f32)) {
+                try std.testing.expect(std.math.isInf(got) or @abs(got) == std.math.floatMax(f32));
+            } else if (want != 0) {
+                const e = @abs(@as(f64, got) - want) / std.math.ldexp(@as(f64, 1), @max(std.math.ilogb(@as(f32, @floatCast(want))) - 23, -149));
+                worst[k] = @max(worst[k], e);
+            }
+        }
+    }
+    std.debug.print("\n  f32 hyperbolics vs f64: tanh {d:.3}, sinh {d:.3}, cosh {d:.3} ulp\n", .{ worst[0], worst[1], worst[2] });
+    for (worst) |w| try std.testing.expect(w < 1);
+    try std.testing.expect(std.math.isNan(tanh(std.math.nan(f32))));
+    try std.testing.expectEqual(@as(f32, 1), tanh(std.math.inf(f32)));
+    try std.testing.expectEqual(@as(f32, -1), tanh(-std.math.inf(f32)));
+    try std.testing.expectEqual(@as(u32, 1 << 31), @as(u32, @bitCast(tanh(@as(f32, -0.0)))));
+    try std.testing.expectEqual(std.math.inf(f32), cosh(-std.math.inf(f32)));
+    // Lane for lane.
+    inline for (.{ 4, 8, 16 }) |w| {
+        var v: @Vector(w, f32) = undefined;
+        for (0..20_000) |_| {
+            inline for (0..w) |l| v[l] = if (r.boolean()) (r.float(f32) - 0.5) * 30 else @bitCast(r.int(u32));
+            const t = tanh(v);
+            const sh = sinh(v);
+            const ch = cosh(v);
+            inline for (0..w) |l| {
+                if (!std.math.isNan(v[l])) {
+                    try std.testing.expectEqual(@as(u32, @bitCast(tanh(v[l]))), @as(u32, @bitCast(t[l])));
+                    try std.testing.expectEqual(@as(u32, @bitCast(sinh(v[l]))), @as(u32, @bitCast(sh[l])));
+                    try std.testing.expectEqual(@as(u32, @bitCast(cosh(v[l]))), @as(u32, @bitCast(ch[l])));
+                }
+            }
+        }
+    }
 }

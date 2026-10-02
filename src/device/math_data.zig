@@ -12,11 +12,6 @@
 //! from first principles: the constants are chosen so that `k*ln2hi + logc`,
 //! `z/c - 1` and `768 + logc` are EXACT in binary64, which no naive rounding
 //! of log(c) reproduces.
-//!
-//! Unused halves cost nothing. Zig analyses a decl only when something
-//! reaches it, and the `fast_fma` splits in `math.zig` are comptime, so a
-//! target with a hardware FMA never pulls `log_tab2`/`log2_tab2` into its
-//! image at all.
 
 // --- pow: math/pow_log_data.c ------------------------------------------
 
@@ -349,12 +344,13 @@ pub const exp2_poly = [5]f64{
 pub const LogTab = extern struct { invc: f64, logc: f64 };
 
 /// c split as a double-double, so `(z - chi - clo) * invc` reproduces
-/// `fma(z, invc, -1)` to within 2^-66 on a target with no hardware FMA.
-/// Referenced only from the `!fast_fma` branches.
+/// `fma(z, invc, -1)` to within 2^-66 without an FMA, which every body here
+/// is written without.
 const LogTab2 = extern struct { chi: f64, clo: f64 };
 
-pub const log_ln2hi: f64 = 0x1.62e42fefa38p-1;
-pub const log_ln2lo: f64 = 0x1.ef35793c7673p-45;
+/// The same split ln2 `pow` uses.
+pub const log_ln2hi = powlog_ln2hi;
+pub const log_ln2lo = powlog_ln2lo;
 
 /// log1p(r) - r coefficients for the |log(x)| < 2^-4 path; `log_poly1[0]`
 /// is -0.5 and the leading r is explicit.
@@ -873,8 +869,8 @@ pub const log2f_tab = [16]LogTab{
 
 /// 1.5*2^52, and 32/ln2. `expf` reduces onto a 32-entry table, so its
 /// shift is the plain one and the scale is folded into the constant.
-pub const expf_shift: f64 = 0x1.8p+52;
-pub const expf_invln2N: f64 = 0x1.71547652b82fep+5;
+pub const expf_shift = shift;
+pub const expf_invln2N: f64 = invln2N / 4;
 
 /// 2^(r/32) = 1 + poly[2]*r + r^2*(poly[1] + poly[0]*r), |r| <= 1/2.
 pub const expf_poly = [3]f64{

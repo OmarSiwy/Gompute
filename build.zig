@@ -231,6 +231,10 @@ pub fn build(b: *std.Build) void {
     const device_mod = b.addModule("gompute_device", .{
         .root_source_file = b.path("src/device.zig"),
     });
+    // The device math alone, std-only: one body per function, the same bits on
+    // the host, NVPTX and AMDGCN, and at comptime. For code that wants the
+    // math and none of the GPU layer (a compiler folding constants).
+    _ = b.addModule("math", .{ .root_source_file = b.path("src/device/math.zig") });
 
     // A stub so `gompute` always resolves `gompute_kernels`. Without it, merely
     // naming Kernel(spec, .cuda) in a build that never called emitKernels failed

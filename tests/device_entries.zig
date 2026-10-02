@@ -70,7 +70,7 @@ fn expFamily(comptime T: type) fn (T, NoParams) T {
 fn logFamily(comptime T: type) fn (T, NoParams) T {
     return struct {
         fn f(x: T, _: NoParams) T {
-            return g.math.log(x) + g.math.log2(x) + g.math.log10(x) +
+            return g.math.log(x) + g.math.log2(x) + g.math.log10(x) + g.math.log1p(x) +
                 g.math.sqrt(x) + g.math.rsqrt(x);
         }
     }.f;
