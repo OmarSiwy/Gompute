@@ -67,6 +67,10 @@ pub const map = spec.Map;
 /// `map` with `T` and `Params` read off `func`'s signature.
 pub const mapFn = spec.MapFn;
 pub const splat = spec.splat;
+/// `E` at the width of `X`: `Lanes(@TypeOf(x), f64)` is `f64` for a scalar `x`
+/// and `@Vector(n, f64)` for an n-lane one. The return type of a generic
+/// `mapTo`/`zip` body.
+pub const Lanes = spec.Lanes;
 pub const mapTo = spec.MapTo;
 pub const zip = spec.Zip;
 pub const mapIndexed = spec.MapIndexed;

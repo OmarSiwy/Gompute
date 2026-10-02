@@ -76,15 +76,15 @@ pub fn Map(
 /// Out-of-place map: `out[i] = func(in[i], params)`, with a result type that
 /// need not match the input's.
 ///
-/// Unlike `Map`, `func` is a concrete `fn (In, Params) Out` -- there is no
-/// generic form, so the CPU path stays scalar. Vectorizing it needs a body that
-/// instantiates at `@Vector`, which is what in-place `map` already offers.
+/// `func` is a concrete `fn (In, Params) Out`, or generic `fn (x: anytype, p:
+/// Params)`, which the CPU path runs at `@Vector` width like `map`'s: given
+/// `@Vector(n, In)` it must return `@Vector(n, Out)`.
 pub fn MapTo(
     comptime name: [:0]const u8,
     comptime Input: type,
     comptime Output: type,
     comptime Params: type,
-    comptime func: fn (Input, Params) Output,
+    comptime func: anytype,
     comptime options: MapOptions,
 ) type {
     validateName(name);
@@ -92,6 +92,8 @@ pub fn MapTo(
     validateValue(Output);
     _ = abi.Boundary(Params);
     validateBlockSize(options.block_size);
+    const generic = isGeneric(func);
+    if (!generic) _ = @as(fn (Input, Params) Output, func);
 
     return struct {
         pub const kind: Kind = .map_to;
@@ -103,14 +105,16 @@ pub fn MapTo(
         pub const Parameters = Params;
         pub const BoundaryParameters = abi.Boundary(Params);
         pub const block_size: u32 = options.block_size;
+        pub const is_generic: bool = generic;
 
-        pub inline fn eval(x: Input, params: Params) Output {
+        pub inline fn eval(x: anytype, params: Params) Lanes(@TypeOf(x), Output) {
             return @call(.always_inline, func, .{ x, params });
         }
     };
 }
 
-/// Elementwise binary map: `out[i] = func(a[i], b[i], params)`.
+/// Elementwise binary map: `out[i] = func(a[i], b[i], params)`. A generic
+/// `fn (a: anytype, b: anytype, p: Params)` runs at `@Vector` width on the CPU.
 ///
 /// Two buffers, two positional arguments. Packing the operands into one
 /// `[]struct { a: A, b: B }` would work through `map` alone, but that is
@@ -122,7 +126,7 @@ pub fn Zip(
     comptime Second: type,
     comptime Output: type,
     comptime Params: type,
-    comptime func: fn (First, Second, Params) Output,
+    comptime func: anytype,
     comptime options: MapOptions,
 ) type {
     validateName(name);
@@ -131,6 +135,8 @@ pub fn Zip(
     validateValue(Output);
     _ = abi.Boundary(Params);
     validateBlockSize(options.block_size);
+    const generic = isGeneric(func);
+    if (!generic) _ = @as(fn (First, Second, Params) Output, func);
 
     return struct {
         pub const kind: Kind = .zip;
@@ -143,14 +149,18 @@ pub fn Zip(
         pub const BoundaryParameters = abi.Boundary(Params);
         pub const block_size: u32 = options.block_size;
 
-        pub inline fn eval(a: First, b: Second, params: Params) Output {
+        pub const is_generic: bool = generic;
+
+        pub inline fn eval(a: anytype, b: Lanes(@TypeOf(a), Second), params: Params) Lanes(@TypeOf(a), Output) {
             return @call(.always_inline, func, .{ a, b, params });
         }
     };
 }
 
 /// In-place map that also sees the element's linear index:
-/// `data[i] = func(data[i], i, params)`.
+/// `data[i] = func(data[i], i, params)`. A generic `fn (x: anytype, i:
+/// anytype, p: Params)` runs at `@Vector` width on the CPU, with `i` a vector
+/// of consecutive u64 indices.
 ///
 /// ponytail: one linear index, no `globalIdY`/`globalIdZ` and no 2-D launch.
 /// A caller who wants (row, col) divides by the row stride, which is free next
@@ -161,13 +171,15 @@ pub fn MapIndexed(
     comptime name: [:0]const u8,
     comptime T: type,
     comptime Params: type,
-    comptime func: fn (T, u64, Params) T,
+    comptime func: anytype,
     comptime options: MapOptions,
 ) type {
     validateName(name);
     validateValue(T);
     _ = abi.Boundary(Params);
     validateBlockSize(options.block_size);
+    const generic = isGeneric(func);
+    if (!generic) _ = @as(fn (T, u64, Params) T, func);
 
     return struct {
         pub const kind: Kind = .map_indexed;
@@ -177,7 +189,9 @@ pub fn MapIndexed(
         pub const BoundaryParameters = abi.Boundary(Params);
         pub const block_size: u32 = options.block_size;
 
-        pub inline fn eval(x: T, index: u64, params: Params) T {
+        pub const is_generic: bool = generic;
+
+        pub inline fn eval(x: anytype, index: Lanes(@TypeOf(x), u64), params: Params) Lanes(@TypeOf(x), T) {
             return @call(.always_inline, func, .{ x, index, params });
         }
     };
@@ -342,7 +356,7 @@ pub fn Sum(
     comptime Params: type,
     comptime options: ReduceOptions(T, Params),
 ) type {
-    return Reduce(name, T, Params, Arith(T).add, 0, withOp(options, .Add));
+    return Preset(name, T, Params, options, .Add, 0);
 }
 
 /// `@min`, identity `maxInt(T)` for an integer and `+inf` for a float -- an
@@ -353,7 +367,8 @@ pub fn Min(
     comptime Params: type,
     comptime options: ReduceOptions(T, Params),
 ) type {
-    return Reduce(name, T, Params, Arith(T).min, Arith(T).largest, withOp(options, .Min));
+    const largest: T = if (@typeInfo(T) == .int) std.math.maxInt(T) else std.math.inf(T);
+    return Preset(name, T, Params, options, .Min, largest);
 }
 
 /// `@max`, identity `minInt(T)` for an integer and `-inf` for a float -- an
@@ -364,7 +379,8 @@ pub fn Max(
     comptime Params: type,
     comptime options: ReduceOptions(T, Params),
 ) type {
-    return Reduce(name, T, Params, Arith(T).max, Arith(T).smallest, withOp(options, .Max));
+    const smallest: T = if (@typeInfo(T) == .int) std.math.minInt(T) else -std.math.inf(T);
+    return Preset(name, T, Params, options, .Max, smallest);
 }
 
 /// Bitwise OR, i.e. "is any element nonzero". Integer only; write the predicate
@@ -376,7 +392,7 @@ pub fn Any(
     comptime options: ReduceOptions(T, Params),
 ) type {
     requireInt(T, "any");
-    return Reduce(name, T, Params, Arith(T).bitOr, 0, withOp(options, .Or));
+    return Preset(name, T, Params, options, .Or, 0);
 }
 
 /// Bitwise AND, i.e. "is every element all-ones". Integer only; write the
@@ -388,7 +404,7 @@ pub fn All(
     comptime options: ReduceOptions(T, Params),
 ) type {
     requireInt(T, "all");
-    return Reduce(name, T, Params, Arith(T).bitAnd, ~@as(T, 0), withOp(options, .And));
+    return Preset(name, T, Params, options, .And, ~@as(T, 0));
 }
 
 fn requireInt(comptime T: type, comptime what: []const u8) void {
@@ -396,34 +412,39 @@ fn requireInt(comptime T: type, comptime what: []const u8) void {
         @compileError(what ++ " combines bitwise and needs an integer value type, not " ++ @typeName(T));
 }
 
-fn withOp(comptime options: anytype, comptime op: std.builtin.ReduceOp) @TypeOf(options) {
-    var out = options;
-    out.simd_op = op;
-    return out;
+/// A `Reduce` whose `combine` is `op` itself, with `simd_op` set so the CPU
+/// path can keep a vector accumulator.
+fn Preset(
+    comptime name: [:0]const u8,
+    comptime T: type,
+    comptime Params: type,
+    comptime options: ReduceOptions(T, Params),
+    comptime op: std.builtin.ReduceOp,
+    comptime identity_value: T,
+) type {
+    var with_op = options;
+    with_op.simd_op = op;
+    const combine = struct {
+        fn f(a: T, b: T) T {
+            return combineOp(op, a, b);
+        }
+    }.f;
+    return Reduce(name, T, Params, combine, identity_value, with_op);
 }
 
-fn Arith(comptime T: type) type {
-    const int = @typeInfo(T) == .int;
-    return struct {
-        /// Wrapping for integers: the device runs ReleaseFast and would wrap
-        /// silently anyway, so the CPU path must not disagree by panicking.
-        pub fn add(a: T, b: T) T {
-            return if (int) a +% b else a + b;
-        }
-        pub fn min(a: T, b: T) T {
-            return @min(a, b);
-        }
-        pub fn max(a: T, b: T) T {
-            return @max(a, b);
-        }
-        pub fn bitOr(a: T, b: T) T {
-            return if (int) a | b else unreachable;
-        }
-        pub fn bitAnd(a: T, b: T) T {
-            return if (int) a & b else unreachable;
-        }
-        pub const largest: T = if (int) std.math.maxInt(T) else std.math.inf(T);
-        pub const smallest: T = if (int) std.math.minInt(T) else -std.math.inf(T);
+/// One reduction step, lane-wise: the same body serves a scalar `combine` and
+/// the CPU path's vector accumulator. Integer addition wraps -- the device runs
+/// ReleaseFast and would wrap silently anyway, so the CPU must not panic.
+pub inline fn combineOp(comptime op: std.builtin.ReduceOp, a: anytype, b: @TypeOf(a)) @TypeOf(a) {
+    const V = @TypeOf(a);
+    const E = if (@typeInfo(V) == .vector) @typeInfo(V).vector.child else V;
+    return switch (op) {
+        .Add => if (@typeInfo(E) == .int) a +% b else a + b,
+        .Min => @min(a, b),
+        .Max => @max(a, b),
+        .Or => a | b,
+        .And => a & b,
+        else => @compileError("no preset combines with " ++ @tagName(op)),
     };
 }
 
@@ -437,6 +458,20 @@ fn Eval(comptime generic: bool, comptime T: type, comptime P: type, comptime fun
             return @call(.always_inline, func, .{ x, params });
         }
     };
+}
+
+/// A function whose first parameter is `anytype`: the CPU path may call it at
+/// `@Vector` width.
+fn isGeneric(comptime func: anytype) bool {
+    const info = @typeInfo(@TypeOf(func));
+    if (info != .@"fn") @compileError("the operation must be a function");
+    return info.@"fn".params[0].type == null;
+}
+
+/// `E`, or `@Vector(n, E)` when `X` is an n-lane vector: the return type of a
+/// generic `mapTo`/`zip` body whose result type differs from its input's.
+pub fn Lanes(comptime X: type, comptime E: type) type {
+    return if (@typeInfo(X) == .vector) @Vector(@typeInfo(X).vector.len, E) else E;
 }
 
 fn validateName(comptime name: []const u8) void {

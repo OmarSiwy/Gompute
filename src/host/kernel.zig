@@ -100,6 +100,17 @@ fn CpuKernel(comptime Spec: type) type {
             for (data[i..]) |*value| value.* = Spec.eval(value.*, params);
         }
 
+        /// Lanes for a generic body touching element types `Ts`: the narrowest
+        /// suggestion among them, so the widest type still fills one register.
+        /// Zig 0.16 ships LLVM's loop vectorizer off, so a loop not widened
+        /// here is scalar.
+        fn widthOf(comptime Ts: anytype) usize {
+            if (!(@hasDecl(Spec, "is_generic") and Spec.is_generic)) return 1;
+            var n: usize = 64;
+            for (Ts) |T| n = @min(n, std.simd.suggestVectorLength(T) orelse 1);
+            return n;
+        }
+
         inline fn mapToRun(
             _: *Self,
             in: []const Spec.In,
@@ -107,7 +118,12 @@ fn CpuKernel(comptime Spec: type) type {
             params: Spec.Parameters,
         ) iface.Error!void {
             try sameLen(.{ in.len, out.len });
-            for (in, out) |x, *o| o.* = Spec.eval(x, params);
+            const n = comptime widthOf(.{ Spec.In, Spec.Out });
+            var i: usize = 0;
+            if (comptime n > 1) while (i + n <= in.len) : (i += n) {
+                out[i..][0..n].* = Spec.eval(@as(@Vector(n, Spec.In), in[i..][0..n].*), params);
+            };
+            for (in[i..], out[i..]) |x, *o| o.* = Spec.eval(x, params);
         }
 
         inline fn zipRun(
@@ -118,11 +134,24 @@ fn CpuKernel(comptime Spec: type) type {
             params: Spec.Parameters,
         ) iface.Error!void {
             try sameLen(.{ a.len, b.len, out.len });
-            for (a, b, out) |x, y, *o| o.* = Spec.eval(x, y, params);
+            const n = comptime widthOf(.{ Spec.A, Spec.B, Spec.Out });
+            var i: usize = 0;
+            if (comptime n > 1) while (i + n <= a.len) : (i += n) {
+                const x: @Vector(n, Spec.A) = a[i..][0..n].*;
+                const y: @Vector(n, Spec.B) = b[i..][0..n].*;
+                out[i..][0..n].* = Spec.eval(x, y, params);
+            };
+            for (a[i..], b[i..], out[i..]) |x, y, *o| o.* = Spec.eval(x, y, params);
         }
 
         inline fn mapIndexedRun(_: *Self, data: []Spec.Value, params: Spec.Parameters) iface.Error!void {
-            for (data, 0..) |*value, i| value.* = Spec.eval(value.*, @intCast(i), params);
+            const n = comptime widthOf(.{ Spec.Value, u64 });
+            var i: usize = 0;
+            if (comptime n > 1) while (i + n <= data.len) : (i += n) {
+                const idx = std.simd.iota(u64, n) + @as(@Vector(n, u64), @splat(i));
+                data[i..][0..n].* = Spec.eval(@as(@Vector(n, Spec.Value), data[i..][0..n].*), idx, params);
+            };
+            for (data[i..], i..) |*value, j| value.* = Spec.eval(value.*, @intCast(j), params);
         }
 
         /// Scalar for a custom `combine` -- a generic `fn (T, T) T` cannot be
@@ -137,14 +166,21 @@ fn CpuKernel(comptime Spec: type) type {
             var acc: Spec.Value = Spec.identity;
             var i: usize = 0;
             if (comptime Spec.simd_op != null and vec_lanes > 1) {
-                const V = @Vector(vec_lanes, Spec.Value);
-                while (i + vec_lanes <= data.len) : (i += vec_lanes) {
-                    var chunk: V = data[i..][0..vec_lanes].*;
+                const op = comptime Spec.simd_op.?;
+                // ponytail: 4 registers wide, so 4 independent accumulator
+                // chains hide the add latency; the tail is up to 4*lanes-1
+                // scalar steps, which is noise past a few hundred elements.
+                const n = 4 * vec_lanes;
+                const V = @Vector(n, Spec.Value);
+                var vacc: V = @splat(Spec.identity);
+                while (i + n <= data.len) : (i += n) {
+                    var chunk: V = data[i..][0..n].*;
                     // `pre` is scalar by construction, so it is applied per lane
                     // and only the combining tree is widened.
-                    inline for (0..vec_lanes) |lane| chunk[lane] = Spec.pre(chunk[lane], params);
-                    acc = Spec.combine(acc, @reduce(Spec.simd_op.?, chunk));
+                    inline for (0..n) |lane| chunk[lane] = Spec.pre(chunk[lane], params);
+                    vacc = spec.combineOp(op, vacc, chunk);
                 }
+                acc = @reduce(op, vacc);
             }
             for (data[i..]) |x| acc = Spec.combine(acc, Spec.pre(x, params));
             return acc;
@@ -353,10 +389,25 @@ fn GpuKernel(comptime Spec: type, comptime gpu: Gpu) type {
         /// Device memory. Valid on every handle for the same device, because
         /// they all share one primary context.
         pub const Buffer = gpu.rt.Buffer;
+        /// The type of `stream`.
+        pub const Stream = gpu.rt.Stream;
 
         context: gpu.rt.Context = .{},
         module: gpu.rt.Module = .{},
         kernel: gpu.rt.Kernel = .{},
+        /// Where `launch` enqueues; the NULL stream by default. Set it to a
+        /// `context.createStreamNonBlocking()` stream to capture launches into
+        /// a graph (`stream.beginCapture` .. `endCapture`, then `instantiate`
+        /// and replay). Borrowed: `deinit` clears it, the caller destroys it.
+        stream: Stream = .{},
+        /// `run`'s device buffers, kept and grown on demand rather than
+        /// allocated per call: cuMemAlloc + cuMemFree were ~83 us of a ~100 us
+        /// `run`. Freed by `deinit`.
+        ///
+        /// ponytail: one handle, one `run` at a time -- two threads sharing a
+        /// handle would share these. Give each thread its own handle; a second
+        /// `init` on a warm device costs ~0.3 us.
+        scratch: [3]Buffer = @splat(.{}),
 
         /// (#3) Handles on the same device share one primary context and one
         /// JIT'd copy of the artifact, so this is cheap after the first one and
@@ -377,6 +428,7 @@ fn GpuKernel(comptime Spec: type, comptime gpu: Gpu) type {
         /// driver-level double free. Cleared handles make it a no-op, which is
         /// what the runtime structs already do.
         pub fn deinit(self: *Self) void {
+            for (&self.scratch) |*b| b.free();
             self.module.deinit();
             self.context.deinit();
             self.* = .{};
@@ -386,27 +438,35 @@ fn GpuKernel(comptime Spec: type, comptime gpu: Gpu) type {
         /// bytes, because it has no spec to size against.
         ///
         /// Caller owns the returned buffer and must `free` it; nothing here
-        /// tracks it. Hoisting one out of a loop is the point: `run` allocates
-        /// and frees on every call.
+        /// tracks it. Hoisting one out of a loop is the point: `run` copies in
+        /// and out on every call.
         pub fn alloc(self: *Self, count: usize) iface.Error!Buffer {
             return self.context.alloc(count * @sizeOf(Spec.Value));
         }
 
-        /// A device copy of `slice`, already uploaded. Callers must have ruled
-        /// out an empty slice: a zero-byte allocation is an error to both drivers.
-        fn staged(self: *Self, comptime E: type, slice: []const E) iface.Error!Buffer {
-            const bytes = slice.len * @sizeOf(E);
-            var buffer = try self.context.alloc(bytes);
-            errdefer buffer.free();
-            try buffer.upload(slice.ptr, bytes);
-            return buffer;
+        /// `scratch[i]`, at least `bytes` long. Callers must have ruled out an
+        /// empty request: a zero-byte allocation is an error to both drivers.
+        fn slot(self: *Self, i: usize, bytes: usize) iface.Error!*Buffer {
+            const b = &self.scratch[i];
+            if (b.bytes < bytes) {
+                b.free();
+                b.* = try self.context.alloc(bytes);
+            }
+            return b;
+        }
+
+        /// `slot(i)` holding a device copy of `slice`.
+        fn staged(self: *Self, i: usize, comptime E: type, slice: []const E) iface.Error!*Buffer {
+            const b = try self.slot(i, slice.len * @sizeOf(E));
+            try b.upload(slice.ptr, slice.len * @sizeOf(E));
+            return b;
         }
 
         /// A worker thread that has not touched this device yet has no current
         /// context; without this every launch off the main thread fails.
         fn dispatch(self: *Self, grid: iface.Dim3, args: []const iface.Arg) iface.Error!void {
             try self.context.makeCurrent();
-            try self.kernel.launch(grid, .{ .x = Spec.block_size }, 0, args);
+            try self.kernel.launchOnStream(grid, .{ .x = Spec.block_size }, 0, args, self.stream.stream);
         }
 
         /// Same story as `CpuKernel.run`: one signature per kind, chosen at
@@ -439,9 +499,9 @@ fn GpuKernel(comptime Spec: type, comptime gpu: Gpu) type {
         /// signatures below stay positional and explicit: `docs/reference.md`
         /// documents them that way, and they are public API.
         ///
-        /// `len` and `packed_params` are locals the driver reads through
-        /// `args`, so they have to outlive the call -- which they do, because
-        /// `dispatch` is synchronous.
+        /// `len` and `packed_params` can be locals: both drivers copy the
+        /// argument values out of `args` when the launch is enqueued (or
+        /// captured), not when it runs.
         fn packedLaunch(
             self: *Self,
             bufs: anytype,
@@ -469,9 +529,8 @@ fn GpuKernel(comptime Spec: type, comptime gpu: Gpu) type {
 
         fn mapRun(self: *Self, data: []Spec.Value, params: Spec.Parameters) iface.Error!void {
             if (data.len == 0) return;
-            var buffer = try self.staged(Spec.Value, data);
-            defer buffer.free();
-            try self.launch(&buffer, data.len, params);
+            const buffer = try self.staged(0, Spec.Value, data);
+            try self.launch(buffer, data.len, params);
             try self.context.synchronize();
             try buffer.download(data.ptr, data.len * @sizeOf(Spec.Value));
         }
@@ -494,11 +553,9 @@ fn GpuKernel(comptime Spec: type, comptime gpu: Gpu) type {
         ) iface.Error!void {
             try sameLen(.{ in.len, out.len });
             if (in.len == 0) return;
-            var in_buf = try self.staged(Spec.In, in);
-            defer in_buf.free();
-            var out_buf = try self.context.alloc(out.len * @sizeOf(Spec.Out));
-            defer out_buf.free();
-            try self.launch(&in_buf, &out_buf, in.len, params);
+            const in_buf = try self.staged(0, Spec.In, in);
+            const out_buf = try self.slot(1, out.len * @sizeOf(Spec.Out));
+            try self.launch(in_buf, out_buf, in.len, params);
             try self.context.synchronize();
             try out_buf.download(out.ptr, out.len * @sizeOf(Spec.Out));
         }
@@ -523,13 +580,10 @@ fn GpuKernel(comptime Spec: type, comptime gpu: Gpu) type {
         ) iface.Error!void {
             try sameLen(.{ a.len, b.len, out.len });
             if (a.len == 0) return;
-            var a_buf = try self.staged(Spec.A, a);
-            defer a_buf.free();
-            var b_buf = try self.staged(Spec.B, b);
-            defer b_buf.free();
-            var out_buf = try self.context.alloc(out.len * @sizeOf(Spec.Out));
-            defer out_buf.free();
-            try self.launch(&a_buf, &b_buf, &out_buf, a.len, params);
+            const a_buf = try self.staged(0, Spec.A, a);
+            const b_buf = try self.staged(1, Spec.B, b);
+            const out_buf = try self.slot(2, out.len * @sizeOf(Spec.Out));
+            try self.launch(a_buf, b_buf, out_buf, a.len, params);
             try self.context.synchronize();
             try out_buf.download(out.ptr, out.len * @sizeOf(Spec.Out));
         }
@@ -574,11 +628,9 @@ fn GpuKernel(comptime Spec: type, comptime gpu: Gpu) type {
             if (data.len == 0) return Spec.identity;
             const blocks = reduceBlocks(data.len);
 
-            var data_buf = try self.staged(Spec.Value, data);
-            defer data_buf.free();
-            var partial_buf = try self.context.alloc(blocks * @sizeOf(Spec.Value));
-            defer partial_buf.free();
-            try self.launch(&data_buf, data.len, &partial_buf, blocks, params);
+            const data_buf = try self.staged(0, Spec.Value, data);
+            const partial_buf = try self.slot(1, blocks * @sizeOf(Spec.Value));
+            try self.launch(data_buf, data.len, partial_buf, blocks, params);
             try self.context.synchronize();
 
             var partials: [max_reduce_blocks]Spec.Value = undefined;
@@ -621,15 +673,12 @@ fn GpuKernel(comptime Spec: type, comptime gpu: Gpu) type {
         ) iface.Error!void {
             try sameLen(.{ idx.len, out.len });
             if (out.len == 0 or src.len == 0) return;
-            var src_buf = try self.staged(Spec.Value, src);
-            defer src_buf.free();
-            var idx_buf = try self.staged(Spec.Index, idx);
-            defer idx_buf.free();
+            const src_buf = try self.staged(0, Spec.Value, src);
+            const idx_buf = try self.staged(1, Spec.Index, idx);
             // Uploaded, not just allocated: allocating alone would download
             // uninitialized device memory into every unselected slot.
-            var out_buf = try self.staged(Spec.Value, out);
-            defer out_buf.free();
-            try self.launch(&src_buf, &idx_buf, &out_buf, out.len, src.len);
+            const out_buf = try self.staged(2, Spec.Value, out);
+            try self.launch(src_buf, idx_buf, out_buf, out.len, src.len);
             try self.context.synchronize();
             try out_buf.download(out.ptr, out.len * @sizeOf(Spec.Value));
         }
@@ -642,15 +691,12 @@ fn GpuKernel(comptime Spec: type, comptime gpu: Gpu) type {
         ) iface.Error!void {
             try sameLen(.{ src.len, idx.len });
             if (src.len == 0 or out.len == 0) return;
-            var src_buf = try self.staged(Spec.Value, src);
-            defer src_buf.free();
-            var idx_buf = try self.staged(Spec.Index, idx);
-            defer idx_buf.free();
+            const src_buf = try self.staged(0, Spec.Value, src);
+            const idx_buf = try self.staged(1, Spec.Index, idx);
             // Uploaded, not just allocated: an element of `out` that no index
             // selects must keep the value the caller put there.
-            var out_buf = try self.staged(Spec.Value, out);
-            defer out_buf.free();
-            try self.launch(&src_buf, &idx_buf, &out_buf, src.len, out.len);
+            const out_buf = try self.staged(2, Spec.Value, out);
+            try self.launch(src_buf, idx_buf, out_buf, src.len, out.len);
             try self.context.synchronize();
             try out_buf.download(out.ptr, out.len * @sizeOf(Spec.Value));
         }
@@ -1093,5 +1139,50 @@ test "a broken build is distinguishable from a machine that simply has no GPU" {
     for ([_]iface.Error{ error.ModuleLoadFailed, error.KernelNotFound, error.LaunchFailed }) |broken| {
         try std.testing.expect(!absent(broken));
         try std.testing.expectError(broken, reportSkip("cuda", broken, true));
+    }
+}
+
+test "generic mapTo, zip and mapIndexed run at vector width and match their scalar body" {
+    const P = struct { scale: f32 };
+    const MapTo = spec.MapTo("t_g_map_to", f32, f64, P, struct {
+        fn call(x: anytype, p: P) spec.Lanes(@TypeOf(x), f64) {
+            const w: spec.Lanes(@TypeOf(x), f64) = @floatCast(x);
+            return w * spec.splat(@TypeOf(w), @as(f64, p.scale)) - spec.splat(@TypeOf(w), @as(f64, 1));
+        }
+    }.call, .{});
+    const Zip = spec.Zip("t_g_zip", f32, f32, f32, P, struct {
+        fn call(a: anytype, b: anytype, p: P) @TypeOf(a) {
+            return @max(a * spec.splat(@TypeOf(a), p.scale), b);
+        }
+    }.call, .{});
+    const Indexed = spec.MapIndexed("t_g_indexed", f32, P, struct {
+        fn call(x: anytype, i: anytype, p: P) @TypeOf(x) {
+            const fi: @TypeOf(x) = @floatFromInt(i & spec.splat(@TypeOf(i), 7));
+            return x + fi * spec.splat(@TypeOf(x), p.scale);
+        }
+    }.call, .{});
+    comptime std.debug.assert(MapTo.is_generic and Zip.is_generic and Indexed.is_generic);
+    comptime std.debug.assert(CpuKernel(Zip).widthOf(.{ f32, f32, f32 }) > 1 or std.simd.suggestVectorLength(f32) == null);
+
+    var k1 = try CpuKernel(MapTo).init(0);
+    var k2 = try CpuKernel(Zip).init(0);
+    var k3 = try CpuKernel(Indexed).init(0);
+    const p: P = .{ .scale = 1.5 };
+    var a: [100]f32 = undefined;
+    var b: [100]f32 = undefined;
+    var o64: [100]f64 = undefined;
+    var o32: [100]f32 = undefined;
+    for (0..100) |len| {
+        for (a[0..len], b[0..len], 0..) |*x, *y, i| {
+            x.* = @as(f32, @floatFromInt(i)) * 0.37 - 9;
+            y.* = 4 - @as(f32, @floatFromInt(i)) * 0.11;
+        }
+        try k1.run(a[0..len], o64[0..len], p);
+        for (a[0..len], o64[0..len]) |x, y| try std.testing.expectEqual(MapTo.eval(x, p), y);
+        try k2.run(a[0..len], b[0..len], o32[0..len], p);
+        for (a[0..len], b[0..len], o32[0..len]) |x, y, z| try std.testing.expectEqual(Zip.eval(x, y, p), z);
+        @memcpy(o32[0..len], a[0..len]);
+        try k3.run(o32[0..len], p);
+        for (a[0..len], o32[0..len], 0..) |x, z, i| try std.testing.expectEqual(Indexed.eval(x, @as(u64, i), p), z);
     }
 }

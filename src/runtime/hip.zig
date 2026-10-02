@@ -412,7 +412,6 @@ pub const Buffer = struct {
         try check(g.hipMemcpyDtoH(host, try self.devicePtr(), n), error.CopyFailed);
     }
     /// Release the device memory. Idempotent.
-    /// Release the device memory. Idempotent.
     pub fn free(self: *Buffer) void {
         // Also covers a default-constructed Buffer, where `g` is still
         // `undefined` because nothing ever dlopen'd the runtime.
