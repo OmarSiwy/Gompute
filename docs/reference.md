@@ -40,12 +40,12 @@ Things that are easy to get wrong because nothing in the API says them out loud.
 | | |
 | --- | --- |
 | `init(0)` | The CUDA/HIP **device ordinal**. Ignored by `.cpu`. |
-| `run` | Allocates a device buffer, uploads, launches, **synchronizes**, downloads and frees, on every call. Convenient, not cheap; see [Advanced](advanced.html) to hoist it. |
+| `run` | Uploads, launches, **synchronizes** and downloads on every call. Device buffers are kept on the handle and grown on demand, so one handle must not `run` from two threads at once; give each thread its own (a warm `init` is ~0.3 µs). See [Advanced](advanced.html) to skip the copies. |
 | `deinit` | Always safe, and safe to call twice. On `.cpu` it is a no-op. It releases *your handle*, not the shared device state. |
 | Contexts and modules | Shared process-wide, per device. Two `Kernel`s on one GPU share one CUDA primary context and JIT the artifact once, so buffers allocated through one are usable by the other. `runtime.cuda.shutdown()` is the only real teardown. |
 | Threads | Safe. A context is made current per thread on first use. |
 | `Buffer` | `free()` is idempotent. Use-after-free is not checked. `upload`/`download` do not bounds-check against `Buffer.bytes`; the driver catches the overrun and you get `error.CopyFailed`. |
-| Errors | One flat set of 12, listed [below](#errors). `lastDriverError()` returns the raw CUDA/HIP code behind the last failure, which is the only way to tell "no driver" from "out of memory". It is cleared on success. |
+| Errors | One flat set of 16, listed [below](#errors). `lastDriverError()` returns the raw CUDA/HIP code behind the last failure, which is the only way to tell "no driver" from "out of memory". It is cleared on success. |
 | `block_size` | Must be 1…1024. Not required to be a multiple of the warp/wave size, but anything else wastes part of every warp. |
 | Empty input | `run` on a zero-length slice returns without launching. |
 
@@ -70,6 +70,10 @@ union.
 | `error.InvalidArgument` | Caller-side validation: a null or freed `Buffer`, or a launch geometry `Dim3.linearChecked` will not express. |
 | `error.BackendUnavailable` | `Kernel(spec, .cuda)` was instantiated in a build that emitted no CUDA artifact. The type still compiles; `init` refuses. |
 | `error.UnsupportedBackend` | Reserved. Nothing returns it today. |
+| `error.CaptureFailed` | A stream capture failed to begin or end, or was invalidated in between (a host-blocking call ran during it). |
+| `error.GraphFailed` | A graph failed to instantiate, launch or update for a reason other than a topology change, which `GraphExec.update` reports as `false`. |
+| `error.EventFailed` | Creating, recording, waiting on or timing an event failed; timing an event created with `timing = false` lands here. |
+| `error.Unsupported` | The driver is too old for the call: graphs and events need CUDA 11.4+ or a ROCm that exports them. `hasGraphs()` / `hasEvents()` say so first. |
 
 The error tells you *which step* failed; `lastDriverError()` tells you *why*.
 
@@ -154,6 +158,7 @@ hoist the allocation and the copies. See [Advanced](advanced.html):
 | `context` | The underlying `runtime.cuda.Context` / `runtime.hip.Context`. `context.synchronize()` is how you wait for a bare `launch`. |
 | `Buffer` | The backend's buffer type. `void` on `.cpu`. |
 | `reduceBlocks(count: usize) u32` | Block count for a `reduce` launch, so you can size the partials buffer. |
+| `stream: Stream` | Where `launch` enqueues; the NULL stream by default. Set it to capture launches into a graph; see [Advanced](advanced.html#graph-replay). |
 
 `AutoKernel(spec)` adds:
 
@@ -296,78 +301,60 @@ targets emit no libcalls, so the backend fails with `no libcall available for
 fexp` or `Cannot select: fsin`. `g.math` provides device-safe replacements, and
 they compile on the host too, so one kernel source builds both ways.
 
-Every one is `inline fn (x: anytype) @TypeOf(x)`, except `pow(x, y)`. They take
-`f32`, `f64`, and `@Vector`s of either; anything else is a compile error telling
-you to cast first. Vectors matter because the CPU backend instantiates a generic
-map body at vector width, so that is what a vectorized kernel passes them.
+Every one is `inline fn (x: anytype) @TypeOf(x)`, except `pow(x, y)` where
+`y` has `x`'s type. They take `f32`, `f64`, and `@Vector`s of either. A bare
+literal or `const lim = 80.0` is a `comptime_float` and a compile error;
+write `@as(f64, 80.0)`. That's deliberate: choosing f64 silently could differ
+from what an f32 kernel computes. The set:
+`exp exp2 log log2 log10 log1p pow sin cos tan tanh sinh cosh expm1 atan sqrt
+rsqrt`.
 
-The vector form is correct rather than fast. The ones that are a builtin
-(`sin`, `cos`, `tan`, `sqrt`, `rsqrt` and `f32` `exp2`) stay elementwise; the
-ported transcendentals index a table with the input and branch on it, so they
-run a lane at a time.
+**One body per function, the same bits everywhere.** No function uses FMA, a
+hardware approximation, inline asm or a target intrinsic, so a given input
+gives the same bits on the host (with or without FMA hardware), on NVPTX, on
+AMDGCN, and when evaluated at comptime. `examples/exhaustive` checks the CUDA
+result against the CPU result bit for bit for every function over 64K inputs.
+f32 is one rounding of the f64 body wherever there is no f32 port. On a GPU
+that costs f64 throughput (1/64 rate on consumer NVIDIA), and it is the price
+of the bits agreeing.
 
-`exp`, `exp2`, `log`, `log2`, `log10` and `pow` are ports of [ARM
-optimized-routines][aor]: ONE body each, used unchanged on the host, on NVPTX
-and on AMDGCN, for both widths (only `f32` `exp2` still uses the hardware
-instruction). Everything else is a musl port for device `f64` and a hardware
-approximation for device `f32`.
+The math is also its own std-only module, `b.dependency("gompute", .{}).module("math")`,
+for code that wants it without the GPU layer, such as a compiler folding
+constants.
 
-`expm1` and `atan` are here for a different reason, and it is worth knowing if
-you reach for `std.math` in a kernel. Neither needs a libcall, but both of
-std's ports raise the subnormal underflow flag through
-`std.mem.doNotOptimizeAway`, which for a float becomes `asm volatile ("" :: "rm"
-(v))`. The AMDGPU backend cannot match the `m` alternative, so both are a hard
-error on AMDGCN while assembling to PTX without complaint. **An NVIDIA-only test
-matrix will not see this.** `g.math.expm1` is std's own algorithm with that line
-dropped (values bit-identical); `g.math.atan` keeps std's scalar body on the
-host and takes its vector path on device. `std.math.log1p` happens not to
-contain the idiom and is fine as-is.
+**Vector forms.** At f32 and f64, `exp`, `exp2`, `log`, `log2`, `log10` and
+`pow` run as real SIMD, and so do f32 `sin`, `cos`, `tanh`, `sinh` and
+`cosh`. Each vector lane is the scalar call's result bit for bit, because the
+scalar body is the width-1 instance of the same code. A vector with any
+special lane (zero, subnormal, inf, NaN, huge) falls back to the scalar body
+for each lane. f64 `sin`/`cos`/`tanh`/`sinh`/`cosh`/`expm1`, `log1p` and
+`atan` still run one lane at a time.
 
-[aor]: https://github.com/ARM-software/optimized-routines
+**Accuracy**, as the maximum error measured in tests:
 
-That is a correctness decision before it is a speed one: glibc ≥ 2.28 *is* ARM
-optimized-routines for exactly those functions, so a simulator scored against a
-glibc-linked reference now shares its arithmetic. Zig's own `@exp`/`@log` are
-musl, a different algorithm that disagrees in the low bits. So is
-`extern "c" fn exp`, because compiler_rt's static definition wins over the
-shared `libm`.
-
-Ulp figures below are measured against the real glibc (`dlsym`'d past
-compiler_rt), ≥1e6 points per function over the full domain including
-subnormals, the saturation thresholds and the near-1 window; `sin`/`cos`/`tanh`
-and friends are measured on `sm_89` over x in (0, 8].
-
-| | `f32` | `f64` | Notes |
+| | Max error | Reference | Notes |
 | --- | --- | --- | --- |
-| `exp` | ≤1 ulp | ≤1 ulp | One body, host and device. |
-| `exp2` | ≤1 ulp | ≤1 ulp | Exact for integer `x`. `f32` is the hardware `exp2`. |
-| `log` | ≤1 ulp | ≤1 ulp | One body. Relative, not absolute; see below. |
-| `log2` | ≤1 ulp | ≤1 ulp | Own table; powers of two exact. |
-| `log10` | ≤1 ulp | ≤2 ulp vs glibc | 0.52 ulp against a 60-digit reference: the slack is glibc's, whose `log10` is not optimized-routines. |
-| `pow` | ≤1 ulp | ≤1 ulp | Integer y in ±64 is square-and-multiply, so exact. |
-| `sin` | ~1e-6 **absolute** | ≤1 ulp | f64 matches glibc bit-for-bit over (0, 8]. |
-| `cos` | ~1e-6 **absolute** | ≤1 ulp | |
-| `tan` | sin/cos | sin/cos | 0.16 absolute at 3π/2 in f32; error blows up at the poles. |
-| `tanh` | ≤1.8 ulp | ≤1 ulp | |
-| `sinh` | ≤3.7 ulp | ≤1.4 ulp | |
-| `cosh` | ≤3.7 ulp | similar | Overflows to infinity just under x = ±710 in f64. |
-| `sqrt` | exact | exact | Native instruction on both backends. |
-| `rsqrt` | exact | exact | `1/sqrt`, two IEEE ops, not the hardware approximation. |
+| `exp` | 0.505 ulp | f128 oracle | ARM optimized-routines. Faithful; promised < 0.52 (`math.max_ulp`). |
+| `log` | 0.502 ulp | f128 oracle | Faithful; promised < 0.52. `log(1)` is +0. |
+| `pow` | 0.502 ulp | f128 oracle | Faithful; promised < 0.55. Exact results come back exact. |
+| `exp2`, `log2`, `log10` | ≤1 / ≤1 / ≤2 ulp | glibc | f64 `log10` is 0.52 ulp against a 60-digit reference; the gap is glibc's error. |
+| f64 `sin`, `cos` | bit-identical to `@sin`/`@cos` | compiler_rt | musl, including Payne-Hanek for huge arguments. |
+| f64 `cosh` | 0.998 ulp | f128 oracle | std's is 1.131. |
+| f64 `tanh`, `sinh` | 2.05 / 1.75 ulp | f128 oracle | Bit-identical to std's musl bodies; not faithful. |
+| every f32 function | ≤ 0.82 ulp | f64, **all 2³² inputs** | exp/exp2/tanh/cosh 0.50, sin/cos/sinh 0.501, log/log2/log10 ≤ 0.82. |
+| `expm1`, `log1p` | std's bits | std | `expm1` minus one line that does not compile for AMDGCN. |
+| `atan` | within 1 ulp of std | std | std's vector body on every target. |
 
-**The absolute-error caveat.** `sin` and `cos` are bounded *absolutely* by the
-f32 hardware, not relatively. `sin.approx.f32` is good to about 2^-20 of
-absolute error, which is fine at x = 3 and is pure noise at x = π. Relative
-accuracy therefore collapses near each function's zeros: `sin` near multiples
-of π, `cos` near π/2 + kπ. If you are working in that neighbourhood, compute in
-`f64` and cast the result.
+`exp`, `log`, `pow` (in both arguments), `expm1`, `log1p` and `sinh` are
+**monotone**. That is tested at every table seam and branch edge, so a prover
+that evaluates only at interval endpoints can rely on it. That is why integer
+`y` goes through the same table route as any other `y`: the old
+square-and-multiply fast path stepped down across y = -64.
 
-The `log` family used to have the same problem: `lg2.approx.f32` bounds its
-error absolutely at ~2^-21, so `log(1.0000001)` was noise. That is what the
-`logf`/`log2f`/`log10f` ports fixed. They accumulate in binary64 and round
-once, so device `f32` `log` now costs about ten `f64` operations (1/64 rate on
-consumer NVIDIA) and is worth it only because it is otherwise wrong where it
-matters. A throughput-bound `f32` kernel that genuinely never goes near x = 1
-should call `@log2` directly.
+Why not `@exp`/`@sin`? Those builtins emit libcalls, and NVPTX/AMDGCN have no
+libm (`no libcall available for fexp`). std's `expm1` and scalar `atan` also do
+not compile for AMDGCN, because they raise an FP flag through inline asm the
+AMDGPU backend cannot match. **An NVIDIA-only test matrix will not see this.**
 
 ## Backend status
 

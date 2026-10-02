@@ -2,9 +2,11 @@
 
 ## Allocation-free GPU launch path
 
-`run` is intentionally convenient, not magical: it allocates a device buffer,
-uploads, launches, synchronizes, downloads and frees on every call. Reuse a
-buffer to avoid all of that:
+`run` is intentionally convenient, not magical: it uploads, launches,
+synchronizes and downloads on every call. Its device buffers are kept on the
+handle and grown on demand, so only the first call (or a bigger one) pays for
+an allocation, and `deinit` frees them. When the data can stay on the device,
+skip the copies too:
 
 ```zig
 var data = [_]f32{ -1, 2, -3, 4 };
@@ -30,6 +32,35 @@ length, and the generated extern parameter struct.
 which is how you wait for a bare `launch`. `launch` does not synchronize, and a
 device-side fault will not surface until you do. For partial transfers,
 device-to-device copies and streams, see [Runtime](runtime.html).
+
+## Graph replay
+
+`kernel.stream` is the stream `launch` enqueues on; it defaults to the NULL
+stream, which cannot be captured. Point it at a non-blocking stream and the same
+`launch` calls are recorded into a graph instead of run:
+
+```zig
+kernel.stream = try kernel.context.createStreamNonBlocking();
+defer kernel.stream.deinit();
+
+try kernel.stream.beginCapture(.thread_local);
+try kernel.launch(&buffer, data.len, .{ .scale = 2 });
+try kernel.launch(&buffer, data.len, .{ .scale = 2 });
+var graph = try kernel.stream.endCapture();
+defer graph.deinit();
+var exec = try graph.instantiate();
+defer exec.deinit();
+
+for (0..1000) |_| try exec.launch(&kernel.stream); // one driver call per replay
+try kernel.stream.synchronize();
+```
+
+Arguments, `params` included, are copied at capture time, so a replay always
+runs with the values you captured; `exec.update(&new_graph)` swaps them in place
+when only the parameters changed. Nothing that waits on the host may run
+between `beginCapture` and `endCapture` -- `run`, `synchronize`, or a blocking
+`upload` invalidate the capture. `kernel.context.hasGraphs()` is false on a
+CUDA driver older than 11.4; every graph call then returns `error.Unsupported`.
 
 ## Compile-time fusion
 
