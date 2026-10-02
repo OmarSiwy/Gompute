@@ -22,3 +22,36 @@ comptime {
     if (g.is_device) g.exportRaw("raw_triple", &rawTriple);
     g.exportKernels(@This());
 }
+
+/// Which `g.math` function `math_f64`/`math_f32` apply, for the CPU/GPU
+/// bit-identity section of the exhaustive run.
+pub const MathParams = struct { f: u32 };
+
+fn mathOf(comptime T: type) fn (T, MathParams) T {
+    return struct {
+        fn call(x: T, p: MathParams) T {
+            return switch (p.f) {
+                0 => g.math.exp(x),
+                1 => g.math.log(x),
+                2 => g.math.exp2(x),
+                3 => g.math.log2(x),
+                4 => g.math.log10(x),
+                5 => g.math.sin(x),
+                6 => g.math.cos(x),
+                7 => g.math.tan(x),
+                8 => g.math.tanh(x),
+                9 => g.math.sinh(x),
+                10 => g.math.cosh(x),
+                11 => g.math.expm1(x),
+                12 => g.math.log1p(x),
+                13 => g.math.atan(x),
+                14 => g.math.pow(x, @as(T, 1.4552480184709202)),
+                15 => g.math.sqrt(x),
+                else => x,
+            };
+        }
+    }.call;
+}
+pub const math_function_count = 16;
+pub const math_f64 = g.map("math_f64", f64, MathParams, mathOf(f64), .{});
+pub const math_f32 = g.map("math_f32", f32, MathParams, mathOf(f32), .{});

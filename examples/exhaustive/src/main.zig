@@ -101,6 +101,12 @@ pub fn main() !void {
     // ── Second kernel root + run-time kernel selection ──────────────────
     section("second root", 5, testSecondRoot);
 
+    // ── A generated kernel captured into a graph and replayed ───────────
+    section("graph replay", 3, testGraphReplay);
+
+    // ── g.math: the same bits on the GPU as on the CPU ──────────────────
+    section("math bit-identity", 2, testMathBits);
+
     // ── Comptime CPU reference (sanity baseline) ────────────────────────
     testCpuReference();
 
@@ -165,6 +171,86 @@ fn testAutoLarge() void {
     }
     check("large_10k", ok);
     print("ok\n", .{});
+}
+
+/// `Kernel.stream` is what makes a generated kernel capturable: two launches
+/// recorded once, replayed twice, add the offset four times.
+fn testGraphReplay() void {
+    print("\n[graph replay]\n", .{});
+    if (!g.AutoKernel(k2.add_offset).Cuda.available) return skip("this build emitted no CUDA artifacts");
+    var kernel = g.Kernel(k2.add_offset, .cuda).init(0) catch return skip("no CUDA device");
+    defer kernel.deinit();
+    if (!kernel.context.hasGraphs()) return skip("driver has no graphs");
+
+    var data = [_]f32{ 1, 2, 3 };
+    var buf = kernel.alloc(data.len) catch return;
+    defer buf.free();
+    buf.upload(&data, @sizeOf(@TypeOf(data))) catch return;
+
+    kernel.stream = kernel.context.createStreamNonBlocking() catch return;
+    defer kernel.stream.deinit();
+    kernel.stream.beginCapture(.thread_local) catch return;
+    kernel.launch(&buf, data.len, .{ .offset = 1 }) catch return;
+    kernel.launch(&buf, data.len, .{ .offset = 1 }) catch return;
+    var graph = kernel.stream.endCapture() catch return;
+    defer graph.deinit();
+    // Capture records, it does not run.
+    var probe: [3]f32 = undefined;
+    buf.download(&probe, @sizeOf(@TypeOf(probe))) catch return;
+    check("capture_ran_nothing", allSame(f32, &probe, &data));
+
+    var exec = graph.instantiate() catch return;
+    defer exec.deinit();
+    for (0..2) |_| exec.launch(&kernel.stream) catch return;
+    kernel.stream.synchronize() catch return;
+    buf.download(&data, @sizeOf(@TypeOf(data))) catch return;
+    check("replayed_twice", allSame(f32, &data, &[_]f32{ 5, 6, 7 }));
+    check("stream_idle", kernel.stream.query() catch false);
+    print("  {any}\n", .{data});
+}
+
+/// Every `g.math` function, f64 and f32, over random bit patterns plus each
+/// function's interesting ranges: the CUDA result must be the CPU's, bit for
+/// bit. One body per function on every target is the contract.
+fn testMathBits() void {
+    print("\n[math bit-identity]\n", .{});
+    if (!g.AutoKernel(k2.math_f64).Cuda.available) return skip("this build emitted no CUDA artifacts");
+    inline for (.{ f64, f32 }) |T| {
+        const Spec = if (T == f64) k2.math_f64 else k2.math_f32;
+        const U = std.meta.Int(.unsigned, @bitSizeOf(T));
+        var gpu = g.Kernel(Spec, .cuda).init(0) catch return skip("no CUDA device");
+        defer gpu.deinit();
+        var cpu = g.Kernel(Spec, .cpu).init(0) catch unreachable;
+        const n = 1 << 16;
+        var a: [n]T = undefined;
+        var b: [n]T = undefined;
+        var prng = std.Random.DefaultPrng.init(0xB17_1D);
+        const r = prng.random();
+        var mismatches: usize = 0;
+        for (0..k2.math_function_count) |f| {
+            for (&a, 0..) |*x, i| x.* = switch (i % 4) {
+                0 => @bitCast(r.int(U)), // any bit pattern: specials, subnormals
+                1 => (r.float(T) - 0.5) * 40,
+                2 => (r.float(T) - 0.5) * 1400,
+                else => 1 + (r.float(T) - 0.5) * 0.25, // around 1
+            };
+            const input = a;
+            b = a;
+            gpu.run(&a, .{ .f = @intCast(f) }) catch return;
+            cpu.run(&b, .{ .f = @intCast(f) }) catch unreachable;
+            var bad: usize = 0;
+            for (a, b) |x, y| {
+                if (@as(U, @bitCast(x)) != @as(U, @bitCast(y)) and !(std.math.isNan(x) and std.math.isNan(y))) bad += 1;
+            }
+            if (bad != 0) for (a, b, input) |x, y, in| {
+                if (@as(U, @bitCast(x)) != @as(U, @bitCast(y)) and !(std.math.isNan(x) and std.math.isNan(y))) print("    x={x} gpu={x} cpu={x}\n", .{ @as(U, @bitCast(in)), @as(U, @bitCast(x)), @as(U, @bitCast(y)) });
+            };
+            if (bad != 0) print("  {s} f{d}: {d} of {d} differ\n", .{ @typeName(T), f, bad, n });
+            mismatches += bad;
+        }
+        check("math_bits_" ++ @typeName(T), mismatches == 0);
+    }
+    print("  done\n", .{});
 }
 
 // ── Runtime dynamic: module load + buffer + kernel launch ───────────────
