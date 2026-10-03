@@ -2,12 +2,14 @@
 
 ## Versions
 
-Gompute pins one Zig release at a time; Zig 0.16 moved `std.Build`,
-`std.DynLib` and the NVPTX backend under it.
+Gompute pins one Zig release at a time; every Zig release so far has moved
+`std.Build`, `@typeInfo` or the GPU backends under it. Git tags name the Zig
+release a commit builds with; the package version is separate.
 
-| Gompute | Zig    |
-| ------- | ------ |
-| 1.0.x   | 0.16.0 |
+| Git tag | Gompute | Zig    |
+| ------- | ------- | ------ |
+| `0.16.0` | 1.0.0  | 0.16.0 |
+| `main`   | 1.0.0  | 0.17.0 |
 
 `minimum_zig_version` in `build.zig.zon` is the same value. Nothing older or
 newer is supported.
@@ -21,7 +23,7 @@ newer is supported.
 | `wasm32-wasi`       | Yes         | **Does not compile**                |
 | Windows             | Yes         | **Does not compile**                |
 
-Zig 0.16's `std.DynLib` only has an implementation for Linux and the
+Zig's `std.DynLib` only has an implementation for Linux and the
 Darwin/BSD family; every other target hits `@compileError("unsupported
 platform")`. Gompute `dlopen`s the CUDA and HIP drivers, so on Windows and
 wasm anything that instantiates `Kernel(spec, .cuda)`, `Kernel(spec, .hip)`,

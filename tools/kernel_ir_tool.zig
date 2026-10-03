@@ -1,13 +1,14 @@
-//! Fix Zig 0.16 GPU kernel aliases and emit a host-side alias map.
+//! List the GPU entry points in a kernel root's LLVM IR as a Zig name table.
 //!
-//! Usage: kernel_ir_tool <input.ll> <rewritten.ll> <aliases.zig>
+//! Usage: kernel_ir_tool <input.ll> <names.zig>
+//!
+//! Zig 0.16 exported a kernel as an LLVM alias of a mangled definition, which
+//! NVPTX rejects; this tool used to rewrite the IR around that. Since 0.17 the
+//! definition carries the exported name itself, so all that is left is reading
+//! the names off: `emitKernels` needs them at comptime to map a kernel name to
+//! the blob that holds it.
 
 const std = @import("std");
-
-const Alias = struct {
-    name: []const u8,
-    aliasee: []const u8,
-};
 
 fn identEnd(s: []const u8) usize {
     for (s, 0..) |c, i| switch (c) {
@@ -17,39 +18,27 @@ fn identEnd(s: []const u8) usize {
     return s.len;
 }
 
-fn parseAlias(line: []const u8) ?Alias {
-    if (!std.mem.startsWith(u8, line, "@")) return null;
-
-    const name_end = identEnd(line[1..]);
-    if (name_end == 0) return null;
-    const name = line[1 .. 1 + name_end];
-
-    // Anchor on the header, not on " alias " anywhere in the line: a string
-    // constant whose *contents* spell " alias " would otherwise be parsed as an
-    // alias and silently deleted from the module. Everything that may precede
-    // the kind keyword (linkage, visibility, unnamed_addr, addrspace(N), ...)
-    // is a single space-free word, so the first word that names a kind decides.
-    if (!std.mem.startsWith(u8, line[1 + name_end ..], " = ")) return null;
-    var words = std.mem.tokenizeScalar(u8, line[1 + name_end + " = ".len ..], ' ');
+/// The symbol of an externally visible kernel definition, still LLVM-escaped
+/// if quoted, or null for any other line.
+fn parseKernel(line: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, line, "define ")) return null;
+    const at = std.mem.indexOfScalar(u8, line, '@') orelse return null;
+    // Everything before the name is space-separated keywords and the return
+    // type; a kernel returns void, so no word here can hide a space.
+    var kernel = false;
+    var words = std.mem.tokenizeScalar(u8, line["define ".len..at], ' ');
     while (words.next()) |word| {
-        if (std.mem.eql(u8, word, "alias")) break;
-        // ponytail: the kinds Zig's backends actually emit. A new kind just
-        // means the scan runs off the end and returns null, which is the safe
-        // direction -- the global stays in the module.
-        for ([_][]const u8{ "global", "constant", "ifunc" }) |kind| {
-            if (std.mem.eql(u8, word, kind)) return null;
-        }
-    } else return null;
+        if (std.mem.eql(u8, word, "internal") or std.mem.eql(u8, word, "private")) return null;
+        if (std.mem.eql(u8, word, "ptx_kernel") or std.mem.eql(u8, word, "amdgpu_kernel")) kernel = true;
+    }
+    if (!kernel) return null;
 
-    const at = std.mem.lastIndexOfScalar(u8, line, '@') orelse return null;
     const rest = line[at + 1 ..];
-    const aliasee = if (rest.len > 0 and rest[0] == '"') blk: {
+    const name = if (rest.len > 0 and rest[0] == '"') blk: {
         const close = std.mem.indexOfScalarPos(u8, rest, 1, '"') orelse return null;
         break :blk rest[0 .. close + 1];
     } else rest[0..identEnd(rest)];
-
-    if (aliasee.len == 0) return null;
-    return .{ .name = name, .aliasee = aliasee };
+    return if (name.len == 0) null else name;
 }
 
 fn decodeLlvmName(arena: std.mem.Allocator, llvm_name: []const u8) ![]const u8 {
@@ -77,116 +66,23 @@ fn decodeLlvmName(arena: std.mem.Allocator, llvm_name: []const u8) ![]const u8 {
     return out.items;
 }
 
-/// Drop the alias lines and rename each aliased definition to its public name.
-fn rewriteIr(arena: std.mem.Allocator, input: []const u8, aliases: []const Alias) ![]const u8 {
-    var rewritten: std.ArrayList(u8) = .empty;
-    try rewritten.ensureTotalCapacity(arena, input.len);
-    var first = true;
-    var it = std.mem.splitScalar(u8, input, '\n');
-    while (it.next()) |line| {
-        if (parseAlias(line) != null) continue;
-        if (!first) try rewritten.append(arena, '\n');
-        first = false;
-
-        if (std.mem.startsWith(u8, line, "define ")) rewrite: {
-            for (aliases) |alias| {
-                const marker = try std.fmt.allocPrint(arena, "@{s}(", .{alias.aliasee});
-                const pos = std.mem.indexOf(u8, line, marker) orelse continue;
-                const head = line[0..pos];
-                var body = head["define ".len..];
-                for ([_][]const u8{ "internal ", "private " }) |linkage| {
-                    if (std.mem.startsWith(u8, body, linkage)) {
-                        body = body[linkage.len..];
-                        break;
-                    }
-                }
-                try rewritten.appendSlice(arena, "define ");
-                try rewritten.appendSlice(arena, body);
-                try rewritten.append(arena, '@');
-                try rewritten.appendSlice(arena, alias.name);
-                try rewritten.appendSlice(arena, line[pos + marker.len - 1 ..]);
-                break :rewrite;
-            }
-            try rewritten.appendSlice(arena, line);
-        } else {
-            try rewritten.appendSlice(arena, line);
-        }
-    }
-
-    // When multiple aliases target the same definition (LLVM merges identical
-    // kernel bodies), only the first got renamed. Clone the full function body
-    // for each additional alias.
-    var renamed = std.StringHashMap([]const u8).init(arena);
-    for (aliases) |alias| {
-        const gop = try renamed.getOrPut(alias.aliasee);
-        if (!gop.found_existing) {
-            gop.value_ptr.* = alias.name;
-            continue;
-        }
-        const primary = gop.value_ptr.*;
-        const needle = try std.fmt.allocPrint(arena, " @{s}(", .{primary});
-        // Take the occurrence that is on a "define " line; a call site would
-        // otherwise walk back to the *previous* function and clone that.
-        var scan: usize = 0;
-        var fn_start: usize = undefined;
-        const define_start = while (std.mem.indexOfPos(u8, rewritten.items, scan, needle)) |pos| {
-            const line_start = if (std.mem.lastIndexOfScalar(u8, rewritten.items[0..pos], '\n')) |nl|
-                nl + 1
-            else
-                0;
-            if (std.mem.startsWith(u8, rewritten.items[line_start..], "define ")) {
-                fn_start = pos;
-                break line_start;
-            }
-            scan = pos + needle.len;
-        } else continue;
-
-        // A function only ever closes with a line that is exactly "}". Matching
-        // any "}" followed by a newline truncated the body at ordinary lines
-        // such as `%s = alloca { i32, i32 }`, emitting IR with no terminator.
-        var end = fn_start + needle.len;
-        while (end < rewritten.items.len) : (end += 1) {
-            if (rewritten.items[end] != '}') continue;
-            if (end == 0 or rewritten.items[end - 1] != '\n') continue;
-            if (end + 1 == rewritten.items.len or rewritten.items[end + 1] == '\n') break;
-        }
-        if (end >= rewritten.items.len) continue;
-
-        const fn_body = rewritten.items[define_start .. end + 1];
-        const old_name = try std.fmt.allocPrint(arena, "@{s}(", .{primary});
-        const new_name = try std.fmt.allocPrint(arena, "@{s}(", .{alias.name});
-        const cloned = try std.mem.replaceOwned(u8, arena, fn_body, old_name, new_name);
-        try rewritten.append(arena, '\n');
-        try rewritten.appendSlice(arena, cloned);
-    }
-
-    return rewritten.items;
-}
-
-/// Public entry name -> symbol as it appears in the *unrewritten* object, which
-/// is what HIP loads. CUDA loads the rewritten module, where the entry is the
-/// public name itself, so a CUDA caller ignores `internal` and keeps the name it
-/// asked for -- it reads this table only to know the kernel is in the artifact.
-///
 /// A plain table rather than a `resolve` function: `emitKernels` merges one of
 /// these per kernel root into a single comptime name -> (blob, symbol) map, and
 /// a chain of comptime `if`s cannot be merged.
-fn emitMap(arena: std.mem.Allocator, aliases: []const Alias) ![]const u8 {
+fn emitNames(arena: std.mem.Allocator, input: []const u8) ![]const u8 {
     var out: std.Io.Writer.Allocating = .init(arena);
     try out.writer.writeAll(
-        \\//! Generated from LLVM aliases. Do not edit.
-        \\//!
-        \\//! `internal` is the symbol name in the HIP artifact. In the CUDA
-        \\//! artifact the entry point is `exported` itself.
-        \\pub const Entry = struct { exported: [:0]const u8, internal: [:0]const u8 };
-        \\
-        \\pub const entries = [_]Entry{
+        \\//! Generated from the kernel definitions in LLVM IR. Do not edit.
+        \\pub const entries = [_][:0]const u8{
         \\
     );
-    for (aliases) |alias| try out.writer.print("    .{{ .exported = \"{f}\", .internal = \"{f}\" }},\n", .{
-        std.zig.fmtString(alias.name),
-        std.zig.fmtString(try decodeLlvmName(arena, alias.aliasee)),
-    });
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, input, '\n');
+    while (it.next()) |line| if (parseKernel(line)) |name| {
+        try out.writer.print("    \"{f}\",\n", .{std.zig.fmtString(try decodeLlvmName(arena, name))});
+        n += 1;
+    };
+    if (n == 0) return error.NoKernelsFound;
     try out.writer.writeAll("};\n");
     return out.written();
 }
@@ -195,175 +91,59 @@ pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const io = init.io;
     const args = try init.minimal.args.toSlice(arena);
-    if (args.len != 4) {
-        std.debug.print("usage: kernel_ir_tool <input.ll> <rewritten.ll> <aliases.zig>\n", .{});
+    if (args.len != 3) {
+        std.debug.print("usage: kernel_ir_tool <input.ll> <names.zig>\n", .{});
         return error.BadUsage;
     }
 
-    const input = try std.Io.Dir.cwd().readFileAlloc(
-        io,
-        args[1],
-        arena,
-        .limited(512 * 1024 * 1024),
+    const input = try std.Io.Dir.cwd().readFileAlloc(io, args[1], arena, .limited(512 * 1024 * 1024));
+    const names = emitNames(arena, input) catch |err| switch (err) {
+        // A user who forgot exportKernels gets told what to do, not an error name.
+        error.NoKernelsFound => {
+            std.debug.print(
+                \\gompute: the device compilation of your kernels file produced no GPU entry points.
+                \\
+                \\Every kernel launched with Kernel(spec, .cuda) or Kernel(spec, .hip) must be
+                \\exported from the kernels file named by `.kernels_root` in your build.zig:
+                \\
+                \\    comptime {{ g.exportKernels(@This()); }}          // all kernels in this file
+                \\    comptime {{ g.exportKernels(.{{ my_kernel }}); }}   // or an explicit list
+                \\
+                \\Check that the file exporting them is the same file `.kernels_root` points at.
+                \\
+            , .{});
+            return err;
+        },
+        else => |e| return e,
+    };
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = args[2], .data = names });
+}
+
+test parseKernel {
+    try std.testing.expectEqualStrings("t_map", parseKernel(
+        "define ptx_kernel void @t_map(ptr addrspace(1) align 4 captures(none) %0, i64 %1) local_unnamed_addr #2 {",
+    ).?);
+    try std.testing.expectEqualStrings("\"a b\"", parseKernel(
+        "define dso_local amdgpu_kernel void @\"a b\"(ptr addrspace(1) %0) #1 {",
+    ).?);
+    // Device helpers, declarations, and kernels that are not exported.
+    try std.testing.expect(parseKernel("define private fastcc double @device.math.softSin(double %0) unnamed_addr #7 {") == null);
+    try std.testing.expect(parseKernel("define internal ptx_kernel void @hidden(ptr %0) {") == null);
+    try std.testing.expect(parseKernel("declare ptx_kernel void @ext(ptr)") == null);
+    try std.testing.expect(parseKernel("@.str = private unnamed_addr constant [9 x i8] c\"ptx_kernel\\00\"") == null);
+}
+
+test emitNames {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // Escaped as a Zig string, and `\22` in the LLVM name decoded first.
+    const names = try emitNames(arena,
+        \\define ptx_kernel void @add(ptr %0) {
+        \\}
+        \\define ptx_kernel void @"k\22x"(ptr %0) {
+        \\}
     );
-
-    var aliases: std.ArrayList(Alias) = .empty;
-    var it = std.mem.splitScalar(u8, input, '\n');
-    while (it.next()) |line| {
-        if (parseAlias(line)) |alias| try aliases.append(arena, alias);
-    }
-    // "alias" is an internal detail of the Zig 0.16 NVPTX workaround. A user who
-    // forgot exportKernels has never heard the word, so say what to do instead.
-    if (aliases.items.len == 0) {
-        std.debug.print(
-            \\gompute: the device compilation of your kernels file produced no GPU entry points.
-            \\
-            \\Every kernel launched with Kernel(spec, .cuda) or Kernel(spec, .hip) must be
-            \\exported from the kernels file named by `.kernels_root` in your build.zig:
-            \\
-            \\    comptime {{ g.exportKernels(@This()); }}          // all kernels in this file
-            \\    comptime {{ g.exportKernels(.{{ my_kernel }}); }}   // or an explicit list
-            \\
-            \\Check that the file exporting them is the same file `.kernels_root` points at.
-            \\
-        , .{});
-        return error.NoKernelAliasesFound;
-    }
-
-    const rewritten = try rewriteIr(arena, input, aliases.items);
-    const map_source = try emitMap(arena, aliases.items);
-
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = args[2], .data = rewritten });
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = args[3], .data = map_source });
-}
-
-test "parse Zig-style alias" {
-    const a = parseAlias("@add = alias void (ptr), ptr @kernels.add").?;
-    try std.testing.expectEqualStrings("add", a.name);
-    try std.testing.expectEqualStrings("kernels.add", a.aliasee);
-}
-
-test "a global whose contents say ' alias ' is not an alias" {
-    try std.testing.expect(parseAlias(
-        \\@.str = private unnamed_addr constant [16 x i8] c"x alias y\00", align 1
-    ) == null);
-    try std.testing.expect(parseAlias("@g = external global i32") == null);
-    try std.testing.expect(parseAlias("@r = internal unnamed_addr alias i32, ptr @g") != null);
-}
-
-/// Everything below drives the two rewrite passes through an arena, the way
-/// main() does.
-fn testRewrite(arena: std.mem.Allocator, input: []const u8) ![]const u8 {
-    var aliases: std.ArrayList(Alias) = .empty;
-    var it = std.mem.splitScalar(u8, input, '\n');
-    while (it.next()) |line| {
-        if (parseAlias(line)) |alias| try aliases.append(arena, alias);
-    }
-    return rewriteIr(arena, input, aliases.items);
-}
-
-test "string constants survive the rewrite and stay out of the name map" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const input =
-        \\@.str = private unnamed_addr constant [16 x i8] c"x alias y\00", align 1
-        \\@add = alias void (ptr), ptr @kernels.add
-        \\
-        \\define private ptx_kernel void @kernels.add(ptr %0) {
-        \\  ret void
-        \\}
-        \\
-    ;
-    const out = try testRewrite(arena, input);
-    try std.testing.expect(std.mem.indexOf(u8, out, "@.str = private") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "@add = alias") == null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "define ptx_kernel void @add(ptr %0) {") != null);
-
-    const map = try emitMap(arena, &.{.{ .name = "add", .aliasee = "kernels.add" }});
-    try std.testing.expect(std.mem.indexOf(u8, map, ".str") == null);
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        map,
-        ".{ .exported = \"add\", .internal = \"kernels.add\" },",
-    ) != null);
-}
-
-test emitMap {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-
-    // The emitted file is compiled by build.zig, so anything LLVM allows in a
-    // name has to come back out as a valid Zig string literal: quotes and
-    // backslashes escaped, non-printables as \xNN, `\22` in the aliasee decoded
-    // to the byte it names first.
-    const map = try emitMap(arena_state.allocator(), &.{.{ .name = "a\"b\\c\x01", .aliasee = "\"k\\22x\"" }});
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        map,
-        ".{ .exported = \"a\\\"b\\\\c\\x01\", .internal = \"k\\\"x\" },",
-    ) != null);
-}
-
-test "cloning a shared definition copies the whole body" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    // The alloca's trailing "}" used to be mistaken for the end of the function.
-    const input =
-        \\@one = alias void (ptr), ptr @impl
-        \\@two = alias void (ptr), ptr @impl
-        \\
-        \\define private ptx_kernel void @impl(ptr %0) {
-        \\entry:
-        \\  %s = alloca { i32, i32 }
-        \\  store i32 7, ptr %s
-        \\  ret void
-        \\}
-        \\
-    ;
-    const out = try testRewrite(arena, input);
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, out, "define ptx_kernel void @"));
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, out, "store i32 7, ptr %s"));
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, out, "  ret void\n}"));
-    try std.testing.expect(std.mem.indexOf(u8, out, "@one(ptr %0)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "@two(ptr %0)") != null);
-    try std.testing.expect(std.mem.endsWith(u8, std.mem.trimEnd(u8, out, "\n"), "}"));
-}
-
-test "a call site does not make the clone pick the previous function" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const input =
-        \\@one = alias void (ptr), ptr @impl
-        \\@two = alias void (ptr), ptr @impl
-        \\
-        \\define internal void @caller(ptr %0) {
-        \\  call void @impl(ptr %0)
-        \\  ret void
-        \\}
-        \\
-        \\define private ptx_kernel void @impl(ptr %0) {
-        \\  ret void
-        \\}
-        \\
-    ;
-    const out = try testRewrite(arena, input);
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "define internal void @caller"));
-    try std.testing.expect(std.mem.indexOf(u8, out, "define ptx_kernel void @two(ptr %0) {\n  ret void\n}") != null);
-}
-
-test "hex escapes decode, including one at the very end of the name" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    try std.testing.expectEqualStrings("a.b", try decodeLlvmName(arena, "\"a\\2Eb\""));
-    try std.testing.expectEqualStrings("kernels.a\"", try decodeLlvmName(arena, "\"kernels.a\\22\""));
-    // A truncated escape is not one; it stays literal.
-    try std.testing.expectEqualStrings("a\\2", try decodeLlvmName(arena, "a\\2"));
+    try std.testing.expect(std.mem.indexOf(u8, names, "    \"add\",\n    \"k\\\"x\",\n") != null);
+    try std.testing.expectError(error.NoKernelsFound, emitNames(arena, "define void @f() {\n}\n"));
 }

@@ -8,13 +8,13 @@
 //! replacement; it also compiles on the host, so one kernel source builds both
 //! ways.
 //!
-//! `expm1` and `atan` fail differently and only on AMD, which is how they went
+//! `expm1`, `log1p` and `atan` fail differently and only on AMD, which is how they went
 //! unnoticed: both assemble to PTX cleanly, and both die on AMDGCN. Not for
 //! want of a libcall — std's ports raise the subnormal underflow flag through
 //! `std.mem.doNotOptimizeAway`, which for a float is `asm volatile ("" :: "rm"
 //! (v))`, and the AMDGPU backend cannot match the `m` alternative. That flag is
 //! a register no GPU exposes, so the idiom is dead weight on device and a hard
-//! error there. See `expm1` for the port and `atan` for the cheaper dodge.
+//! error there. See `expm1` and `log1p` for the ports and `atan` for the cheaper dodge.
 //!
 //! `exp exp2 log log2 log10 pow` are ports of ARM optimized-routines (what
 //! glibc >= 2.28 ships), f32 sin/cos follow musl's `sinf` in binary64, f32
@@ -64,7 +64,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const arch = builtin.cpu.arch;
+const arch = builtin.target.cpu.arch;
 const dev = arch == .nvptx64 or arch == .amdgcn;
 
 /// The element type a body computes in: `T` itself for a scalar, the child for
@@ -246,15 +246,77 @@ pub inline fn expm1(x: anytype) @TypeOf(x) {
     return apply(softExpm1, x);
 }
 
-/// log(1 + x), std's musl port, which is plain f64 arithmetic and so already
-/// one body on every target. Here so callers have one module for all of it.
+/// log(1 + x), std's musl port with the same one line dropped as `expm1`.
+///
+/// Zig 0.17's `std.math.log1p` gained the subnormal `doNotOptimizeAway`, so it
+/// stopped compiling for AMDGCN too. Every return is bit-identical to std.
 pub inline fn log1p(x: anytype) @TypeOf(x) {
-    if (Elem(@TypeOf(x)) == f32) return apply(viaF64(log1pBody), x);
-    return apply(log1pBody, x);
+    if (Elem(@TypeOf(x)) == f32) return apply(viaF64(softLog1p), x);
+    return apply(softLog1p, x);
 }
 
-fn log1pBody(x: f64) f64 {
-    return std.math.log1p(x);
+fn softLog1p(x: f64) f64 {
+    const ln2_hi: f64 = 6.93147180369123816490e-01;
+    const ln2_lo: f64 = 1.90821492927058770002e-10;
+    const Lg1: f64 = 6.666666666666735130e-01;
+    const Lg2: f64 = 3.999999999940941908e-01;
+    const Lg3: f64 = 2.857142874366239149e-01;
+    const Lg4: f64 = 2.222219843214978396e-01;
+    const Lg5: f64 = 1.818357216161805012e-01;
+    const Lg6: f64 = 1.531383769920937332e-01;
+    const Lg7: f64 = 1.479819860511658591e-01;
+
+    const ix: u64 = @bitCast(x);
+    const hx: u32 = @intCast(ix >> 32);
+    var k: i32 = 1;
+    var c: f64 = undefined;
+    var f: f64 = undefined;
+
+    if (hx < 0x3FDA827A or hx >> 31 != 0) { // 1 + x < sqrt(2)
+        if (ix == 0xBFF0000000000000) return x / 0.0; // log1p(-1) = -inf
+        if (hx >= 0xBFF00000) return (x - x) / 0.0; // x < -1: nan
+        // |x| < 2^-53. std raises underflow here for a subnormal x; dropped.
+        if ((hx << 1) < (0x3CA00000 << 1)) return x;
+        if (hx <= 0xBFD2BEC4) { // sqrt(2)/2- <= 1 + x < sqrt(2)+
+            k = 0;
+            c = 0;
+            f = x;
+        }
+    } else if (hx >= 0x7FF00000) {
+        return x;
+    }
+
+    if (k != 0) {
+        const uf = 1 + x;
+        const hu: u64 = @bitCast(uf);
+        var iu: u32 = @intCast(hu >> 32);
+        iu += 0x3FF00000 - 0x3FE6A09E;
+        k = @as(i32, @intCast(iu >> 20)) - 0x3FF;
+
+        // correction to avoid underflow in c / u
+        if (k < 54) {
+            c = if (k >= 2) 1 - (uf - x) else x - (uf - 1);
+            c /= uf;
+        } else {
+            c = 0;
+        }
+
+        // u into [sqrt(2)/2, sqrt(2)]
+        iu = (iu & 0x000FFFFF) + 0x3FE6A09E;
+        const iq = (@as(u64, iu) << 32) | (hu & 0xFFFFFFFF);
+        f = @as(f64, @bitCast(iq)) - 1;
+    }
+
+    const hfsq = 0.5 * f * f;
+    const s = f / (2.0 + f);
+    const z = s * s;
+    const w = z * z;
+    const t1 = w * (Lg2 + w * (Lg4 + w * Lg6));
+    const t2 = z * (Lg1 + w * (Lg3 + w * (Lg5 + w * Lg7)));
+    const R = t2 + t1;
+    const dk: f64 = @floatFromInt(k);
+
+    return s * (hfsq + R) + (dk * ln2_lo + c) - hfsq + f + dk * ln2_hi;
 }
 
 /// arctangent: `std.math.atan`'s VECTOR body on every target, scalars as a
@@ -1713,19 +1775,40 @@ test "ported cores agree with the builtins" {
     }
 }
 
+test "log1p is bit-identical to std" {
+    // Same claim as expm1's port. Edges are the branch splits: -1, 2^-53,
+    // the sqrt(2)/2 and sqrt(2) bounds, k = 54, a subnormal, inf.
+    for ([_]f64{
+        0,      -0.0,    -1,     -0.9999, 0x1p-54, -0x1p-54, 0x1p-53, 4.9e-324,
+        -0.293, -0.2929, 0.4142, 0.4143,  1,       0x1p54,   1e300,   std.math.inf(f64),
+    }) |x| try std.testing.expectEqual(
+        @as(u64, @bitCast(std.math.log1p(x))),
+        @as(u64, @bitCast(log1p(x))),
+    );
+    var i: i32 = -99_999;
+    while (i < 200_000) : (i += 1) {
+        const x = @as(f64, @floatFromInt(i)) * 1e-5;
+        try std.testing.expectEqual(
+            @as(u64, @bitCast(std.math.log1p(x))),
+            @as(u64, @bitCast(log1p(x))),
+        );
+    }
+    try std.testing.expect(std.math.isNan(log1p(@as(f64, -2))));
+}
+
 test "expm1 is bit-identical to std, and atan is within an ulp" {
     // The whole claim of the port: it drops a line that touched only the FP
     // flag register, so every VALUE must match std exactly. Bit equality, over
     // the branch boundaries the algorithm actually switches on -- 2^-54, the
     // 0.5*ln2 and 1.5*ln2 reduction splits, 56*ln2, and the overflow threshold.
     const edges = [_]f64{
-        0,          -0.0,         0x1p-60,     -0x1p-60,   0x1p-54,
-        -0x1p-54,   0x1p-53,      1e-300,      -1e-300,    0.3465,
-        -0.3465,    0.3466,       -0.3466,     1.0397,     -1.0397,
-        1.0398,     -1.0398,      1,           -1,         0.25,
-        -0.25,      -0.2501,      2,           -2,         38.8,
-        -38.8,      38.9,         709.78,      709.79,     710,
-        -745,       1e300,        -1e300,
+        0,        -0.0,    0x1p-60, -0x1p-60, 0x1p-54,
+        -0x1p-54, 0x1p-53, 1e-300,  -1e-300,  0.3465,
+        -0.3465,  0.3466,  -0.3466, 1.0397,   -1.0397,
+        1.0398,   -1.0398, 1,       -1,       0.25,
+        -0.25,    -0.2501, 2,       -2,       38.8,
+        -38.8,    38.9,    709.78,  709.79,   710,
+        -745,     1e300,   -1e300,
     };
     for (edges) |x| {
         try std.testing.expectEqual(
@@ -1877,8 +1960,8 @@ const Fn32 = fn (f32) callconv(.c) f32;
 /// either width. Sampling lives here rather than in the tests because every
 /// function wants the same four shapes and only the ranges differ.
 fn Diff(comptime T: type) type {
-    const U = std.meta.Int(.unsigned, @bitSizeOf(T));
-    const I = std.meta.Int(.signed, @bitSizeOf(T));
+    const U = @Int(.unsigned, @bitSizeOf(T));
+    const I = @Int(.signed, @bitSizeOf(T));
     return struct {
         const Self = @This();
 
@@ -2569,7 +2652,7 @@ test "vector pow is the scalar call, lane for lane, f64 and f32" {
                 }
             }
             const got = pow(x, y);
-            const U = std.meta.Int(.unsigned, @bitSizeOf(T));
+            const U = @Int(.unsigned, @bitSizeOf(T));
             inline for (0..w) |l| {
                 const want = pow(x[l], y[l]);
                 if (!(std.math.isNan(want) and std.math.isNan(got[l])))

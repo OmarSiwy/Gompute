@@ -30,7 +30,7 @@ const BackendOptions = struct {
     gpu: Gpu = .auto,
     /// Optimize mode for this backend's device code. Overrides
     /// `EmitOptions.optimize`.
-    optimize: ?std.builtin.OptimizeMode = null,
+    optimize: ?std.lang.Optimize = null,
 };
 
 pub const CudaOptions = BackendOptions;
@@ -39,12 +39,13 @@ pub const HipOptions = BackendOptions;
 /// ponytail: nvidia-smi ships with every NVIDIA driver; querying it is the
 /// lightest reliable probe. Compute cap "8.9" maps directly to "sm_89".
 fn detectCudaGpu(b: *std.Build) ?[]const u8 {
-    var code: u8 = undefined;
-    const out = b.runAllowFail(
+    const out = switch (b.runFallible(
         &.{ "nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader" },
-        &code,
-        .ignore,
-    ) catch return null;
+        .{ .stderr_behavior = .ignore },
+    )) {
+        .success => |out| out,
+        else => return null,
+    };
     const line = std.mem.trim(u8, std.mem.sliceTo(out, '\n'), " \r\t");
     // nvidia-smi can exit 0 and still print "[N/A]" or "[Not Supported]" for a
     // card it cannot report. Passing that through produced "sm_[N/A]", which
@@ -93,8 +94,10 @@ fn detectHipGpu(b: *std.Build) ?[]const u8 {
         &.{"amdgpu-arch"},
         &.{"rocm_agent_enumerator"},
     }) |argv| {
-        var code: u8 = undefined;
-        const out = b.runAllowFail(argv, &code, .ignore) catch continue;
+        const out = switch (b.runFallible(argv, .{ .stderr_behavior = .ignore })) {
+            .success => |out| out,
+            else => continue,
+        };
         var it = std.mem.tokenizeAny(u8, out, " \r\n\t");
         while (it.next()) |arch| {
             // gfx000 is the CPU agent reported by rocm_agent_enumerator.
@@ -121,6 +124,11 @@ fn resolveGpu(
     switch (gpu) {
         .name => |n| return n,
         .auto => {
+            // The answer depends on the machine, not on any file, so the
+            // configure cache must not replay it: swap the GPU and the next
+            // build has to probe again. Costs a re-configure per `zig build`,
+            // which `.name` avoids.
+            b.graph.poisonCache();
             if (detect(b)) |n| return n;
             std.log.warn(
                 "gompute: .auto found no " ++ backend ++ " GPU on this BUILD machine, so the " ++
@@ -136,18 +144,18 @@ fn resolveGpu(
     }
 }
 
-/// Debug device code drags std.builtin panic globals into the module and
-/// LLVM's NVPTX backend emits invalid PTX types (.u2/.u4/.u5) for them.
-/// ReleaseFast removes the panic machinery outright rather than optimizing it,
-/// so it serves that goal strictly better than ReleaseSafe -- and far cheaper:
+/// Debug device code drags the std panic machinery into the module (on Zig
+/// 0.16 the NVPTX backend even emitted invalid PTX types, .u2/.u4/.u5, for
+/// it). ReleaseFast removes it outright rather than optimizing it, so it
+/// serves that goal strictly better than ReleaseSafe -- and far cheaper:
 /// ReleaseSafe keeps a panic edge per operation, which sends the LLVM pipeline
 /// superlinear on large straight-line kernels (32x on a 140k-line device model,
 /// 443s vs 13.6s; measured by the ARPice consumer across 37 models).
 ///
 /// ponytail: no way to ask for on-device safety checks. Add an EmitOptions
 /// knob if someone wants them, but quote the compile cost above first.
-fn deviceOptimize(mode: std.builtin.OptimizeMode) std.builtin.OptimizeMode {
-    return if (mode == .Debug) .ReleaseFast else mode;
+fn deviceOptimize(mode: std.lang.Optimize) std.lang.Optimize {
+    return if (mode == .debug) .fast else mode;
 }
 
 /// Builds the extra imports for the kernel root, for one backend.
@@ -164,7 +172,7 @@ fn deviceOptimize(mode: std.builtin.OptimizeMode) std.builtin.OptimizeMode {
 pub const DeviceImportsFn = *const fn (
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     ctx: ?*anyopaque,
 ) []const std.Build.Module.Import;
 
@@ -210,7 +218,7 @@ pub const EmitOptions = struct {
     target: ?std.Build.ResolvedTarget = null,
     /// Optimize mode for device code (from standardOptimizeOption).
     /// Defaults to the host artifact's optimize mode.
-    optimize: ?std.builtin.OptimizeMode = null,
+    optimize: ?std.lang.Optimize = null,
 };
 
 /// ponytail: one build graph per process, so a plain list is enough to catch
@@ -298,7 +306,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("build.zig"),
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = .debug,
         }),
     });
     const run_build_tests = b.addRunArtifact(build_tests);
@@ -308,7 +316,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/codegen.zig"),
             .target = target,
-            .optimize = .ReleaseFast,
+            .optimize = .fast,
             .imports = &.{.{ .name = "gompute", .module = host_mod }},
         }),
     });
@@ -321,11 +329,11 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("tools/codegen_check.zig"),
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = .debug,
         }),
     });
     const run_codegen_check = b.addRunArtifact(codegen_check);
-    run_codegen_check.addFileArg(codegen_probe.getEmittedAsm());
+    run_codegen_check.addFileArg2(codegen_probe.getEmittedAsm(), .{});
 
     const check_tests = b.addTest(.{ .root_module = codegen_check.root_module });
     const run_check_tests = b.addRunArtifact(check_tests);
@@ -339,12 +347,8 @@ pub fn build(b: *std.Build) void {
     // It runs the whole way to PTX, not just to IR. The frontend is not where
     // device code fails: `src/device/math.zig` exists because `@exp` and `@sin`
     // reach the IR->ISA stage and die there ("no libcall available for fexp"),
-    // which an IR-only probe cannot see. `@export` on a `callconv(.kernel)`
-    // function emits an LLVM alias and the NVPTX backend rejects one
-    // ("NVPTX aliasee must be a non-kernel function definition"), so the probe
-    // goes through `tools/kernel_ir_tool.zig` first -- the same three steps
-    // `buildArtifacts` runs, which until now nothing in `zig build test`
-    // exercised either.
+    // which an IR-only probe cannot see. The IR also goes through
+    // `tools/kernel_ir_tool.zig`, the same steps `buildArtifacts` runs.
     const device_probe = b.addObject(.{
         .name = "gompute-device-probe",
         .root_module = b.createModule(.{
@@ -353,37 +357,29 @@ pub fn build(b: *std.Build) void {
                 .arch_os_abi = "nvptx64-cuda",
                 .cpu_features = "sm_70",
             }) catch unreachable),
-            .optimize = .ReleaseFast,
+            .optimize = .fast,
             .strip = true,
             .imports = &.{.{ .name = "gompute", .module = device_mod }},
         }),
     });
-    const probe_rewrite = b.addRunArtifact(b.addExecutable(.{
+    const probe_names = b.addRunArtifact(b.addExecutable(.{
         .name = "gompute-kernel-ir-tool",
         .root_module = b.createModule(.{
             .root_source_file = b.path("tools/kernel_ir_tool.zig"),
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = .debug,
         }),
     }));
-    probe_rewrite.addFileArg(device_probe.getEmittedLlvmIr());
-    const probe_ir = probe_rewrite.addOutputFileArg("gompute_probe.ll");
-    _ = probe_rewrite.addOutputFileArg("gompute_probe_names.zig");
+    probe_names.addFileArg2(device_probe.getEmittedLlvmIr(), .{});
+    // Every entry shape must come out under its exported name, which is what
+    // the host's `getKernel` looks up.
+    const names_check = b.addCheckFile(probe_names.addOutputFileArg2("gompute_probe_names.zig", .{}), .{ .expected_matches = &.{
+        "\"t_map\"",    "\"t_map_to\"",  "\"t_zip\"",         "\"t_reduce\"",
+        "\"t_gather\"", "\"t_scatter\"", "\"t_map_indexed\"",
+    } });
 
-    const probe_ptx = b.addSystemCommand(&.{
-        b.graph.zig_exe,
-        "cc",
-        "-target",
-        "nvptx64-cuda",
-        "-mcpu=sm_70",
-        "-S",
-        "-g0",
-        "-Wno-unused-command-line-argument",
-    });
-    probe_ptx.addFileArg(probe_ir);
-    const probe_ptx_out = probe_ptx.addPrefixedOutputFileArg("-o", "gompute_probe.ptx");
     // The lowerings `src/device/builtins.zig` promises for `t_raw_atomics`.
-    const ptx_atomics = b.addCheckFile(probe_ptx_out, .{ .expected_matches = &.{
+    const ptx_atomics = b.addCheckFile(device_probe.getEmittedAsm(), .{ .expected_matches = &.{
         "atom.global.add.u32",
         "atom.global.min.u32",
         "ld.acquire.sys.global.b32",
@@ -408,7 +404,7 @@ pub fn build(b: *std.Build) void {
                 // `buildArtifacts` adds `trap_handler` to every HIP target; see there.
                 .cpu_features = "gfx1100+trap_handler",
             }) catch unreachable),
-            .optimize = .ReleaseFast,
+            .optimize = .fast,
             .strip = true,
             .imports = &.{.{ .name = "gompute", .module = device_mod }},
         }),
@@ -434,7 +430,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_build_tests.step);
     test_step.dependOn(&run_check_tests.step);
     test_step.dependOn(&run_codegen_check.step);
-    test_step.dependOn(&probe_ptx.step);
+    test_step.dependOn(&names_check.step);
     test_step.dependOn(&ptx_atomics.step);
     test_step.dependOn(&device_probe_amd.step);
     test_step.dependOn(&amd_trap.step);
@@ -456,8 +452,14 @@ fn buildDocs(b: *std.Build, host_mod: *std.Build.Module, test_step: *std.Build.S
     // Everything the site is made of hangs off `site`, not off `docs` directly,
     // so that `-Dopen` can be sequenced *after* the site without `docs`
     // depending on the opener and the opener depending on `docs`.
-    const site = b.allocator.create(std.Build.Step) catch @panic("OOM");
-    site.* = std.Build.Step.init(.{ .id = .custom, .name = "docs site", .owner = b });
+    // A top-level step that is never registered: a grouping node `zig build -l`
+    // does not list.
+    const site_info = b.allocator.create(std.Build.Step.TopLevel) catch @panic("OOM");
+    site_info.* = .{
+        .step = .init(.{ .tag = .top_level, .name = "docs site", .owner = b }),
+        .description = "",
+    };
+    const site = &site_info.step;
     docs_step.dependOn(site);
 
     const api = b.addObject(.{ .name = "gompute", .root_module = host_mod });
@@ -489,13 +491,16 @@ fn buildDocs(b: *std.Build, host_mod: *std.Build.Module, test_step: *std.Build.S
         .root_module = b.createModule(.{
             .root_source_file = b.path("tools/md2html.zig"),
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = .debug,
         }),
     });
 
     // Every docs/*.md becomes a page. Adding one needs no build.zig change.
+    // The listing below is configure-time logic; tell the cache, so a new page
+    // re-runs configure instead of replaying the old page set.
+    b.dependOnDirectoryContents(b.path("docs"));
     const io = b.graph.io;
-    var dir = b.build_root.handle.openDir(io, "docs", .{ .iterate = true }) catch
+    var dir = b.root.openDir(io, "docs", .{ .iterate = true }) catch
         @panic("gompute: docs/ is missing; the documentation site cannot be built");
     defer dir.close(io);
     var it = dir.iterate();
@@ -505,9 +510,9 @@ fn buildDocs(b: *std.Build, host_mod: *std.Build.Module, test_step: *std.Build.S
         const stem = entry.name[0 .. entry.name.len - ".md".len];
 
         const run = b.addRunArtifact(md2html);
-        run.addFileArg(b.path(b.fmt("docs/{s}", .{entry.name})));
-        run.addFileArg(b.path("docs/page.template.html"));
-        const out = run.addOutputFileArg(b.fmt("{s}.html", .{stem}));
+        run.addFileArg2(b.path(b.fmt("docs/{s}", .{entry.name})), .{});
+        run.addFileArg2(b.path("docs/page.template.html"), .{});
+        const out = run.addOutputFileArg2(b.fmt("{s}.html", .{stem}), .{});
         site.dependOn(&b.addInstallFileWithDir(
             out,
             .prefix,
@@ -530,7 +535,8 @@ fn buildDocs(b: *std.Build, host_mod: *std.Build.Module, test_step: *std.Build.S
         };
         const open = b.addSystemCommand(&.{opener});
         // The install path, not `b.path`: the file only exists once `site` ran.
-        open.addArg(b.getInstallPath(.prefix, "docs/index.html"));
+        // Relative to the prefix, which only the maker process knows.
+        open.addFileArg2(.{ .relative = .{ .base = .install_prefix, .sub_path = "docs/index.html" } }, .{});
         open.has_side_effects = true;
         open.step.dependOn(site);
         docs_step.dependOn(&open.step);
@@ -546,7 +552,7 @@ fn deviceImports(
     dep: *std.Build.Dependency,
     root: KernelRoot,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
 ) []const std.Build.Module.Import {
     // `&.{base}` would return a pointer to a stack temporary; always allocate.
     const extra: []const std.Build.Module.Import = if (root.imports) |build_extra|
@@ -630,7 +636,7 @@ fn buildArtifacts(
     dep: *std.Build.Dependency,
     options: EmitOptions,
     host_target: std.Build.ResolvedTarget,
-    host_optimize: std.builtin.OptimizeMode,
+    host_optimize: std.lang.Optimize,
 ) *std.Build.Module {
     const roots = normalizeRoots(b, options);
     const tool = b.addExecutable(.{
@@ -638,7 +644,7 @@ fn buildArtifacts(
         .root_module = b.createModule(.{
             .root_source_file = dep.path("tools/kernel_ir_tool.zig"),
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = .debug,
         }),
     });
 
@@ -669,8 +675,8 @@ fn buildArtifacts(
     });
 
     // The two backends run the same pipeline -- device module, build-obj, IR
-    // tool, then one final command -- and differ only in the values below plus
-    // that last step. Kept as one loop so a change to the pipeline cannot be
+    // tool -- and differ only in the values below plus how the blob is taken
+    // off the object. Kept as one loop so a change to the pipeline cannot be
     // applied to CUDA and forgotten for HIP; nothing in `zig build test`
     // exercises either path.
     for ([_]struct {
@@ -678,7 +684,7 @@ fn buildArtifacts(
         triple: []const u8,
         expected_cpu: []const u8,
         cpu: ?[]const u8,
-        optimize: ?std.builtin.OptimizeMode,
+        optimize: ?std.lang.Optimize,
     }{
         .{
             .device = .cuda,
@@ -710,7 +716,7 @@ fn buildArtifacts(
         // an explicit feature list that leaves it off, and then `@trap()`
         // lowers to a silent `s_endpgm` instead of `s_trap 2`. `globalIdX`'s
         // wide-launch check is only loud with it.
-        if (d.device == .hip) query.cpu_features_add.addFeature(@intFromEnum(std.Target.amdgcn.Feature.trap_handler));
+        if (d.device == .hip) query.cpu_features_add.addFeature(@backingInt(std.Target.amdgcn.Feature.trap_handler));
         const target = b.resolveTargetQuery(query);
         const mode = if (d.optimize) |m| deviceOptimize(m) else optimize;
         var lanes: HeavyLanes = .init(b, options.heavy_lanes);
@@ -731,32 +737,17 @@ fn buildArtifacts(
             });
             if (root.heavy) lanes.chain(&object.step);
 
-            // The tool always writes both outputs. CUDA assembles the rewritten
-            // IR; HIP links the object itself and keeps only the name table.
-            const rewrite = b.addRunArtifact(tool);
-            rewrite.addFileArg(object.getEmittedLlvmIr());
-            const rewritten_ir = rewrite.addOutputFileArg(b.fmt("gompute_{s}_{s}.ll", .{ tag, root.name }));
-            const names = rewrite.addOutputFileArg(b.fmt("gompute_{s}_names_{s}.zig", .{ tag, root.name }));
+            const list = b.addRunArtifact(tool);
+            list.addFileArg2(object.getEmittedLlvmIr(), .{});
+            const names = list.addOutputFileArg2(b.fmt("gompute_{s}_names_{s}.zig", .{ tag, root.name }), .{});
 
             const blob = switch (d.device) {
-                .cuda => blk: {
-                    const assemble = b.addSystemCommand(&.{
-                        b.graph.zig_exe,
-                        "cc",
-                        "-target",
-                        d.triple,
-                        b.fmt("-mcpu={s}", .{cpu}),
-                        "-S",
-                        "-g0", // nvptx rejects dwarf debug info; keeps stderr clean
-                        "-Wno-unused-command-line-argument",
-                    });
-                    assemble.addFileArg(rewritten_ir);
-                    break :blk assemble.addPrefixedOutputFileArg("-o", b.fmt("gompute_{s}.ptx", .{root.name}));
-                },
+                // PTX is NVPTX's assembly output; the driver JIT-compiles it.
+                .cuda => object.getEmittedAsm(),
                 .hip => blk: {
                     const link = b.addSystemCommand(&.{ b.graph.zig_exe, "ld.lld", "-shared" });
-                    link.addFileArg(object.getEmittedBin());
-                    break :blk link.addPrefixedOutputFileArg("-o", b.fmt("gompute_{s}.hsaco", .{root.name}));
+                    link.addFileArg2(object.getEmittedBin(), .{});
+                    break :blk link.addOutputFileArg2(b.fmt("gompute_{s}.hsaco", .{root.name}), .{ .prefix = "-o" });
                 },
             };
 
@@ -801,30 +792,24 @@ fn artifactsSource(
         \\pub const Entry = struct { blob: u16, symbol: [:0]const u8 };
         \\const KV = struct { []const u8, Entry };
         \\
-        \\/// Fold one root's name table into the merged map. `mangled` is HIP,
-        \\/// whose entry points keep the mangled Zig symbol; a CUDA entry point is
-        \\/// the exported name itself.
+        \\/// Fold one root's name table into the merged map.
         \\///
         \\/// ponytail: O(kernels^2) duplicate scan, at comptime. Fine into the
         \\/// hundreds; sort first if a consumer ever gets to thousands.
         \\fn merge(
         \\    comptime kvs: []const KV,
         \\    comptime blob: u16,
-        \\    comptime table: anytype,
-        \\    comptime mangled: bool,
+        \\    comptime table: []const [:0]const u8,
         \\) []const KV {
         \\    @setEvalBranchQuota(100_000);
         \\    var out = kvs;
-        \\    for (table) |e| {
-        \\        for (out) |prev| if (std.mem.eql(u8, prev[0], e.exported)) @compileError(
-        \\            "gompute: kernel \"" ++ e.exported ++ "\" is exported by two kernel roots (" ++
+        \\    for (table) |name| {
+        \\        for (out) |prev| if (std.mem.eql(u8, prev[0], name)) @compileError(
+        \\            "gompute: kernel \"" ++ name ++ "\" is exported by two kernel roots (" ++
         \\                root_names[prev[1].blob] ++ " and " ++ root_names[blob] ++
         \\                "). A kernel name is the run-time dispatch key, so it must name one root.",
         \\        );
-        \\        out = out ++ .{KV{ e.exported, .{
-        \\            .blob = blob,
-        \\            .symbol = if (mangled) e.internal else e.exported,
-        \\        } }};
+        \\        out = out ++ .{KV{ name, .{ .blob = blob, .symbol = name } }};
         \\    }
         \\    return out;
         \\}
@@ -832,11 +817,11 @@ fn artifactsSource(
         \\
     ) catch @panic("OOM");
 
-    for ([_]struct { []const u8, bool, bool }{
-        .{ "cuda", has_cuda, false },
-        .{ "hip", has_hip, true },
+    for ([_]struct { []const u8, bool }{
+        .{ "cuda", has_cuda },
+        .{ "hip", has_hip },
     }) |backend| {
-        const tag, const present, const mangled = backend;
+        const tag, const present = backend;
         if (!present) {
             w.print(
                 \\pub const {s}_images: []const [:0]const u8 = &.{{}};
@@ -855,8 +840,8 @@ fn artifactsSource(
             \\
         , .{tag}) catch @panic("OOM");
         for (roots, 0..) |_, i| w.print(
-            "    kv = merge(kv, {d}, @import(\"{s}_names_{d}\").entries, {});\n",
-            .{ i, tag, i, mangled },
+            "    kv = merge(kv, {d}, &@import(\"{s}_names_{d}\").entries);\n",
+            .{ i, tag, i },
         ) catch @panic("OOM");
         w.writeAll("    break :blk kv;\n});\n\n") catch @panic("OOM");
     }
@@ -917,7 +902,7 @@ pub fn emitKernels(
         dep,
         options,
         options.target orelse host.root_module.resolved_target orelse b.graph.host,
-        options.optimize orelse host.root_module.optimize orelse .ReleaseFast,
+        options.optimize orelse host.root_module.optimize orelse .fast,
     );
     // Resolution happens inside the shared `gompute` module; the host import is
     // only so a consumer's own code may `@import("gompute_kernels")` directly.
@@ -932,7 +917,7 @@ pub const KernelsOptions = struct {
     /// be combined, and at least one of them must be set.
     root_source_file: ?std.Build.LazyPath = null,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     /// Extra imports for `root_source_file`, on top of `gompute`. Leave null
     /// when the kernel root imports nothing of its own.
     imports: ?DeviceImportsFn = null,

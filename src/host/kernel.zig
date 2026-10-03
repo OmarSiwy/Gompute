@@ -102,7 +102,7 @@ fn CpuKernel(comptime Spec: type) type {
 
         /// Lanes for a generic body touching element types `Ts`: the narrowest
         /// suggestion among them, so the widest type still fills one register.
-        /// Zig 0.16 ships LLVM's loop vectorizer off, so a loop not widened
+        /// Zig 0.16 and 0.17 ship LLVM's loop vectorizer off, so a loop not widened
         /// here is scalar.
         fn widthOf(comptime Ts: anytype) usize {
             if (!(@hasDecl(Spec, "is_generic") and Spec.is_generic)) return 1;
@@ -616,7 +616,7 @@ fn GpuKernel(comptime Spec: type, comptime gpu: Gpu) type {
         /// How many blocks `count` elements get. Saturates at
         /// `max_reduce_blocks`; the grid-stride loop covers the rest.
         pub fn reduceBlocks(count: usize) u32 {
-            const covering = (count + Spec.block_size - 1) / Spec.block_size;
+            const covering = @divCeil(count, Spec.block_size);
             return @intCast(@min(covering, max_reduce_blocks));
         }
 
@@ -976,7 +976,7 @@ test "reduce folds with a custom combine and returns the identity when empty" {
             return a *% b;
         }
     }.call, 1, .{ .block_size = 8 });
-    try std.testing.expectEqual(@as(?std.builtin.ReduceOp, null), Spec.simd_op);
+    try std.testing.expectEqual(@as(?std.lang.ReduceOp, null), Spec.simd_op);
 
     var kernel = try CpuKernel(Spec).init(0);
     var data: [65]u32 = undefined;
@@ -998,7 +998,7 @@ test "reduce presets take the @reduce path and agree with the scalar fold" {
     const Any = spec.Any("t_any", u32, TestParams, .{ .block_size = 8 });
     const All = spec.All("t_all", u32, TestParams, .{ .block_size = 8 });
 
-    try std.testing.expectEqual(std.builtin.ReduceOp.Add, Sum.simd_op.?);
+    try std.testing.expectEqual(std.lang.ReduceOp.Add, Sum.simd_op.?);
     try std.testing.expectEqual(@as(i32, std.math.maxInt(i32)), Min.identity);
     try std.testing.expectEqual(@as(i32, std.math.minInt(i32)), Max.identity);
     try std.testing.expectEqual(@as(u32, 0), Any.identity);

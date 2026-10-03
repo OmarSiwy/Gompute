@@ -104,7 +104,7 @@ pub const Dim3 = extern struct {
     /// the ones that used to wrap a u32 in ReleaseFast (n > 2^32 * block_x).
     pub fn linearChecked(n: usize, block_x: u32) Error!Dim3 {
         if (n == 0 or block_x == 0) return error.InvalidArgument;
-        const blocks = (@as(u64, n) + block_x - 1) / block_x;
+        const blocks = @divCeil(@as(u64, n), block_x);
         if (blocks > max_grid_x) return error.InvalidArgument;
         return .{ .x = @intCast(blocks) };
     }

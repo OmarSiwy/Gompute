@@ -221,7 +221,7 @@ pub const Module = union(Backend) {
     cuda: cuda.Module,
     hip: hip.Module,
 
-    /// Look up an entry point by its mangled symbol name.
+    /// Look up an entry point by its symbol name.
     pub fn getKernel(self: *Module, name: [*:0]const u8) Error!Kernel {
         return switch (self.*) {
             .cuda => |*m| .{ .cuda = try m.getKernel(name) },

@@ -156,12 +156,12 @@ fn IndexedCopyEntry(comptime Spec: type, comptime gathering: bool) type {
 /// symbols, which surfaces as an `ld.lld` duplicate-symbol error on HIP and is
 /// undefined on CUDA. `build.zig` does the equivalent check for root names.
 pub fn exportAll(comptime specs: anytype) void {
-    if (builtin.cpu.arch != .nvptx64 and builtin.cpu.arch != .amdgcn)
+    if (builtin.target.cpu.arch != .nvptx64 and builtin.target.cpu.arch != .amdgcn)
         @compileError("exportAll must be compiled for nvptx64 or amdgcn");
 
     if (@TypeOf(specs) == type) {
-        inline for (@typeInfo(specs).@"struct".decls) |decl| {
-            const Spec = @field(specs, decl.name);
+        inline for (@typeInfo(specs).@"struct".decl_names) |name| {
+            const Spec = @field(specs, name);
             if (comptime isSpec(Spec)) exportOne(Spec);
         }
     } else {

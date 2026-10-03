@@ -40,7 +40,7 @@ pub const MapOptions = spec.MapOptions;
 /// to compile for both.
 pub const is_device = false;
 /// `.auto` here, `.kernel` in `src/device.zig`. Put it on a raw entry point.
-pub const kernel_callconv: std.builtin.CallingConvention = .auto;
+pub const kernel_callconv: std.lang.CallingConvention = .auto;
 
 /// A plain `[*]T` here; `[*]addrspace(.global) T` in `src/device.zig`.
 pub fn GlobalPtr(comptime T: type) type {

@@ -11,7 +11,7 @@ Your executable is not linked against libc.
 exe.root_module.linkSystemLibrary("c", .{});
 ```
 
-Without libc, Zig 0.16's `std.DynLib` resolves to `ElfDynLib` rather than
+Without libc, Zig's `std.DynLib` resolves to `ElfDynLib` rather than
 `DlDynLib`. It opens `libcuda.so` successfully and then cannot resolve a single
 symbol out of it. The message reads exactly like a driver version mismatch and
 is not one. CPU-only builds do not need this.
@@ -151,7 +151,7 @@ combining duplicates needs a device float atomic, which is gfx9+ and
 ## ≈29 compile errors from `std/dynamic_library.zig`
 
 You are building for Windows or wasm and something instantiated a GPU backend.
-Zig 0.16's `std.DynLib` only supports Linux and the Darwin/BSD family;
+Zig's `std.DynLib` only supports Linux and the Darwin/BSD family;
 everything else is `@compileError("unsupported platform")`.
 
 `.cpu` alone compiles everywhere. `AutoKernel` does not count as CPU-only,

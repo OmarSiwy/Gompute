@@ -186,10 +186,10 @@ for 3.
 
 ## Device optimize mode
 
-`Debug` device code drags `std.builtin` panic globals into the module, and
-LLVM's NVPTX backend emits invalid PTX types (`.u2`/`.u4`/`.u5`) for them. So a
-`Debug` build compiles device code at `ReleaseFast`, which removes the panic
-machinery outright rather than merely optimizing it.
+`Debug` device code drags the std panic machinery into the module (under Zig
+0.16 LLVM's NVPTX backend even emitted invalid PTX types, `.u2`/`.u4`/`.u5`,
+for it). So a `Debug` build compiles device code at `ReleaseFast`, which removes
+the panic machinery outright rather than merely optimizing it.
 
 `ReleaseSafe` would keep it, and is pathologically expensive: it turns a large
 straight-line kernel into a CFG with a panic edge per operation and something
@@ -211,21 +211,20 @@ comptime name -> `(blob, symbol)` map in the generated `gompute_kernels` module.
 
 ### CUDA
 
-1. Cross-compile `kernels.zig` to NVPTX LLVM IR.
-2. Run `tools/kernel_ir_tool.zig`.
-3. Delete Zig 0.16's exported alias lines.
-4. Rename each internal `ptx_kernel` definition to its requested entry name.
-5. Assemble the rewritten IR to PTX with Zig's bundled LLVM tools.
-6. Embed the PTX in the host executable, with a compile-time name map.
+1. Cross-compile `kernels.zig` for NVPTX, emitting PTX and LLVM IR.
+2. Read the `ptx_kernel` names off the IR with `tools/kernel_ir_tool.zig`.
+3. Embed the PTX in the host executable, with a compile-time name map.
 
-This implements the workaround for Zig 0.16's NVPTX alias form, which NVPTX
-code generation rejects.
+Zig 0.16 exported each kernel as an LLVM alias, which NVPTX code generation
+rejects, so the IR used to be rewritten and re-assembled with `zig cc`. Zig
+0.17 emits the definition under its exported name, and the PTX comes straight
+out of the compiler.
 
 ### HIP
 
 1. Cross-compile `kernels.zig` to an AMDGCN object and LLVM IR.
 2. Link the object into an HSA code object with Zig's bundled `ld.lld`.
-3. Generate a Zig compile-time map from public names to AMDGPU metadata names.
+3. Read the `amdgpu_kernel` names off the IR, as for CUDA.
 4. Embed both the code object and the name map.
 
 The map lets `hipModuleGetFunction` request the internal kernel name recorded in

@@ -138,7 +138,7 @@ fn betweenTokens(w: *std.Io.Writer, text: []const u8) void {
 /// disagree with the language about what a keyword is. Everything is escaped on
 /// the way out, exactly as an unhighlighted block would be.
 fn highlightZig(w: *std.Io.Writer, a: std.mem.Allocator, src: []const u8) void {
-    const buf = a.dupeZ(u8, src) catch @panic("OOM");
+    const buf = a.dupeSentinel(u8, src, 0) catch @panic("OOM");
     var tokenizer = std.zig.Tokenizer.init(buf);
     var prev: usize = 0;
     while (true) {

@@ -1,10 +1,10 @@
-//! Device-only thread-index builtins for Zig 0.16.0.
+//! Device-only thread-index builtins for Zig 0.17.0.
 //!
 //! Almost no atomics here: Zig's own `@atomicRmw`, `@atomicLoad` and `@atomicStore`
 //! on `addrspace(.global)` pointers lower correctly on both targets, with one
-//! hole. On NVPTX, LLVM 21 drops the ordering of every read-modify-write:
-//! `@atomicRmw(.., .acq_rel)`, `.seq_cst` and `@cmpxchgStrong` all emit a plain
-//! relaxed `atom.global.*` with no fence. Pair a relaxed RMW with an
+//! hole. On NVPTX, LLVM drops the ordering of `@atomicRmw`: `.acq_rel` and
+//! `.seq_cst` emit a plain relaxed `atom.global.*` with no fence (LLVM 21 did
+//! the same to `@cmpxchgStrong`; LLVM 22, in Zig 0.17, fences that one). Pair a relaxed RMW with an
 //! `@atomicLoad(.acquire)` / `@atomicStore(.release)` instead, which do lower
 //! to `ld.acquire.sys` / `st.release.sys` -- system scope, stronger than the
 //! `.gpu` a kernel needs, since Zig cannot name a sync scope --
@@ -46,13 +46,13 @@ extern fn @"llvm.nvvm.nanosleep"(u32) callconv(.c) void;
 /// ponytail: AMDGCN should read `workgroup_size_x` out of the HSA dispatch
 /// packet, which is the exact counterpart of `ntid.x`. It cannot be expressed
 /// here yet: `llvm.amdgcn.dispatch.ptr` returns `ptr addrspace(4)` and Zig
-/// 0.16 rejects `addrspace(.constant)` on amdgcn ("pointers with address space
+/// 0.17 rejects `addrspace(.constant)` on amdgcn ("pointers with address space
 /// 'constant' are not supported on amdgcn"). Declaring it `.global` would
 /// mis-type the intrinsic. Revisit when Zig supports the constant address
 /// space; until then the contract above is the mitigation, and it is untested
 /// on hardware -- no AMD device was available.
 pub inline fn globalIdX(comptime block_size: u32) usize {
-    return switch (builtin.cpu.arch) {
+    return switch (builtin.target.cpu.arch) {
         .nvptx64 => @as(usize, @"llvm.nvvm.read.ptx.sreg.ctaid.x"()) *
             @"llvm.nvvm.read.ptx.sreg.ntid.x"() + @"llvm.nvvm.read.ptx.sreg.tid.x"(),
         .amdgcn => blk: {
@@ -67,7 +67,7 @@ pub inline fn globalIdX(comptime block_size: u32) usize {
 /// The thread's index within its own block, `threadIdx.x`. Indexes block-local
 /// shared scratch, so it is always in `0..block_size`.
 pub inline fn localIdX() u32 {
-    return switch (builtin.cpu.arch) {
+    return switch (builtin.target.cpu.arch) {
         .nvptx64 => @"llvm.nvvm.read.ptx.sreg.tid.x"(),
         .amdgcn => @"llvm.amdgcn.workitem.id.x"(),
         else => @compileError("device localIdX used on a non-GPU target"),
@@ -76,7 +76,7 @@ pub inline fn localIdX() u32 {
 
 /// The block's index within the grid, `blockIdx.x`.
 pub inline fn blockIdX() u32 {
-    return switch (builtin.cpu.arch) {
+    return switch (builtin.target.cpu.arch) {
         .nvptx64 => @"llvm.nvvm.read.ptx.sreg.ctaid.x"(),
         .amdgcn => @"llvm.amdgcn.workgroup.id.x"(),
         else => @compileError("device blockIdX used on a non-GPU target"),
@@ -97,10 +97,10 @@ pub inline fn blockIdX() u32 {
 /// symbols; the HSACO then carries a real `@gotpcrel32` call to a function that
 /// does not exist and the device rejects it at load. The genuine route is
 /// `llvm.amdgcn.dispatch.ptr`, which returns `ptr addrspace(4)` and needs the
-/// constant address space Zig 0.16 rejects on amdgcn -- the same wall
+/// constant address space Zig 0.17 rejects on amdgcn -- the same wall
 /// `globalIdX` documents above.
 pub inline fn gridDimX() usize {
-    return switch (builtin.cpu.arch) {
+    return switch (builtin.target.cpu.arch) {
         .nvptx64 => @"llvm.nvvm.read.ptx.sreg.nctaid.x"(),
         else => @compileError(
             "gridDimX is nvptx64-only; pass the grid stride as a kernel argument for portability",
@@ -118,7 +118,7 @@ pub inline fn gridDimX() usize {
 /// NVPTX `bar.sync` orders memory by itself. AMDGCN `s_barrier` does not, so
 /// the fences HIP puts around it are spelled out; see `wg_fence`.
 pub inline fn barrier() void {
-    switch (builtin.cpu.arch) {
+    switch (builtin.target.cpu.arch) {
         .nvptx64 => @"llvm.nvvm.barrier0"(),
         .amdgcn => {
             asm volatile (wg_fence.release ::: .{ .memory = true });
@@ -137,10 +137,10 @@ pub inline fn barrier() void {
 ///
 /// ponytail: tgsplit (gfx90a/gfx94x, off by default) spreads a workgroup over
 /// CUs and needs an L1 invalidate on acquire; refused rather than guessed.
-const wg_fence: struct { release: []const u8, acquire: []const u8 = "" } = if (builtin.cpu.arch != .amdgcn) .{ .release = "" } else blk: {
+const wg_fence: struct { release: []const u8, acquire: []const u8 = "" } = if (builtin.target.cpu.arch != .amdgcn) .{ .release = "" } else blk: {
     const has = struct {
         fn f(comptime feature: std.Target.amdgcn.Feature) bool {
-            return builtin.cpu.features.isEnabled(@intFromEnum(feature));
+            return builtin.target.cpu.features.isEnabled(@backingInt(feature));
         }
     }.f;
     if (has(.tgsplit)) @compileError("barrier: tgsplit is not supported");
@@ -165,7 +165,7 @@ const wg_fence: struct { release: []const u8, acquire: []const u8 = "" } = if (b
 /// A no-op on NVPTX below PTX 6.3 or sm_70, where `nanosleep` does not exist.
 /// That includes the default `sm_70` target, which Zig pins to PTX 6.0.
 pub inline fn spinPause() void {
-    switch (builtin.cpu.arch) {
+    switch (builtin.target.cpu.arch) {
         .nvptx64 => if (comptime nv.ptx >= 63 and nv.sm >= 70) @"llvm.nvvm.nanosleep"(64),
         .amdgcn => @"llvm.amdgcn.s.sleep"(1),
         else => @compileError("device spinPause used on a non-GPU target"),
@@ -183,7 +183,7 @@ pub inline fn spinPause() void {
 /// asm for those when someone has one to test on. NVPTX below sm_70 has no
 /// `ld.acquire` and falls back the same way.
 pub inline fn loadAcquireDevice(p: *addrspace(.global) const u32) u32 {
-    if (builtin.cpu.arch == .nvptx64 and comptime nv.sm >= 70)
+    if (builtin.target.cpu.arch == .nvptx64 and comptime nv.sm >= 70)
         return asm volatile ("ld.acquire.gpu.global.u32 %[v], [%[p]];"
             : [v] "=r" (-> u32),
             : [p] "l" (@intFromPtr(p)),
@@ -193,7 +193,7 @@ pub inline fn loadAcquireDevice(p: *addrspace(.global) const u32) u32 {
 
 /// `@atomicStore(.release)` at device scope; see `loadAcquireDevice`.
 pub inline fn storeReleaseDevice(p: *addrspace(.global) u32, v: u32) void {
-    if (builtin.cpu.arch == .nvptx64 and comptime nv.sm >= 70)
+    if (builtin.target.cpu.arch == .nvptx64 and comptime nv.sm >= 70)
         return asm volatile ("st.release.gpu.global.u32 [%[p]], %[v];"
             :
             : [p] "l" (@intFromPtr(p)),
@@ -206,10 +206,11 @@ pub inline fn storeReleaseDevice(p: *addrspace(.global) u32, v: u32) void {
 /// `sm_NN` features do not imply each other, so take the highest of each.
 const nv = blk: {
     var v: struct { ptx: u32 = 0, sm: u32 = 0 } = .{};
-    if (builtin.cpu.arch != .nvptx64) break :blk v;
-    for (@typeInfo(std.Target.nvptx.Feature).@"enum".fields) |f| {
-        if (!builtin.cpu.features.isEnabled(f.value)) continue;
-        const digits = std.mem.trimEnd(u8, f.name, "af"); // sm_90a, sm_100f
+    if (builtin.target.cpu.arch != .nvptx64) break :blk v;
+    const info = @typeInfo(std.Target.nvptx.Feature).@"enum";
+    for (info.field_names, info.field_values) |name, value| {
+        if (!builtin.target.cpu.features.isEnabled(value)) continue;
+        const digits = std.mem.trimEnd(u8, name, "af"); // sm_90a, sm_100f
         if (std.mem.startsWith(u8, digits, "ptx"))
             v.ptx = @max(v.ptx, std.fmt.parseInt(u32, digits[3..], 10) catch 0);
         if (std.mem.startsWith(u8, digits, "sm_"))

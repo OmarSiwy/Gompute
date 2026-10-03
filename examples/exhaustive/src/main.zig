@@ -217,7 +217,7 @@ fn testMathBits() void {
     if (!g.AutoKernel(k2.math_f64).Cuda.available) return skip("this build emitted no CUDA artifacts");
     inline for (.{ f64, f32 }) |T| {
         const Spec = if (T == f64) k2.math_f64 else k2.math_f32;
-        const U = std.meta.Int(.unsigned, @bitSizeOf(T));
+        const U = @Int(.unsigned, @bitSizeOf(T));
         var gpu = g.Kernel(Spec, .cuda).init(0) catch return skip("no CUDA device");
         defer gpu.deinit();
         var cpu = g.Kernel(Spec, .cpu).init(0) catch unreachable;

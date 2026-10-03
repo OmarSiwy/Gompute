@@ -1,6 +1,6 @@
 ---
 name: gompute
-description: Write, build and launch one-dimensional GPU/CPU kernels with the Gompute Zig 0.16 library. Use when a Zig project imports `gompute`, when the user wants to run a map/zip/reduce/gather/scatter over a slice on CUDA, HIP or the CPU from one source, wire `emitKernels` into build.zig, hoist allocations out of `run`, capture launches into a CUDA/HIP graph, write a raw device kernel, or choose between `Kernel`, `AutoKernel`, `RawKernel` and `g.runtime`. Also use when deciding what a Gompute feature costs at run time.
+description: Write, build and launch one-dimensional GPU/CPU kernels with the Gompute Zig 0.17 library. Use when a Zig project imports `gompute`, when the user wants to run a map/zip/reduce/gather/scatter over a slice on CUDA, HIP or the CPU from one source, wire `emitKernels` into build.zig, hoist allocations out of `run`, capture launches into a CUDA/HIP graph, write a raw device kernel, or choose between `Kernel`, `AutoKernel`, `RawKernel` and `g.runtime`. Also use when deciding what a Gompute feature costs at run time.
 ---
 
 # Gompute
@@ -11,7 +11,7 @@ point, all from the same source file. The backend is part of the type, so
 `Kernel(spec, .cpu)` compiles to the loop you would have written yourself;
 `zig build test` checks that against the emitted assembly.
 
-Pinned to **Zig 0.16.0**. GPU backends work on Linux only (macOS compiles them,
+Pinned to **Zig 0.17.0**. GPU backends work on Linux only (macOS compiles them,
 but there is no driver). Windows and wasm are CPU-only.
 
 ## Pick the right layer
@@ -94,7 +94,7 @@ every kernel root.
 | `g.gather(name, T, Idx, o)` | `(src, idx, out)`: `out[i] = src[idx[i]]` | scalar, bounds-skipping |
 | `g.scatter(name, T, Idx, o)` | `(src, idx, out)`: `out[idx[i]] = src[i]` | scalar, bounds-skipping |
 
-"Scalar" means scalar machine code. **Zig 0.16 ships LLVM's loop vectorizer
+"Scalar" means scalar machine code. **Zig 0.16 and 0.17 ship LLVM's loop vectorizer
 disabled**, so a plain loop over a concrete `fn (f32, P) f32` is `vaddss`, one
 element at a time, even at `ReleaseFast -mcpu=native`. A generic (`anytype`)
 body is the only way to get SIMD on the CPU. When a generic `mapTo`/`zip`

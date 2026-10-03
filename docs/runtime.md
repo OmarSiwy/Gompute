@@ -54,8 +54,8 @@ pub const hip_index: std.StaticStringMap(Entry);
 ```
 
 One image per kernel root, so the index maps a kernel name to the blob that
-holds it and the symbol inside it. The symbol is not always the kernel name,
-because HIP keeps Zig's mangled name, which is why the map stores both.
+holds it and the symbol inside it. Since Zig 0.17 the symbol is always the
+kernel name; under 0.16 HIP kept Zig's mangled one.
 
 ```zig
 const artifacts = @import("gompute_kernels");

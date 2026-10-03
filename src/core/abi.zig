@@ -4,7 +4,8 @@ const std = @import("std");
 
 /// The wire type `T` becomes when it crosses to the GPU: an `extern struct`
 /// mirroring `T` field by field, with `bool` as `u8`, an enum as its tag type,
-/// and arrays and vectors mapped elementwise.
+/// arrays mapped elementwise, and a vector as an array of its lanes (an
+/// `extern struct` cannot hold a vector: it has no guaranteed memory layout).
 ///
 /// A type with no stable GPU representation is a `@compileError` naming the
 /// field path that reached it, never a silently different layout. A struct may
@@ -62,7 +63,7 @@ fn BoundaryAt(comptime T: type, comptime at: []const u8) type {
         },
         .@"enum" => |e| BoundaryAt(e.tag_type, at),
         .array => |a| [a.len]BoundaryAt(a.child, at ++ "[_]"),
-        .vector => |v| @Vector(v.len, BoundaryAt(v.child, at ++ "[_]")),
+        .vector => |v| [v.len]BoundaryAt(v.child, at ++ "[_]"),
         .@"struct" => |s| boundaryStruct(T, s, at),
         else => @compileError(reject(at, T, "only scalars and aggregates of scalars have a stable GPU representation")),
     };
@@ -77,7 +78,7 @@ fn reject(comptime at: []const u8, comptime T: type, comptime why: []const u8) [
         "  `pub fn toGpu(Self) gpu_layout` and `pub fn fromGpu(gpu_layout) Self`.";
 }
 
-fn boundaryStruct(comptime T: type, comptime info: std.builtin.Type.Struct, comptime at: []const u8) type {
+fn boundaryStruct(comptime T: type, comptime info: std.lang.Type.Struct, comptime at: []const u8) type {
     // All three of gpu_layout/toGpu/fromGpu are required together. Declaring a
     // subset used to derive a field-wise layout and then fail inside pack() with
     // a raw type mismatch pointing into this file.
@@ -107,18 +108,14 @@ fn boundaryStruct(comptime T: type, comptime info: std.builtin.Type.Struct, comp
         return U;
     }
 
-    comptime var names: [info.fields.len][]const u8 = undefined;
-    comptime var types: [info.fields.len]type = undefined;
-    comptime var attrs: [info.fields.len]std.builtin.Type.StructField.Attributes = undefined;
-    inline for (info.fields, 0..) |field, i| {
-        if (field.is_comptime)
-            @compileError("gompute: `" ++ at ++ "." ++ field.name ++ "` is a comptime field, which has no runtime representation to send to the GPU. Remove it from the params struct.");
-        names[i] = field.name;
-        types[i] = BoundaryAt(field.type, at ++ "." ++ field.name);
-        attrs[i] = .{};
+    comptime var types: [info.field_names.len]type = undefined;
+    inline for (info.field_names, info.field_types, info.field_attrs, 0..) |name, F, attr, i| {
+        if (attr.@"comptime")
+            @compileError("gompute: `" ++ at ++ "." ++ name ++ "` is a comptime field, which has no runtime representation to send to the GPU. Remove it from the params struct.");
+        types[i] = BoundaryAt(F, at ++ "." ++ name);
     }
 
-    return @Struct(.@"extern", null, &names, &types, &attrs);
+    return @Struct(.@"extern", null, info.field_names, &types, &@splat(.{}));
 }
 
 /// `gpu_layout` is the one type gompute does not derive, so it is the one type
@@ -168,11 +165,14 @@ pub fn pack(comptime T: type, value: T) Boundary(T) {
     return switch (@typeInfo(T)) {
         .bool => @intFromBool(value),
         .int, .float => value,
-        .@"enum" => @intFromEnum(value),
+        .@"enum" => @backingInt(value),
         // A bool vector is bit-packed -- @Vector(4, bool) is 4 bits, its wire
-        // form @Vector(4, u8) is 32 -- so it is the one vector a @bitCast
-        // cannot carry. Both builtins are elementwise on vectors.
-        .vector => |v| if (v.child == bool) @intCast(@intFromBool(value)) else @bitCast(value),
+        // form [4]u8 is 32 -- so it is the one vector a @bitCast cannot
+        // carry. Both builtins are elementwise on vectors.
+        .vector => |v| if (v.child == bool) blk: {
+            const bytes: @Vector(v.len, u8) = @intCast(@intFromBool(value));
+            break :blk bytes;
+        } else @bitCast(value),
         .array => |a| blk: {
             var out: Boundary(T) = undefined;
             inline for (0..a.len) |i| out[i] = pack(a.child, value[i]);
@@ -181,8 +181,8 @@ pub fn pack(comptime T: type, value: T) Boundary(T) {
         .@"struct" => |s| blk: {
             if (@hasDecl(T, "toGpu")) break :blk T.toGpu(value);
             var out: Boundary(T) = undefined;
-            inline for (s.fields) |field|
-                @field(out, field.name) = pack(field.type, @field(value, field.name));
+            inline for (s.field_names, s.field_types) |name, F|
+                @field(out, name) = pack(F, @field(value, name));
             break :blk out;
         },
         else => unreachable,
@@ -202,9 +202,9 @@ pub fn unpack(comptime T: type, value: Boundary(T)) T {
     return switch (@typeInfo(T)) {
         .bool => value != 0,
         .int, .float => value,
-        .@"enum" => @enumFromInt(value),
+        .@"enum" => @fromBackingInt(value),
         .vector => |v| if (v.child == bool)
-            value != @as(Boundary(T), @splat(0))
+            @as(@Vector(v.len, u8), value) != @as(@Vector(v.len, u8), @splat(0))
         else
             @bitCast(value),
         .array => |a| blk: {
@@ -215,8 +215,8 @@ pub fn unpack(comptime T: type, value: Boundary(T)) T {
         .@"struct" => |s| blk: {
             if (@hasDecl(T, "fromGpu")) break :blk T.fromGpu(value);
             var out: T = undefined;
-            inline for (s.fields) |field|
-                @field(out, field.name) = unpack(field.type, @field(value, field.name));
+            inline for (s.field_names, s.field_types) |name, F|
+                @field(out, name) = unpack(F, @field(value, name));
             break :blk out;
         },
         else => unreachable,
@@ -266,7 +266,7 @@ test "arrays and vectors round-trip element by element" {
     try std.testing.expectEqual(flags, unpack(Flags, pack(Flags, flags)));
 
     const V4 = @Vector(4, f32);
-    try std.testing.expectEqual(V4, Boundary(V4));
+    try std.testing.expectEqual([4]f32, Boundary(V4));
     const v: V4 = .{ 1, 2, 3, 4 };
     try std.testing.expectEqual(v, unpack(V4, pack(V4, v)));
 
@@ -279,9 +279,9 @@ test "arrays and vectors round-trip element by element" {
     // the wire form is 32, so this used to fail inside pack() with a raw
     // @bitCast size mismatch pointing into this file.
     const Mask = @Vector(4, bool);
-    try std.testing.expectEqual(@Vector(4, u8), Boundary(Mask));
+    try std.testing.expectEqual([4]u8, Boundary(Mask));
     const mask: Mask = .{ true, false, true, false };
-    try std.testing.expectEqual(@Vector(4, u8){ 1, 0, 1, 0 }, pack(Mask, mask));
+    try std.testing.expectEqual([4]u8{ 1, 0, 1, 0 }, pack(Mask, mask));
     try std.testing.expectEqual(mask, unpack(Mask, pack(Mask, mask)));
 }
 
@@ -309,7 +309,7 @@ test "nested structs, f16 and a zero-field params struct" {
 
     // A kernel that takes no parameters still has to pack something.
     const Empty = struct {};
-    try std.testing.expectEqual(@as(usize, 0), @typeInfo(Boundary(Empty)).@"struct".fields.len);
+    try std.testing.expectEqual(@as(usize, 0), @typeInfo(Boundary(Empty)).@"struct".field_names.len);
     _ = unpack(Empty, pack(Empty, .{}));
 }
 

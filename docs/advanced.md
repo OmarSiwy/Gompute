@@ -166,7 +166,7 @@ nothing on NVPTX targets below sm_70 with PTX 6.3. `g.builtins` is only present
 in the device compilation.
 
 For atomics, use Zig's `@atomicRmw`, `@atomicLoad` and `@atomicStore` on global
-pointers. One caveat: on NVPTX every read-modify-write runs relaxed, whatever
+pointers. One caveat: on NVPTX every `@atomicRmw` runs relaxed, whatever
 ordering you pass. Order through an acquire load or a release store instead.
 
 If the kernel to launch is named by a config file rather than by your source,

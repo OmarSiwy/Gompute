@@ -212,7 +212,7 @@ pub fn ReduceOptions(comptime T: type, comptime Params: type) type {
         /// `@Vector`. Left null for a custom `combine`: a generic `fn (T, T) T`
         /// cannot be lane-widened, and float addition is not reassociative, so
         /// LLVM will not widen it either.
-        simd_op: ?std.builtin.ReduceOp = null,
+        simd_op: ?std.lang.ReduceOp = null,
     };
 }
 
@@ -252,7 +252,7 @@ pub fn Reduce(
         pub const BoundaryParameters = abi.Boundary(Params);
         pub const block_size: u32 = options.block_size;
         pub const identity: T = identity_value;
-        pub const simd_op: ?std.builtin.ReduceOp = options.simd_op;
+        pub const simd_op: ?std.lang.ReduceOp = options.simd_op;
 
         pub inline fn combine(a: T, b: T) T {
             return @call(.always_inline, combine_fn, .{ a, b });
@@ -329,11 +329,11 @@ pub fn MapFn(
     comptime options: MapOptions,
 ) type {
     const f = fnInfo(func);
-    const T = f.params[0].type orelse @compileError(
+    const T = f.param_types[0] orelse @compileError(
         "cannot infer the value type of a generic map function; use the " ++
             "5-argument form g.map(name, T, Params, func, options)",
     );
-    const P = f.params[1].type orelse @compileError(
+    const P = f.param_types[1] orelse @compileError(
         "cannot infer the parameter type; use g.map(name, T, Params, func, options)",
     );
     return Map(name, T, P, func, options);
@@ -419,7 +419,7 @@ fn Preset(
     comptime T: type,
     comptime Params: type,
     comptime options: ReduceOptions(T, Params),
-    comptime op: std.builtin.ReduceOp,
+    comptime op: std.lang.ReduceOp,
     comptime identity_value: T,
 ) type {
     var with_op = options;
@@ -435,7 +435,7 @@ fn Preset(
 /// One reduction step, lane-wise: the same body serves a scalar `combine` and
 /// the CPU path's vector accumulator. Integer addition wraps -- the device runs
 /// ReleaseFast and would wrap silently anyway, so the CPU must not panic.
-pub inline fn combineOp(comptime op: std.builtin.ReduceOp, a: anytype, b: @TypeOf(a)) @TypeOf(a) {
+pub inline fn combineOp(comptime op: std.lang.ReduceOp, a: anytype, b: @TypeOf(a)) @TypeOf(a) {
     const V = @TypeOf(a);
     const E = if (@typeInfo(V) == .vector) @typeInfo(V).vector.child else V;
     return switch (op) {
@@ -465,7 +465,7 @@ fn Eval(comptime generic: bool, comptime T: type, comptime P: type, comptime fun
 fn isGeneric(comptime func: anytype) bool {
     const info = @typeInfo(@TypeOf(func));
     if (info != .@"fn") @compileError("the operation must be a function");
-    return info.@"fn".params[0].type == null;
+    return info.@"fn".param_types[0] == null;
 }
 
 /// `E`, or `@Vector(n, E)` when `X` is an n-lane vector: the return type of a
@@ -520,11 +520,11 @@ fn validateValue(comptime T: type) void {
     }
 }
 
-fn fnInfo(comptime func: anytype) std.builtin.Type.Fn {
+fn fnInfo(comptime func: anytype) std.lang.Type.Fn {
     const info = @typeInfo(@TypeOf(func));
     if (info != .@"fn") @compileError("map operation must be a function");
     const f = info.@"fn";
-    if (f.is_var_args or f.params.len != 2)
+    if (f.attrs.varargs or f.param_types.len != 2)
         @compileError("map operation must have signature fn (T, Params) T");
     return f;
 }
@@ -533,12 +533,12 @@ fn fnInfo(comptime func: anytype) std.builtin.Type.Fn {
 /// which the CPU backend may instantiate at vector width.
 fn validateFunction(comptime T: type, comptime P: type, comptime func: anytype) bool {
     const f = fnInfo(func);
-    const b = f.params[1].type orelse @compileError("the params argument cannot be anytype");
+    const b = f.param_types[1] orelse @compileError("the params argument cannot be anytype");
     if (b != P)
         @compileError("map operation must take " ++ @typeName(P) ++ " as its second argument");
-    if (f.params[0].type == null) return true;
+    if (f.param_types[0] == null) return true;
     const r = f.return_type orelse @compileError("map operation must return T");
-    if (f.params[0].type.? != T or r != T)
+    if (f.param_types[0].? != T or r != T)
         @compileError("map operation must have signature fn (" ++ @typeName(T) ++ ", " ++ @typeName(P) ++ ") " ++ @typeName(T));
     return false;
 }

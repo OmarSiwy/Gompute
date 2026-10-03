@@ -101,7 +101,7 @@ fn acquire() void {
     while (!lock.tryLock()) std.Thread.yield() catch std.atomic.spinLoopHint();
 }
 
-const lib_names = switch (builtin.os.tag) {
+const lib_names = switch (builtin.target.os.tag) {
     .windows => &[_][]const u8{"amdhip64.dll"},
     else => &[_][]const u8{ "libamdhip64.so", "libamdhip64.so.7", "libamdhip64.so.6", "libamdhip64.so.5" },
 };
@@ -118,15 +118,16 @@ fn loadApiLocked() Error!void {
     if (loaded) return;
     var lib = openFirst(lib_names) orelse return error.InitFailed;
     errdefer lib.close();
-    inline for (@typeInfo(Api).@"struct".fields) |field| {
-        if (comptime std.mem.eql(u8, field.name, "lib")) continue;
+    const api = @typeInfo(Api).@"struct";
+    inline for (api.field_names, api.field_types) |field_name, field_type| {
+        if (comptime std.mem.eql(u8, field_name, "lib")) continue;
         // An optional field is one we can live without; anything else is fatal.
-        const optional = comptime @typeInfo(field.type) == .optional;
-        const Fn = comptime if (optional) @typeInfo(field.type).optional.child else field.type;
-        if (lib.lookup(Fn, field.name)) |sym| {
-            @field(g, field.name) = sym;
+        const optional = comptime @typeInfo(field_type) == .optional;
+        const Fn = comptime if (optional) @typeInfo(field_type).optional.child else field_type;
+        if (lib.lookup(Fn, field_name)) |sym| {
+            @field(g, field_name) = sym;
         } else if (optional) {
-            @field(g, field.name) = null;
+            @field(g, field_name) = null;
         } else return error.InitFailed;
     }
     g.lib = lib;
@@ -461,7 +462,7 @@ pub const Buffer = struct {
     }
 };
 
-/// A loaded module. `getKernel` looks entry points up by mangled symbol name.
+/// A loaded module. `getKernel` looks entry points up by symbol name.
 pub const Module = struct {
     module: hipModule_t = null,
     /// Owned by the process-wide cache; `deinit` must leave it alone.
@@ -663,14 +664,14 @@ test "the graph and event surface matches cuda.zig's, and handle-less deinit is 
     // types swapped, and a default-built handle never reaches the runtime.
     const cuda = @import("cuda.zig");
     inline for (.{
-        .{ Graph, cuda.Graph },           .{ GraphExec, cuda.GraphExec }, .{ Event, cuda.Event },
-        .{ Stream, cuda.Stream },         .{ Buffer, cuda.Buffer },       .{ Context, cuda.Context },
+        .{ Graph, cuda.Graph },   .{ GraphExec, cuda.GraphExec }, .{ Event, cuda.Event },
+        .{ Stream, cuda.Stream }, .{ Buffer, cuda.Buffer },       .{ Context, cuda.Context },
     }) |pair| {
         std.testing.refAllDecls(pair[0]);
         inline for (.{ "instantiate", "launch", "update", "record", "synchronize", "query", "elapsedUs", "waitEvent", "beginCapture", "endCapture", "isCapturing", "copyFromAsync", "createStreamNonBlocking", "createEvent" }) |name| {
             if (@hasDecl(pair[1], name)) try std.testing.expectEqual(
-                @typeInfo(@TypeOf(@field(pair[1], name))).@"fn".params.len,
-                @typeInfo(@TypeOf(@field(pair[0], name))).@"fn".params.len,
+                @typeInfo(@TypeOf(@field(pair[1], name))).@"fn".param_types.len,
+                @typeInfo(@TypeOf(@field(pair[0], name))).@"fn".param_types.len,
             );
         }
     }

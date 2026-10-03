@@ -1,15 +1,15 @@
 # Guide
 
-Gompute is a Zig **0.16.0** library for defining a one-dimensional GPU/CPU
+Gompute is a Zig **0.17.0** library for defining a one-dimensional GPU/CPU
 kernel once and specializing the whole abstraction at compile time.
 
 ## Dependencies
 
-LLVM comes from Zig itself: the PTX/HSACO steps call `zig cc` and `zig ld.lld`,
+LLVM comes from Zig itself: PTX is Zig's own output and HSACO is `zig ld.lld`,
 so there is nothing to install.
 
 The CUDA and HIP backends do need libc linked into your executable, via
-`exe.root_module.linkSystemLibrary("c", .{})`. Without libc, Zig 0.16's
+`exe.root_module.linkSystemLibrary("c", .{})`. Without libc, Zig's
 `std.DynLib` resolves to `ElfDynLib` instead of `DlDynLib`; that opens
 `libcuda.so` but cannot resolve symbols out of it, and you get
 `cuda: symbol not found: cuInit` at run time. The message looks exactly like a

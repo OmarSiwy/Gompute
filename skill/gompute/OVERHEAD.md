@@ -24,7 +24,7 @@ Expect the same shape on other hardware, though the exact numbers will move.
 | `init`/`deinit` | nothing, both inline to no code |
 | generic `map` | `suggestVectorLength(T)` lanes per step, scalar tail of < lanes elements |
 | generic `mapTo`, `zip`, `mapIndexed` | the same SIMD chunking as `map`. Measured: `zip` a·s+b 0.40 → 0.15 ns/elem (2.8×); `mapTo` of `exp` 2.93 → 1.20 (2.45×) |
-| concrete `map`, `mapTo`, `zip`, `mapIndexed`, `gather`, `scatter` | a plain scalar loop. **Zig 0.16 ships LLVM's loop vectorizer disabled**, so this is one element per instruction |
+| concrete `map`, `mapTo`, `zip`, `mapIndexed`, `gather`, `scatter` | a plain scalar loop. **Zig 0.16 and 0.17 ship LLVM's loop vectorizer disabled**, so this is one element per instruction |
 | `sum`/`min`/`max`/`any`/`all` | 4 vector registers of accumulators, a single `@reduce` at the end; tail < 4×lanes scalar. **1.8 µs for 64K f32** (old per-chunk `@reduce`: 9.9 µs) |
 | custom `reduce` | scalar fold, one dependent `combine` per element |
 | `.pre` on a reduce | one scalar call per element, inlined |

@@ -208,14 +208,14 @@ test "the async surface still lines up with the blocking one" {
         // has to accept exactly what `allocPinned` hands back.
         const pinned = @typeInfo(@TypeOf(Raw.allocPinned)).@"fn".return_type.?;
         try std.testing.expect(@typeInfo(pinned).error_union.payload ==
-            @typeInfo(@TypeOf(Raw.freePinned)).@"fn".params[1].type.?);
+            @typeInfo(@TypeOf(Raw.freePinned)).@"fn".param_types[1].?);
 
         // `launchOn` is `launch` with a stream spliced in after `self`.
-        const blocking = @typeInfo(@TypeOf(Raw.launch)).@"fn".params;
-        const ordered = @typeInfo(@TypeOf(Raw.launchOn)).@"fn".params;
+        const blocking = @typeInfo(@TypeOf(Raw.launch)).@"fn".param_types;
+        const ordered = @typeInfo(@TypeOf(Raw.launchOn)).@"fn".param_types;
         try std.testing.expectEqual(blocking.len + 1, ordered.len);
-        try std.testing.expect(ordered[1].type.? == *Raw.Stream);
+        try std.testing.expect(ordered[1].? == *Raw.Stream);
         inline for (blocking[1..], ordered[2..]) |a, b|
-            try std.testing.expect(a.type.? == b.type.?);
+            try std.testing.expect(a.? == b.?);
     }
 }

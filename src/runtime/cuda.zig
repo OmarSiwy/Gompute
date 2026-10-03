@@ -109,7 +109,7 @@ fn acquire() void {
     while (!lock.tryLock()) std.Thread.yield() catch std.atomic.spinLoopHint();
 }
 
-const lib_names = switch (builtin.os.tag) {
+const lib_names = switch (builtin.target.os.tag) {
     .windows => &[_][]const u8{"nvcuda.dll"},
     else => &[_][]const u8{
         "libcuda.so",                          "libcuda.so.1",
@@ -142,18 +142,19 @@ fn loadApiLocked() Error!void {
         return error.InitFailed;
     };
     errdefer lib.close();
-    inline for (@typeInfo(Api).@"struct".fields) |field| {
-        if (comptime std.mem.eql(u8, field.name, "lib")) continue;
+    const api = @typeInfo(Api).@"struct";
+    inline for (api.field_names, api.field_types) |field_name, field_type| {
+        if (comptime std.mem.eql(u8, field_name, "lib")) continue;
         // An optional field is one we can live without; anything else is fatal.
-        const optional = comptime @typeInfo(field.type) == .optional;
-        const Fn = comptime if (optional) @typeInfo(field.type).optional.child else field.type;
-        if (lib.lookup(Fn, field.name)) |sym| {
-            @field(g, field.name) = sym;
+        const optional = comptime @typeInfo(field_type) == .optional;
+        const Fn = comptime if (optional) @typeInfo(field_type).optional.child else field_type;
+        if (lib.lookup(Fn, field_name)) |sym| {
+            @field(g, field_name) = sym;
         } else if (optional) {
-            @field(g, field.name) = null;
+            @field(g, field_name) = null;
         } else {
             // Opening the driver and then failing to resolve a symbol out of it
-            // is almost never a driver problem: without libc, Zig 0.16's
+            // is almost never a driver problem: without libc, Zig's
             // std.DynLib is ElfDynLib, which opens libcuda.so but cannot
             // resolve from it. Stays loud -- the bare old message
             // ("symbol not found: cuInit") sent people hunting a version
@@ -162,7 +163,7 @@ fn loadApiLocked() Error!void {
                 "gompute: opened the CUDA driver but symbol '{s}' is missing.\n" ++
                     "  This almost always means the executable was not linked against libc.\n" ++
                     "  Add to your build.zig:  exe.root_module.linkSystemLibrary(\"c\", .{{}});",
-                .{field.name},
+                .{field_name},
             );
             return error.InitFailed;
         }
@@ -542,7 +543,7 @@ pub const Buffer = struct {
     }
 };
 
-/// A loaded module. `getKernel` looks entry points up by mangled symbol name.
+/// A loaded module. `getKernel` looks entry points up by symbol name.
 pub const Module = struct {
     module: CUmodule = null,
     /// Owned by the process-wide cache; `deinit` must leave it alone.
