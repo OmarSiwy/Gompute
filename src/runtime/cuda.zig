@@ -3,6 +3,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const iface = @import("../core/interface.zig");
+const DynLib = @import("dynlib.zig").DynLib;
 const Dim3 = iface.Dim3;
 const Error = iface.Error;
 /// See `core/interface.zig`; the same type on both backends.
@@ -27,7 +28,7 @@ const CU_EVENT_DISABLE_TIMING: c_uint = 2;
 const CU_DEVICE_ATTRIBUTE_SINGLE_TO_DOUBLE_PRECISION_PERF_RATIO: c_int = 87;
 
 const Api = struct {
-    lib: std.DynLib,
+    lib: DynLib,
     // Core
     cuInit: *const fn (c_uint) callconv(.c) CUresult,
     cuDeviceGet: *const fn (*CUdevice, c_int) callconv(.c) CUresult,
@@ -111,6 +112,8 @@ fn acquire() void {
 
 const lib_names = switch (builtin.target.os.tag) {
     .windows => &[_][]const u8{"nvcuda.dll"},
+    // NVIDIA's last macOS driver (CUDA 10.2); nothing newer exists.
+    .macos => &[_][]const u8{ "libcuda.dylib", "/usr/local/cuda/lib/libcuda.dylib" },
     else => &[_][]const u8{
         "libcuda.so",                          "libcuda.so.1",
         "/run/opengl-driver/lib/libcuda.so.1", "/run/opengl-driver/lib/libcuda.so",
@@ -124,9 +127,9 @@ const tried_paths = blk: {
     break :blk s;
 };
 
-fn openFirst(names: []const []const u8) ?std.DynLib {
+fn openFirst(names: []const []const u8) ?DynLib {
     for (names) |n| {
-        if (std.DynLib.open(n)) |l| return l else |_| {}
+        if (DynLib.open(n)) |l| return l else |_| {}
     }
     return null;
 }
@@ -155,7 +158,7 @@ fn loadApiLocked() Error!void {
         } else {
             // Opening the driver and then failing to resolve a symbol out of it
             // is almost never a driver problem: without libc, Zig's
-            // std.DynLib is ElfDynLib, which opens libcuda.so but cannot
+            // DynLib is ElfDynLib, which opens libcuda.so but cannot
             // resolve from it. Stays loud -- the bare old message
             // ("symbol not found: cuInit") sent people hunting a version
             // mismatch that does not exist.

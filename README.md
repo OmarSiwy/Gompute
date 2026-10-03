@@ -24,9 +24,10 @@ than removing any features.
 zig fetch --save git+https://github.com/OmarSiwy/Gompute.git
 ```
 
-Requires Zig 0.17.0 exactly (the `0.16.0` tag is the last Zig 0.16 build). Linux and macOS; Windows and wasm are CPU-only and
-the GPU backends do not compile there. The CUDA/HIP backends need
-`exe.root_module.linkSystemLibrary("c", .{})`, because the drivers are `dlopen`'d.
+Requires Zig 0.17.0 exactly (the `0.16.0` tag is the last Zig 0.16 build). Builds on Linux, Windows, macOS and
+wasm. The CUDA/HIP drivers are loaded at run time (`dlopen` / `LoadLibraryA`), and
+a machine without one falls back to the CPU; see [Platform support](docs/reference.md#platform-support).
+The GPU backends need `exe.root_module.linkSystemLibrary("c", .{})`.
 
 ## Example
 

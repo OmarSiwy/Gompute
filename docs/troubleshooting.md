@@ -148,15 +148,6 @@ which one lands is unspecified on both vendors. There is no `scatterAdd`;
 combining duplicates needs a device float atomic, which is gfx9+ and
 `--unsafe-fp-atomics` on AMD.
 
-## ≈29 compile errors from `std/dynamic_library.zig`
-
-You are building for Windows or wasm and something instantiated a GPU backend.
-Zig's `std.DynLib` only supports Linux and the Darwin/BSD family;
-everything else is `@compileError("unsupported platform")`.
-
-`.cpu` alone compiles everywhere. `AutoKernel` does not count as CPU-only,
-because it instantiates all three backends. See [Platform support](reference.html#platform-support).
-
 ## Getting the driver's own answer
 
 When the library's error is not specific enough:

@@ -3,6 +3,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const iface = @import("../core/interface.zig");
+const DynLib = @import("dynlib.zig").DynLib;
 const Dim3 = iface.Dim3;
 const Error = iface.Error;
 /// See `core/interface.zig`; the same type on both backends.
@@ -26,7 +27,7 @@ const hipStreamNonBlocking: c_uint = 1;
 const hipEventDisableTiming: c_uint = 2;
 
 const Api = struct {
-    lib: std.DynLib,
+    lib: DynLib,
     hipInit: *const fn (c_uint) callconv(.c) hipError_t,
     hipDeviceGet: *const fn (*hipDevice_t, c_int) callconv(.c) hipError_t,
     hipCtxCreate: *const fn (*hipCtx_t, c_uint, hipDevice_t) callconv(.c) hipError_t,
@@ -102,13 +103,14 @@ fn acquire() void {
 }
 
 const lib_names = switch (builtin.target.os.tag) {
-    .windows => &[_][]const u8{"amdhip64.dll"},
+    // The HIP SDK suffixes the DLL with its major version since 6.0.
+    .windows => &[_][]const u8{ "amdhip64_7.dll", "amdhip64_6.dll", "amdhip64.dll" },
     else => &[_][]const u8{ "libamdhip64.so", "libamdhip64.so.7", "libamdhip64.so.6", "libamdhip64.so.5" },
 };
 
-fn openFirst(names: []const []const u8) ?std.DynLib {
+fn openFirst(names: []const []const u8) ?DynLib {
     for (names) |n| {
-        if (std.DynLib.open(n)) |l| return l else |_| {}
+        if (DynLib.open(n)) |l| return l else |_| {}
     }
     return null;
 }

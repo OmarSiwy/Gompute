@@ -16,24 +16,21 @@ newer is supported.
 
 ## Platform support
 
-| Platform            | CPU backend | CUDA / HIP backends                 |
-| ------------------- | ----------- | ----------------------------------- |
-| Linux               | Yes         | Yes                                 |
-| macOS               | Yes         | Compiles, but no such driver exists |
-| `wasm32-wasi`       | Yes         | **Does not compile**                |
-| Windows             | Yes         | **Does not compile**                |
+| Platform      | CPU backend | CUDA / HIP backends                                         |
+| ------------- | ----------- | ----------------------------------------------------------- |
+| Linux         | Yes         | Yes                                                         |
+| Windows       | Yes         | Yes: `nvcuda.dll`, `amdhip64_7.dll` / `_6` / unsuffixed     |
+| macOS         | Yes         | Compiles; only finds NVIDIA's last driver (CUDA 10.2)       |
+| `wasm32-wasi` | Yes         | Compiles; every GPU init returns `error.InitFailed`         |
 
-Zig's `std.DynLib` only has an implementation for Linux and the
-Darwin/BSD family; every other target hits `@compileError("unsupported
-platform")`. Gompute `dlopen`s the CUDA and HIP drivers, so on Windows and
-wasm anything that instantiates `Kernel(spec, .cuda)`, `Kernel(spec, .hip)`,
-`RawKernel` or `AutoKernel` fails to compile (≈29 errors, all from
-`std/dynamic_library.zig`). The `nvcuda.dll` entry in `src/runtime/cuda.zig`
-is aspirational; **Windows is not supported.**
+The drivers are loaded at run time: `std.DynLib` on Linux, macOS and the BSDs,
+`LoadLibraryA` on Windows (Zig 0.17's std has no Windows `DynLib`), and a stub
+that never opens anything on wasm (`src/runtime/dynlib.zig`). A missing
+driver is the same `error.InitFailed` on every platform, so `AutoKernel`
+falls back to `.cpu` everywhere.
 
-A program that only ever names `.cpu` compiles and runs on all four;
-`emitKernels` already skips the GPU sub-compilations on wasm. `AutoKernel`
-does *not* count as CPU-only: it instantiates all three backends.
+`emitKernels` skips the GPU sub-compilations on wasm, so there is nothing
+to launch there anyway.
 
 ## Behaviour worth knowing
 
