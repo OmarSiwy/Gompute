@@ -379,9 +379,10 @@ pub fn build(b: *std.Build) void {
     } });
 
     // The lowerings `src/device/builtins.zig` promises for `t_raw_atomics`.
+    // LLVM 21 spells these `atom.global.add.u32`, LLVM 22 `atom.relaxed.sys.global.add.u32`.
     const ptx_atomics = b.addCheckFile(device_probe.getEmittedAsm(), .{ .expected_matches = &.{
-        "atom.global.add.u32",
-        "atom.global.min.u32",
+        ".global.add.u32",
+        ".global.min.u32",
         "ld.acquire.sys.global.b32",
         "st.release.sys.global.b32",
         "ld.acquire.gpu.global.u32",

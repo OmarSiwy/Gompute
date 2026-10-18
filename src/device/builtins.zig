@@ -143,7 +143,8 @@ const wg_fence: struct { release: []const u8, acquire: []const u8 = "" } = if (b
             return builtin.target.cpu.features.isEnabled(@backingInt(feature));
         }
     }.f;
-    if (has(.tgsplit)) @compileError("barrier: tgsplit is not supported");
+    // Zig 0.18's amdgcn has no `tgsplit` mode feature, only `tgsplit_support`.
+    if (@hasField(std.Target.amdgcn.Feature, "tgsplit") and has(.tgsplit)) @compileError("barrier: tgsplit is not supported");
     if (has(.gfx12_insts)) break :blk .{
         .release = "s_wait_loadcnt 0x0\n\ts_wait_storecnt 0x0\n\ts_wait_dscnt 0x0",
         .acquire = "global_inv scope:SCOPE_SE",
