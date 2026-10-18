@@ -801,7 +801,9 @@ fn artifactsSource(
         \\    comptime blob: u16,
         \\    comptime table: []const [:0]const u8,
         \\) []const KV {
-        \\    @setEvalBranchQuota(100_000);
+        \\    // The duplicate scan is O(kernels^2); give it room in proportion
+        \\    // (an ESPice build with ~80 kernel roots passed the old fixed 100_000).
+        \\    @setEvalBranchQuota(100_000 + 64 * (kvs.len + table.len) * (table.len + 1));
         \\    var out = kvs;
         \\    for (table) |name| {
         \\        for (out) |prev| if (std.mem.eql(u8, prev[0], name)) @compileError(
