@@ -1,6 +1,6 @@
 .{
     .name = .gompute,
-    .version = "1.2.0",
+    .version = "1.2.1",
     .fingerprint = 0x4f38064d65c9560,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{},

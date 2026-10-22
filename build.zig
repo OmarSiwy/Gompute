@@ -46,8 +46,7 @@ pub const HipOptions = BackendOptions;
 /// Whether `name` resolves on PATH, for the options that default to using
 /// a toolkit program when the build machine has it.
 fn onPath(b: *std.Build, name: []const u8) bool {
-    _ = b.findProgram(&.{name}, &.{}) catch return false;
-    return true;
+    return b.findProgram(.{ .names = &.{name} }) != null;
 }
 
 /// ponytail: nvidia-smi ships with every NVIDIA driver; querying it is the
