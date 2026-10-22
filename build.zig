@@ -35,12 +35,20 @@ const BackendOptions = struct {
     /// `ptxas` and embed both as one fat binary, so a card of that
     /// architecture loads it without the driver's JIT (minutes and many GB
     /// for a large root on first use); any other card still JITs the PTX.
-    /// Needs `ptxas` and `fatbinary` on PATH at build time.
-    sass: bool = false,
+    /// Null (the default) does it exactly when `ptxas` and `fatbinary` are
+    /// on PATH at build time; true requires them.
+    sass: ?bool = null,
 };
 
 pub const CudaOptions = BackendOptions;
 pub const HipOptions = BackendOptions;
+
+/// Whether `name` resolves on PATH, for the options that default to using
+/// a toolkit program when the build machine has it.
+fn onPath(b: *std.Build, name: []const u8) bool {
+    _ = b.findProgram(&.{name}, &.{}) catch return false;
+    return true;
+}
 
 /// ponytail: nvidia-smi ships with every NVIDIA driver; querying it is the
 /// lightest reliable probe. Compute cap "8.9" maps directly to "sm_89".
@@ -672,7 +680,8 @@ fn buildArtifacts(
     // `has_cuda`/`has_hip` are already known, and the generated source depends
     // on nothing else, so there is no reason to stage the LazyPaths anywhere.
     const write = b.addWriteFiles();
-    const sass_arch: ?[]const u8 = if (options.cuda.sass) cuda_cpu else null;
+    const sass_on = options.cuda.sass orelse (onPath(b, "ptxas") and onPath(b, "fatbinary"));
+    const sass_arch: ?[]const u8 = if (sass_on) cuda_cpu else null;
     const artifacts_mod = b.createModule(.{
         .root_source_file = write.add("gompute_kernels.zig", artifactsSource(
             b,

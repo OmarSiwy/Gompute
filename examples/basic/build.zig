@@ -27,7 +27,8 @@ pub fn build(b: *std.Build) void {
 
     exe.root_module.linkSystemLibrary("c", .{});
 
-    const sass = b.option(bool, "sass", "Embed SASS for the CUDA target beside the PTX (needs ptxas and fatbinary)") orelse false;
+    // Null: SASS exactly when ptxas and fatbinary are on PATH.
+    const sass = b.option(bool, "sass", "Embed SASS for the CUDA target beside the PTX (default: when ptxas and fatbinary are on PATH)");
     gompute_build.emitKernels(b, dep, exe, .{
         .kernels_root = b.path("src/kernels.zig"),
         .target = target,
