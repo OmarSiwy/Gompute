@@ -26,6 +26,8 @@ const CUDA_ERROR_GRAPH_EXEC_UPDATE_FAILURE: CUresult = 910;
 const CU_STREAM_NON_BLOCKING: c_uint = 1;
 const CU_EVENT_DISABLE_TIMING: c_uint = 2;
 const CU_DEVICE_ATTRIBUTE_SINGLE_TO_DOUBLE_PRECISION_PERF_RATIO: c_int = 87;
+const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR: c_int = 75;
+const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR: c_int = 76;
 
 const Api = struct {
     lib: DynLib,
@@ -390,6 +392,17 @@ pub const Context = struct {
         var v: c_int = 0;
         try check(g.cuDeviceGetAttribute(&v, CU_DEVICE_ATTRIBUTE_SINGLE_TO_DOUBLE_PRECISION_PERF_RATIO, self.device), error.InvalidArgument);
         return @intCast(v);
+    }
+
+    /// The device's compute capability as `major * 10 + minor`: 89 for an
+    /// sm_89 card, the number `CudaOptions.sass`'s "sm_89" names.
+    pub fn computeCapability(self: *Context) Error!u32 {
+        try self.makeCurrent();
+        var major: c_int = 0;
+        var minor: c_int = 0;
+        try check(g.cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, self.device), error.InvalidArgument);
+        try check(g.cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, self.device), error.InvalidArgument);
+        return @intCast(major * 10 + minor);
     }
     /// Caller owns the returned Stream and must `deinit` it.
     pub fn createStream(self: *Context) Error!Stream {

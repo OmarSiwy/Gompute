@@ -94,6 +94,15 @@ pub const Compute = struct {
         };
     }
 
+    /// The CUDA compute capability as `major * 10 + minor` (89 on sm_89).
+    /// `error.Unsupported` on HIP and `.cpu`.
+    pub fn computeCapability(self: *Compute) Error!u32 {
+        return switch (self.backend) {
+            .cuda => self.cuda_ctx.computeCapability(),
+            .hip, .cpu => error.Unsupported,
+        };
+    }
+
     /// Allocate device memory. Caller owns the returned Buffer and must
     /// `free` it. Returns `error.AllocFailed` on the `.cpu` backend, which has
     /// no device to allocate on.

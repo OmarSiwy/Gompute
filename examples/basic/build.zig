@@ -27,10 +27,12 @@ pub fn build(b: *std.Build) void {
 
     exe.root_module.linkSystemLibrary("c", .{});
 
+    const sass = b.option(bool, "sass", "Embed SASS for the CUDA target beside the PTX (needs ptxas and fatbinary)") orelse false;
     gompute_build.emitKernels(b, dep, exe, .{
         .kernels_root = b.path("src/kernels.zig"),
         .target = target,
         .optimize = optimize,
+        .cuda = .{ .sass = sass },
     });
     b.installArtifact(exe);
 

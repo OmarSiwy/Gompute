@@ -31,6 +31,12 @@ const BackendOptions = struct {
     /// Optimize mode for this backend's device code. Overrides
     /// `EmitOptions.optimize`.
     optimize: ?std.lang.Optimize = null,
+    /// CUDA only: also compile each root's PTX to SASS for `gpu` with
+    /// `ptxas` and embed both as one fat binary, so a card of that
+    /// architecture loads it without the driver's JIT (minutes and many GB
+    /// for a large root on first use); any other card still JITs the PTX.
+    /// Needs `ptxas` and `fatbinary` on PATH at build time.
+    sass: bool = false,
 };
 
 pub const CudaOptions = BackendOptions;
@@ -666,12 +672,14 @@ fn buildArtifacts(
     // `has_cuda`/`has_hip` are already known, and the generated source depends
     // on nothing else, so there is no reason to stage the LazyPaths anywhere.
     const write = b.addWriteFiles();
+    const sass_arch: ?[]const u8 = if (options.cuda.sass) cuda_cpu else null;
     const artifacts_mod = b.createModule(.{
         .root_source_file = write.add("gompute_kernels.zig", artifactsSource(
             b,
             roots,
             cuda_cpu != null,
             hip_cpu != null,
+            sass_arch,
         )),
     });
 
@@ -744,7 +752,22 @@ fn buildArtifacts(
 
             const blob = switch (d.device) {
                 // PTX is NVPTX's assembly output; the driver JIT-compiles it.
-                .cuda => object.getEmittedAsm(),
+                .cuda => if (sass_arch) |arch| blk: {
+                    // SASS for `arch` plus the PTX, in one fat binary the
+                    // driver picks from: the cubin on a matching card, a
+                    // JIT of the PTX elsewhere.
+                    const ptx = object.getEmittedAsm();
+                    const ptxas = b.addSystemCommand(&.{ "ptxas", b.fmt("-arch={s}", .{arch}), "-O3" });
+                    ptxas.addFileArg2(ptx, .{});
+                    const cubin = ptxas.addOutputFileArg2(b.fmt("gompute_cuda_{s}.cubin", .{root.name}), .{ .prefix = "--output-file=" });
+                    if (root.heavy) lanes.chain(&ptxas.step);
+                    const sm = arch["sm_".len..];
+                    const fat = b.addSystemCommand(&.{ "fatbinary", "--64" });
+                    const out = fat.addOutputFileArg2(b.fmt("gompute_cuda_{s}.fatbin", .{root.name}), .{ .prefix = "--create=" });
+                    fat.addFileArg2(cubin, .{ .prefix = b.fmt("--image3=kind=elf,sm={s},file=", .{sm}) });
+                    fat.addFileArg2(ptx, .{ .prefix = b.fmt("--image3=kind=ptx,sm={s},file=", .{sm}) });
+                    break :blk out;
+                } else object.getEmittedAsm(),
                 .hip => blk: {
                     const link = b.addSystemCommand(&.{ b.graph.zig_exe, "ld.lld", "-shared" });
                     link.addFileArg2(object.getEmittedBin(), .{});
@@ -768,6 +791,7 @@ fn artifactsSource(
     roots: []const KernelRoot,
     has_cuda: bool,
     has_hip: bool,
+    sass_arch: ?[]const u8,
 ) []const u8 {
     var out: std.Io.Writer.Allocating = .init(b.allocator);
     const w = &out.writer;
@@ -779,11 +803,14 @@ fn artifactsSource(
         \\pub const emitted = true;
         \\pub const has_cuda = {};
         \\pub const has_hip = {};
+        \\/// The CUDA architecture the images carry SASS for (`CudaOptions.sass`),
+        \\/// e.g. "sm_89"; null when they carry PTX alone.
+        \\pub const cuda_sass: ?[]const u8 = {s};
         \\
         \\/// Kernel roots, in blob order.
         \\pub const root_names = [_][]const u8{{
         \\
-    , .{ has_cuda, has_hip }) catch @panic("OOM");
+    , .{ has_cuda, has_hip, if (sass_arch) |a| b.fmt("\"{s}\"", .{a}) else "null" }) catch @panic("OOM");
     for (roots) |root| w.print("    \"{f}\",\n", .{std.zig.fmtString(root.name)}) catch @panic("OOM");
 
     w.writeAll(

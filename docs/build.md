@@ -215,6 +215,16 @@ comptime name -> `(blob, symbol)` map in the generated `gompute_kernels` module.
 2. Read the `ptx_kernel` names off the IR with `tools/kernel_ir_tool.zig`.
 3. Embed the PTX in the host executable, with a compile-time name map.
 
+With `.cuda = .{ .sass = true }`, step 3 instead embeds a fat binary: `ptxas`
+compiles the PTX to SASS for the `gpu` target (`sm_89`, say) and `fatbinary`
+packs the cubin with the PTX. A card of that architecture loads the SASS with
+no driver JIT, which for a large root otherwise costs minutes and gigabytes on
+first use; any other card still JITs the PTX. Both tools come with the CUDA
+toolkit and must be on PATH at build time. The generated module's
+`cuda_sass` names the architecture (null without SASS), and
+`Compute.computeCapability()` returns the device's (89 on `sm_89`), so a host
+can tell whether a load will JIT.
+
 Zig 0.16 exported each kernel as an LLVM alias, which NVPTX code generation
 rejects, so the IR used to be rewritten and re-assembled with `zig cc`. Zig
 0.17 emits the definition under its exported name, and the PTX comes straight
