@@ -25,6 +25,11 @@ const hipErrorNotReady: hipError_t = 600;
 const hipErrorGraphExecUpdateFailure: hipError_t = 910;
 const hipStreamNonBlocking: c_uint = 1;
 const hipEventDisableTiming: c_uint = 2;
+/// `hipDeviceAttributeMultiprocessorCount` in ROCm 7.2's `hipDeviceAttribute_t`
+/// (clr 7.2.3), valid from HIP 6.0 (`hip_6`); older runtimes are not asked.
+const hipDeviceAttributeMultiprocessorCount: c_int = 63;
+/// `hipRuntimeGetVersion` of HIP 6.0 (major * 10,000,000 + minor * 100,000 + patch).
+const hip_6: c_int = 60_000_000;
 
 const Api = struct {
     lib: DynLib,
@@ -79,6 +84,9 @@ const Api = struct {
     hipEventElapsedTime: ?*const fn (*f32, hipEvent_t, hipEvent_t) callconv(.c) hipError_t,
     hipEventDestroy: ?*const fn (hipEvent_t) callconv(.c) hipError_t,
     hipStreamWaitEvent: ?*const fn (hipStream_t, hipEvent_t, c_uint) callconv(.c) hipError_t,
+    // Device queries, optional (`Context.multiprocessorCount`).
+    hipDeviceGetAttribute: ?*const fn (*c_int, c_int, c_int) callconv(.c) hipError_t,
+    hipRuntimeGetVersion: ?*const fn (*c_int) callconv(.c) hipError_t,
 };
 
 const graph_fns = [_][]const u8{ "hipStreamBeginCapture", "hipStreamEndCapture", "hipStreamIsCapturing", "hipGraphInstantiateWithFlags", "hipGraphExecUpdate", "hipGraphLaunch", "hipGraphExecDestroy", "hipGraphDestroy" };
@@ -360,6 +368,21 @@ pub const Context = struct {
     pub fn fp64Ratio(self: *Context) Error!u32 {
         _ = self;
         return error.Unsupported;
+    }
+    /// See `cuda.Context.multiprocessorCount`: compute units on AMD (96 on a
+    /// gfx1100 RX 7900 XTX). `error.Unsupported` before HIP 6.0.
+    /// ponytail: the attribute value is ROCm 7.2's, unchecked against ROCm 5
+    /// (the enum moved, see `fp64Ratio`), so pre-6.0 runtimes are not asked.
+    pub fn multiprocessorCount(self: *Context) Error!u32 {
+        const get = g.hipDeviceGetAttribute orelse return error.Unsupported;
+        const version = g.hipRuntimeGetVersion orelse return error.Unsupported;
+        var rt: c_int = 0;
+        try check(version(&rt), error.Unsupported);
+        if (rt < hip_6) return error.Unsupported;
+        try self.makeCurrent();
+        var v: c_int = 0;
+        try check(get(&v, hipDeviceAttributeMultiprocessorCount, self.ordinal), error.InvalidArgument);
+        return @intCast(v);
     }
     /// Caller owns the returned Stream and must `deinit` it.
     pub fn createStream(self: *Context) Error!Stream {

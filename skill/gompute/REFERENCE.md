@@ -99,7 +99,8 @@ launch.
 `allocPinned`/`freePinned`, `loadModuleFromMemory(image)` (cached per device
 and image), `createStream`, `createStreamNonBlocking`, `createEvent`,
 `hasGraphs`, `hasEvents`, `fp64Ratio() !u32` (2 on datacenter parts, 64 on
-consumer parts).
+consumer parts; CUDA only), `multiprocessorCount() !u32` (SMs, or compute
+units on HIP 6.0+).
 
 **Buffer**: `upload(host, n)`, `download(host, n)`, `uploadAt/downloadAt(host,
 offset, n)`, `copyFrom(src, src_off, dst_off, n)`, `copyFromAsync(..., &stream)`,
@@ -127,7 +128,8 @@ how many (device, image) modules are JIT'd.
 
 `g.runtime.dynamic.Compute` is one tagged-union facade over CUDA, HIP and a
 `.cpu` arm that fails politely. It offers `init(?Backend)`, `initDevice`,
-`alloc`, `loadModule`, `createStream`, `synchronize` and `fp64Ratio`. It
+`alloc`, `loadModule`, `createStream`, `synchronize`, `fp64Ratio`,
+`computeCapability` and `multiprocessorCount`. It
 has no events or graphs; for those, use the vendor module.
 
 ## Errors

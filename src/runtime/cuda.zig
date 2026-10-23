@@ -28,6 +28,7 @@ const CU_EVENT_DISABLE_TIMING: c_uint = 2;
 const CU_DEVICE_ATTRIBUTE_SINGLE_TO_DOUBLE_PRECISION_PERF_RATIO: c_int = 87;
 const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR: c_int = 75;
 const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR: c_int = 76;
+const CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT: c_int = 16;
 
 const Api = struct {
     lib: DynLib,
@@ -403,6 +404,16 @@ pub const Context = struct {
         try check(g.cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, self.device), error.InvalidArgument);
         try check(g.cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, self.device), error.InvalidArgument);
         return @intCast(major * 10 + minor);
+    }
+
+    /// How many streaming multiprocessors the device has: 24 on an RTX 4060
+    /// Laptop, 108 on an A100. Resident blocks, and so the work a launch
+    /// needs to fill the card, scale with it.
+    pub fn multiprocessorCount(self: *Context) Error!u32 {
+        try self.makeCurrent();
+        var v: c_int = 0;
+        try check(g.cuDeviceGetAttribute(&v, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, self.device), error.InvalidArgument);
+        return @intCast(v);
     }
     /// Caller owns the returned Stream and must `deinit` it.
     pub fn createStream(self: *Context) Error!Stream {
@@ -966,4 +977,10 @@ test "fp64Ratio reports a real FP32:FP64 ratio" {
     const r = try ctx.fp64Ratio();
     // Every NVIDIA part since Kepler is 2 (datacenter) up to 64 (consumer).
     try std.testing.expect(r >= 2 and r <= 64);
+}
+
+test "multiprocessorCount reports at least one SM" {
+    var ctx = Context.init(0) catch return error.SkipZigTest;
+    defer ctx.deinit();
+    try std.testing.expect(try ctx.multiprocessorCount() >= 1);
 }

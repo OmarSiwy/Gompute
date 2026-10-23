@@ -94,6 +94,16 @@ pub const Compute = struct {
         };
     }
 
+    /// Streaming multiprocessors (CUDA) or compute units (HIP 6.0+): 24 on an
+    /// RTX 4060 Laptop. `error.Unsupported` on `.cpu` and older HIP.
+    pub fn multiprocessorCount(self: *Compute) Error!u32 {
+        return switch (self.backend) {
+            .cuda => self.cuda_ctx.multiprocessorCount(),
+            .hip => self.hip_ctx.multiprocessorCount(),
+            .cpu => error.Unsupported,
+        };
+    }
+
     /// The CUDA compute capability as `major * 10 + minor` (89 on sm_89).
     /// `error.Unsupported` on HIP and `.cpu`.
     pub fn computeCapability(self: *Compute) Error!u32 {
@@ -310,6 +320,7 @@ test "the .cpu arm fails politely instead of pretending" {
     try std.testing.expectError(error.ModuleLoadFailed, c.loadModule(""));
     try std.testing.expectError(error.InitFailed, c.createStream());
     try std.testing.expectError(error.Unsupported, c.fp64Ratio());
+    try std.testing.expectError(error.Unsupported, c.multiprocessorCount());
 }
 
 test "Compute.init picks a backend and never fails" {
