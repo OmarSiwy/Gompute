@@ -87,6 +87,13 @@ const Api = struct {
     // Device queries, optional (`Context.multiprocessorCount`).
     hipDeviceGetAttribute: ?*const fn (*c_int, c_int, c_int) callconv(.c) hipError_t,
     hipRuntimeGetVersion: ?*const fn (*c_int) callconv(.c) hipError_t,
+    // Device enumeration and identity, optional (`deviceCount`, `Context.info`).
+    hipGetDeviceCount: ?*const fn (*c_int) callconv(.c) hipError_t,
+    hipDeviceGetName: ?*const fn ([*]u8, c_int, hipDevice_t) callconv(.c) hipError_t,
+    hipDeviceGetUuid: ?*const fn (*[16]u8, hipDevice_t) callconv(.c) hipError_t,
+    hipDeviceGetPCIBusId: ?*const fn ([*]u8, c_int, c_int) callconv(.c) hipError_t,
+    hipDeviceTotalMem: ?*const fn (*usize, hipDevice_t) callconv(.c) hipError_t,
+    hipMemGetInfo: ?*const fn (*usize, *usize) callconv(.c) hipError_t,
 };
 
 const graph_fns = [_][]const u8{ "hipStreamBeginCapture", "hipStreamEndCapture", "hipStreamIsCapturing", "hipGraphInstantiateWithFlags", "hipGraphExecUpdate", "hipGraphLaunch", "hipGraphExecDestroy", "hipGraphDestroy" };
@@ -170,10 +177,9 @@ inline fn ready(rc: hipError_t, err: Error) Error!bool {
 // Mirrors cuda.zig: device pointers are context-scoped, so every handle on a
 // device shares one retained primary context and one JIT'd copy of the image.
 //
-// ponytail: fixed tables sized for one node -- 16 devices, 64 distinct images
-// (one per kernel root, per device). Overflow degrades to uncached, not to wrong.
+// ponytail: as cuda.zig -- 16 devices, a module list that grows; a failed
+// growth degrades to uncached, not to wrong.
 const max_devices = 16;
-const max_modules = 64;
 
 const CtxSlot = struct {
     device: hipDevice_t = 0,
@@ -200,18 +206,67 @@ fn retainPrimary(ordinal: c_int) Error!CtxSlot {
     try loadApiLocked();
     try check(g.hipInit(0), error.InitFailed);
     var found: CtxSlot = .{};
-    try check(g.hipDeviceGet(&found.device, ordinal), error.NoDevice);
-    if (g.hipDevicePrimaryCtxRetain) |retain| {
+    if (ordinal >= try realCountLocked()) {
+        if (ordinal >= fakeCount()) return error.NoDevice;
+        // A fake device (see `fakeCount`): a private context on device 0,
+        // which hipCtxCreate makes current behind `current_ordinal`'s back.
+        try check(g.hipDeviceGet(&found.device, 0), error.NoDevice);
+        try check(g.hipCtxCreate(&found.ctx, 0, found.device), error.ContextFailed);
+        current_ordinal = null;
+    } else if (g.hipDevicePrimaryCtxRetain) |retain| {
+        try check(g.hipDeviceGet(&found.device, ordinal), error.NoDevice);
         try check(retain(&found.ctx, found.device), error.ContextFailed);
         found.primary = true;
     } else {
         // ponytail: pre-4.2 ROCm. One shared private context per device still
         // fixes the cross-handle buffer bug, it just is not shared with cuBLAS.
+        try check(g.hipDeviceGet(&found.device, ordinal), error.NoDevice);
         try check(g.hipCtxCreate(&found.ctx, 0, found.device), error.ContextFailed);
     }
     slot.* = found;
     _ = default_ordinal.cmpxchgStrong(-1, ordinal, .monotonic, .monotonic);
     return found;
+}
+
+/// See cuda.zig's: the runtime's device count, -1 until asked. Caller holds
+/// `lock` and has loaded the API. 1 on a runtime without `hipGetDeviceCount`.
+var real_count: c_int = -1;
+
+fn realCountLocked() Error!c_int {
+    if (real_count < 0) {
+        var n: c_int = 1;
+        if (g.hipGetDeviceCount) |count| try check(count(&n), error.NoDevice);
+        real_count = n;
+    }
+    return real_count;
+}
+
+/// See cuda.zig's `fakeCount`: `GOMPUTE_FAKE_DEVICES`, a test knob.
+var fake_devices: ?c_int = null;
+
+fn fakeCount() c_int {
+    if (fake_devices) |k| return k;
+    const v = std.c.getenv("GOMPUTE_FAKE_DEVICES") orelse "";
+    const k = std.fmt.parseInt(c_int, std.mem.sliceTo(v, 0), 10) catch 0;
+    fake_devices = std.math.clamp(k, 0, max_devices);
+    return fake_devices.?;
+}
+
+/// See `cuda.deviceCount`.
+pub fn deviceCount() Error!u32 {
+    acquire();
+    defer lock.unlock();
+    try loadApiLocked();
+    try check(g.hipInit(0), error.InitFailed);
+    const real = try realCountLocked();
+    if (real == 0) return 0;
+    return @intCast(@max(real, fakeCount()));
+}
+
+/// See cuda.zig's `use`.
+inline fn use(ordinal: c_int) void {
+    if (ordinal < 0) return ensureCurrent();
+    setCurrent(ordinal) catch {};
 }
 
 fn setCurrent(ordinal: c_int) Error!void {
@@ -233,26 +288,22 @@ const ModuleSlot = struct {
     image: []const u8 = &.{},
     module: hipModule_t = null,
 };
-var module_slots: [max_modules]ModuleSlot = @splat(.{});
+var module_list: std.ArrayList(ModuleSlot) = .empty;
 
 /// ponytail: keyed on image identity (ptr + len), not contents -- artifacts come
 /// from `@embedFile` and live for the process.
 fn loadModuleCached(ordinal: c_int, image: []const u8) Error!Module {
     acquire();
     defer lock.unlock();
-    var free_slot: ?*ModuleSlot = null;
-    for (&module_slots) |*s| {
-        if (s.module == null) {
-            if (free_slot == null) free_slot = s;
-        } else if (s.ordinal == ordinal and s.image.ptr == image.ptr and s.image.len == image.len) {
-            return .{ .module = s.module, .cached = true };
+    for (module_list.items) |*s| {
+        if (s.ordinal == ordinal and s.image.ptr == image.ptr and s.image.len == image.len) {
+            return .{ .module = s.module, .cached = true, .ordinal = ordinal };
         }
     }
     var m: hipModule_t = null;
     try check(g.hipModuleLoadData(&m, image.ptr), error.ModuleLoadFailed);
-    const slot = free_slot orelse return .{ .module = m, .cached = false };
-    slot.* = .{ .ordinal = ordinal, .image = image, .module = m };
-    return .{ .module = m, .cached = true };
+    module_list.append(std.heap.page_allocator, .{ .ordinal = ordinal, .image = image, .module = m }) catch return .{ .module = m, .cached = false, .ordinal = ordinal };
+    return .{ .module = m, .cached = true, .ordinal = ordinal };
 }
 
 /// Unload every cached module and release every retained context. Nothing calls
@@ -262,10 +313,8 @@ pub fn shutdown() void {
     acquire();
     defer lock.unlock();
     if (!loaded) return;
-    for (&module_slots) |*s| {
-        if (s.module != null) _ = g.hipModuleUnload(s.module);
-        s.* = .{};
-    }
+    for (module_list.items) |*s| _ = g.hipModuleUnload(s.module);
+    module_list.clearAndFree(std.heap.page_allocator);
     for (&ctx_slots) |*s| {
         if (s.ctx != null) {
             if (s.primary) {
@@ -276,6 +325,7 @@ pub fn shutdown() void {
     }
     current_ordinal = null;
     default_ordinal.store(-1, .monotonic);
+    real_count = -1;
 }
 
 /// One device. Cheap to copy; the expensive part -- the retained primary context
@@ -312,7 +362,7 @@ pub const Context = struct {
     /// it; nothing here tracks it.
     pub fn alloc(self: *Context, bytes: usize) Error!Buffer {
         try self.makeCurrent();
-        var b: Buffer = .{ .bytes = bytes };
+        var b: Buffer = .{ .bytes = bytes, .ordinal = self.ordinal };
         try check(g.hipMalloc(&b.handle, bytes), error.AllocFailed);
         return b;
     }
@@ -384,24 +434,63 @@ pub const Context = struct {
         try check(get(&v, hipDeviceAttributeMultiprocessorCount, self.ordinal), error.InvalidArgument);
         return @intCast(v);
     }
+    /// See `cuda.Context.info`. Name, uuid, PCI address and memory where the
+    /// runtime exports them, compute units from `multiprocessorCount`.
+    /// ponytail: the clocks, the compute capability and the FP64 ratio stay 0:
+    /// `hipDeviceAttribute_t` numbering moved between ROCm 5 and 6 (see
+    /// `fp64Ratio`). Fill them once someone has a ROCm box to check on.
+    pub fn info(self: *Context) Error!iface.DeviceInfo {
+        try self.makeCurrent();
+        var d: iface.DeviceInfo = .{ .ordinal = self.ordinal };
+        if (g.hipDeviceGetName) |get| {
+            try check(get(&d.name_buf, d.name_buf.len, self.device), error.InvalidArgument);
+            d.name_len = std.mem.indexOfScalar(u8, &d.name_buf, 0) orelse d.name_buf.len;
+        }
+        if (g.hipDeviceGetUuid) |get| try check(get(&d.uuid, self.device), error.InvalidArgument);
+        if (g.hipDeviceGetPCIBusId) |get| {
+            // "dddd:bb:dd.f", hexadecimal.
+            var buf: [32]u8 = @splat(0);
+            try check(get(&buf, buf.len, self.device), error.InvalidArgument);
+            var it = std.mem.tokenizeAny(u8, std.mem.sliceTo(&buf, 0), ":.");
+            for ([_]*u32{ &d.pci_domain, &d.pci_bus, &d.pci_device }) |field|
+                field.* = std.fmt.parseInt(u32, it.next() orelse break, 16) catch 0;
+        }
+        d.sms = self.multiprocessorCount() catch 0;
+        if (g.hipDeviceTotalMem) |get| {
+            var total: usize = 0;
+            try check(get(&total, self.device), error.InvalidArgument);
+            d.mem_total = total;
+        }
+        if (g.hipMemGetInfo) |get| {
+            var free: usize = 0;
+            var total: usize = 0;
+            try check(get(&free, &total), error.InvalidArgument);
+            d.mem_free = free;
+        }
+        acquire();
+        defer lock.unlock();
+        d.fake = self.ordinal >= real_count;
+        return d;
+    }
+
     /// Caller owns the returned Stream and must `deinit` it.
     pub fn createStream(self: *Context) Error!Stream {
         try self.makeCurrent();
-        var s: Stream = .{};
+        var s: Stream = .{ .ordinal = self.ordinal };
         try check(g.hipStreamCreate(&s.stream, 0), error.SyncFailed);
         return s;
     }
     /// See `cuda.Context.createStreamNonBlocking`.
     pub fn createStreamNonBlocking(self: *Context) Error!Stream {
         try self.makeCurrent();
-        var s: Stream = .{};
+        var s: Stream = .{ .ordinal = self.ordinal };
         try check(g.hipStreamCreateWithFlags(&s.stream, hipStreamNonBlocking), error.SyncFailed);
         return s;
     }
     /// See `cuda.Context.createEvent`.
     pub fn createEvent(self: *Context, timing: bool) Error!Event {
         try self.makeCurrent();
-        var e: Event = .{};
+        var e: Event = .{ .ordinal = self.ordinal };
         try check((g.hipEventCreateWithFlags orelse return error.Unsupported)(&e.event, if (timing) 0 else hipEventDisableTiming), error.EventFailed);
         return e;
     }
@@ -416,6 +505,9 @@ pub const Context = struct {
 pub const Buffer = struct {
     handle: hipDeviceptr_t = null,
     bytes: usize = 0,
+    /// The device it was made on; -1 (hand-built) adopts the first one
+    /// retained (`use`).
+    ordinal: c_int = -1,
 
     /// `free` nulls the handle and a default-constructed Buffer never had one.
     /// Either way it is a caller mistake, not a safety panic (or, in
@@ -430,11 +522,11 @@ pub const Buffer = struct {
     }
 
     pub fn upload(self: *Buffer, host: *const anyopaque, n: usize) Error!void {
-        ensureCurrent();
+        use(self.ordinal);
         try check(g.hipMemcpyHtoD(try self.devicePtr(), host, n), error.CopyFailed);
     }
     pub fn download(self: *Buffer, host: *anyopaque, n: usize) Error!void {
-        ensureCurrent();
+        use(self.ordinal);
         try check(g.hipMemcpyDtoH(host, try self.devicePtr(), n), error.CopyFailed);
     }
     /// Release the device memory. Idempotent.
@@ -442,7 +534,7 @@ pub const Buffer = struct {
         // Also covers a default-constructed Buffer, where `g` is still
         // `undefined` because nothing ever dlopen'd the runtime.
         if (self.handle == null) return;
-        ensureCurrent();
+        use(self.ordinal);
         _ = g.hipFree(self.handle);
         self.* = .{};
     }
@@ -452,37 +544,37 @@ pub const Buffer = struct {
         return @ptrCast(&self.handle);
     }
     pub fn copyFrom(self: *Buffer, src: *const Buffer, src_offset: usize, dst_offset: usize, n: usize) Error!void {
-        ensureCurrent();
+        use(self.ordinal);
         try check(g.hipMemcpyDtoD(try self.offsetPtr(dst_offset), try src.offsetPtr(src_offset), n), error.CopyFailed);
     }
     /// `copyFrom`, enqueued on `stream` and not waited on. Legal under capture.
     pub fn copyFromAsync(self: *Buffer, src: *const Buffer, src_offset: usize, dst_offset: usize, n: usize, stream: *Stream) Error!void {
-        ensureCurrent();
+        use(self.ordinal);
         try check(g.hipMemcpyDtoDAsync(try self.offsetPtr(dst_offset), try src.offsetPtr(src_offset), n, stream.stream), error.CopyFailed);
     }
     pub fn downloadAt(self: *Buffer, host: *anyopaque, offset: usize, n: usize) Error!void {
-        ensureCurrent();
+        use(self.ordinal);
         try check(g.hipMemcpyDtoH(host, try self.offsetPtr(offset), n), error.CopyFailed);
     }
     pub fn uploadAt(self: *Buffer, host: *const anyopaque, offset: usize, n: usize) Error!void {
-        ensureCurrent();
+        use(self.ordinal);
         try check(g.hipMemcpyHtoD(try self.offsetPtr(offset), host, n), error.CopyFailed);
     }
     /// Enqueued on `stream` and not waited on; `host` must be `allocPinned`
     /// memory and must stay put until `stream.synchronize()` returns.
     pub fn downloadAtAsync(self: *Buffer, host: *anyopaque, offset: usize, n: usize, stream: *Stream) Error!void {
-        ensureCurrent();
+        use(self.ordinal);
         try check(g.hipMemcpyDtoHAsync(host, try self.offsetPtr(offset), n, stream.stream), error.CopyFailed);
     }
     pub fn uploadAtAsync(self: *Buffer, host: *const anyopaque, offset: usize, n: usize, stream: *Stream) Error!void {
-        ensureCurrent();
+        use(self.ordinal);
         try check(g.hipMemcpyHtoDAsync(try self.offsetPtr(offset), host, n, stream.stream), error.CopyFailed);
     }
     /// Set the first `n` bytes to `value`, on the device and on `stream`. The
     /// memory controller does it in place: zeroing this way costs no bus
     /// traffic, where copying a resident block of zeros over it does.
     pub fn fillAsync(self: *Buffer, value: u8, n: usize, stream: *Stream) Error!void {
-        ensureCurrent();
+        use(self.ordinal);
         try check(g.hipMemsetAsync(try self.devicePtr(), value, n, stream.stream), error.CopyFailed);
     }
 };
@@ -492,10 +584,13 @@ pub const Module = struct {
     module: hipModule_t = null,
     /// Owned by the process-wide cache; `deinit` must leave it alone.
     cached: bool = false,
+    /// The device it was made on; -1 (hand-built) adopts the first one
+    /// retained (`use`).
+    ordinal: c_int = -1,
 
     pub fn getKernel(self: *Module, name: [*:0]const u8) Error!Kernel {
-        ensureCurrent();
-        var k: Kernel = .{};
+        use(self.ordinal);
+        var k: Kernel = .{ .ordinal = self.ordinal };
         try check(g.hipModuleGetFunction(&k.func, self.module, name), error.KernelNotFound);
         return k;
     }
@@ -503,7 +598,7 @@ pub const Module = struct {
     /// `shutdown()` unloads it.
     pub fn deinit(self: *Module) void {
         if (!self.cached and self.module != null) {
-            ensureCurrent();
+            use(self.ordinal);
             _ = g.hipModuleUnload(self.module);
         }
         self.* = .{};
@@ -513,13 +608,16 @@ pub const Module = struct {
 /// An entry point in a loaded module.
 pub const Kernel = struct {
     func: hipFunction_t = null,
+    /// The device it was made on; -1 (hand-built) adopts the first one
+    /// retained (`use`).
+    ordinal: c_int = -1,
     pub fn launch(self: Kernel, grid: Dim3, block: Dim3, shared_bytes: u32, args: []const iface.Arg) Error!void {
         try self.launchOnStream(grid, block, shared_bytes, args, null);
     }
     /// Launch on `stream` and return without waiting. `args` must stay put
     /// until the launch has actually run -- `stream.synchronize()`.
     pub fn launchOnStream(self: Kernel, grid: Dim3, block: Dim3, shared_bytes: u32, args: []const iface.Arg, stream: hipStream_t) Error!void {
-        ensureCurrent();
+        use(self.ordinal);
         try check(g.hipModuleLaunchKernel(self.func, grid.x, grid.y, grid.z, block.x, block.y, block.z, shared_bytes, stream, @constCast(args.ptr), null), error.LaunchFailed);
     }
 };
@@ -527,35 +625,38 @@ pub const Kernel = struct {
 /// A queue of ordered asynchronous work. `null` is the default stream.
 pub const Stream = struct {
     stream: hipStream_t = null,
+    /// The device it was made on; -1 (hand-built) adopts the first one
+    /// retained (`use`).
+    ordinal: c_int = -1,
     pub fn synchronize(self: *Stream) Error!void {
-        ensureCurrent();
+        use(self.ordinal);
         try check(g.hipStreamSynchronize(self.stream), error.SyncFailed);
     }
     /// See `cuda.Stream.query`.
     pub fn query(self: *Stream) Error!bool {
-        ensureCurrent();
+        use(self.ordinal);
         return ready(g.hipStreamQuery(self.stream), error.SyncFailed);
     }
     /// See `cuda.Stream.waitEvent`.
     pub fn waitEvent(self: *Stream, event: *const Event) Error!void {
-        ensureCurrent();
+        use(self.ordinal);
         try check((g.hipStreamWaitEvent orelse return error.Unsupported)(self.stream, event.event, 0), error.EventFailed);
     }
     /// See `cuda.Stream.beginCapture`.
     pub fn beginCapture(self: *Stream, mode: CaptureMode) Error!void {
-        ensureCurrent();
+        use(self.ordinal);
         try check((g.hipStreamBeginCapture orelse return error.Unsupported)(self.stream, mode), error.CaptureFailed);
     }
     /// See `cuda.Stream.endCapture`.
     pub fn endCapture(self: *Stream) Error!Graph {
-        ensureCurrent();
-        var graph: Graph = .{};
+        use(self.ordinal);
+        var graph: Graph = .{ .ordinal = self.ordinal };
         try check((g.hipStreamEndCapture orelse return error.Unsupported)(self.stream, &graph.graph), error.CaptureFailed);
         return graph;
     }
     /// See `cuda.Stream.isCapturing`.
     pub fn isCapturing(self: *Stream) Error!bool {
-        ensureCurrent();
+        use(self.ordinal);
         var status: c_int = 0;
         try check((g.hipStreamIsCapturing orelse return error.Unsupported)(self.stream, &status), error.CaptureFailed);
         return status != 0;
@@ -564,7 +665,7 @@ pub const Stream = struct {
         // Same reason as `Buffer.free`: `Stream{}` is a value any caller can
         // build, and `g` is undefined until something dlopen'd the runtime.
         if (!loaded) return;
-        ensureCurrent();
+        use(self.ordinal);
         _ = g.hipStreamDestroy(self.stream);
         self.* = .{};
     }
@@ -573,16 +674,19 @@ pub const Stream = struct {
 /// See `cuda.Graph`.
 pub const Graph = struct {
     graph: hipGraph_t = null,
+    /// The device it was made on; -1 (hand-built) adopts the first one
+    /// retained (`use`).
+    ordinal: c_int = -1,
 
     pub fn instantiate(self: *const Graph) Error!GraphExec {
-        ensureCurrent();
-        var exec: GraphExec = .{};
+        use(self.ordinal);
+        var exec: GraphExec = .{ .ordinal = self.ordinal };
         try check((g.hipGraphInstantiateWithFlags orelse return error.Unsupported)(&exec.exec, self.graph, 0), error.GraphFailed);
         return exec;
     }
     pub fn deinit(self: *Graph) void {
         if (!loaded or self.graph == null) return;
-        ensureCurrent();
+        use(self.ordinal);
         if (g.hipGraphDestroy) |destroy| _ = destroy(self.graph);
         self.* = .{};
     }
@@ -591,13 +695,16 @@ pub const Graph = struct {
 /// See `cuda.GraphExec`.
 pub const GraphExec = struct {
     exec: hipGraphExec_t = null,
+    /// The device it was made on; -1 (hand-built) adopts the first one
+    /// retained (`use`).
+    ordinal: c_int = -1,
 
     pub fn launch(self: *GraphExec, stream: *Stream) Error!void {
-        ensureCurrent();
+        use(self.ordinal);
         try check((g.hipGraphLaunch orelse return error.Unsupported)(self.exec, stream.stream), error.GraphFailed);
     }
     pub fn update(self: *GraphExec, graph: *const Graph) Error!bool {
-        ensureCurrent();
+        use(self.ordinal);
         var node: hipGraphNode_t = null;
         var result: c_int = 0;
         const rc = (g.hipGraphExecUpdate orelse return error.Unsupported)(self.exec, graph.graph, &node, &result);
@@ -610,7 +717,7 @@ pub const GraphExec = struct {
     }
     pub fn deinit(self: *GraphExec) void {
         if (!loaded or self.exec == null) return;
-        ensureCurrent();
+        use(self.ordinal);
         if (g.hipGraphExecDestroy) |destroy| _ = destroy(self.exec);
         self.* = .{};
     }
@@ -619,28 +726,31 @@ pub const GraphExec = struct {
 /// See `cuda.Event`.
 pub const Event = struct {
     event: hipEvent_t = null,
+    /// The device it was made on; -1 (hand-built) adopts the first one
+    /// retained (`use`).
+    ordinal: c_int = -1,
 
     pub fn record(self: *Event, stream: *Stream) Error!void {
-        ensureCurrent();
+        use(self.ordinal);
         try check((g.hipEventRecord orelse return error.Unsupported)(self.event, stream.stream), error.EventFailed);
     }
     pub fn synchronize(self: *Event) Error!void {
-        ensureCurrent();
+        use(self.ordinal);
         try check((g.hipEventSynchronize orelse return error.Unsupported)(self.event), error.EventFailed);
     }
     pub fn query(self: *Event) Error!bool {
-        ensureCurrent();
+        use(self.ordinal);
         return ready((g.hipEventQuery orelse return error.Unsupported)(self.event), error.EventFailed);
     }
     pub fn elapsedUs(start: *const Event, end: *const Event) Error!f32 {
-        ensureCurrent();
+        use(start.ordinal);
         var ms: f32 = 0;
         try check((g.hipEventElapsedTime orelse return error.Unsupported)(&ms, start.event, end.event), error.EventFailed);
         return ms * 1000;
     }
     pub fn deinit(self: *Event) void {
         if (!loaded or self.event == null) return;
-        ensureCurrent();
+        use(self.ordinal);
         if (g.hipEventDestroy) |destroy| _ = destroy(self.event);
         self.* = .{};
     }

@@ -29,6 +29,12 @@ const CU_DEVICE_ATTRIBUTE_SINGLE_TO_DOUBLE_PRECISION_PERF_RATIO: c_int = 87;
 const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR: c_int = 75;
 const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR: c_int = 76;
 const CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT: c_int = 16;
+const CU_DEVICE_ATTRIBUTE_CLOCK_RATE: c_int = 13;
+const CU_DEVICE_ATTRIBUTE_PCI_BUS_ID: c_int = 33;
+const CU_DEVICE_ATTRIBUTE_PCI_DEVICE_ID: c_int = 34;
+const CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE: c_int = 36;
+const CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH: c_int = 37;
+const CU_DEVICE_ATTRIBUTE_PCI_DOMAIN_ID: c_int = 50;
 
 const Api = struct {
     lib: DynLib,
@@ -36,6 +42,15 @@ const Api = struct {
     cuInit: *const fn (c_uint) callconv(.c) CUresult,
     cuDeviceGet: *const fn (*CUdevice, c_int) callconv(.c) CUresult,
     cuDeviceGetAttribute: *const fn (*c_int, c_int, CUdevice) callconv(.c) CUresult,
+    cuDeviceGetCount: *const fn (*c_int) callconv(.c) CUresult,
+    cuDeviceGetName: *const fn ([*]u8, c_int, CUdevice) callconv(.c) CUresult,
+    cuDeviceTotalMem_v2: *const fn (*usize, CUdevice) callconv(.c) CUresult,
+    cuMemGetInfo_v2: *const fn (*usize, *usize) callconv(.c) CUresult,
+    // Optional: `Context.info` leaves the uuid zero without it, and only the
+    // `GOMPUTE_FAKE_DEVICES` test contexts need the other two.
+    cuDeviceGetUuid_v2: ?*const fn (*[16]u8, CUdevice) callconv(.c) CUresult,
+    cuCtxCreate_v2: ?*const fn (*CUcontext, c_uint, CUdevice) callconv(.c) CUresult,
+    cuCtxDestroy_v2: ?*const fn (CUcontext) callconv(.c) CUresult,
     cuDevicePrimaryCtxRetain: *const fn (*CUcontext, CUdevice) callconv(.c) CUresult,
     cuDevicePrimaryCtxRelease_v2: *const fn (CUdevice) callconv(.c) CUresult,
     cuCtxSetCurrent: *const fn (CUcontext) callconv(.c) CUresult,
@@ -185,17 +200,19 @@ fn loadApiLocked() Error!void {
 // the device's *primary* context: refcounted by the driver, and the same one
 // the CUDA runtime API and libraries like cuBLAS use, so we interoperate.
 //
-// ponytail: fixed tables sized for one node -- 16 devices, 64 distinct module
-// images. Overflow degrades to uncached, not to wrong. Swap in a hash map only
-// if someone ships a box past that ceiling.
-//
-// 64 rather than 16 because one artifact per kernel root means the image count
-// is now the root count times the devices in use, not 1: a 37-model consumer on
-// one GPU used to blow a 16-slot table and re-JIT on every handle.
+// ponytail: a fixed table of 16 devices, and a module list that grows: one
+// artifact per kernel root makes the image count the root count times the
+// devices in use (a 37-model consumer on 8 GPUs is ~300). A failed growth
+// degrades to uncached, not to wrong. Linear search: swap in a hash map only
+// if someone profiles module loads past a few hundred.
 const max_devices = 16;
-const max_modules = 64;
 
-const CtxSlot = struct { device: CUdevice = 0, ctx: CUcontext = null };
+const CtxSlot = struct {
+    device: CUdevice = 0,
+    ctx: CUcontext = null,
+    /// False for a `GOMPUTE_FAKE_DEVICES` context, which teardown destroys.
+    primary: bool = true,
+};
 var ctx_slots: [max_devices]CtxSlot = @splat(.{});
 
 /// First ordinal anyone retained, for handles that carry no ordinal of their own.
@@ -216,11 +233,70 @@ fn retainPrimary(ordinal: c_int) Error!CtxSlot {
     try loadApiLocked();
     try check(g.cuInit(0), error.InitFailed);
     var found: CtxSlot = .{};
-    try check(g.cuDeviceGet(&found.device, ordinal), error.NoDevice);
-    try check(g.cuDevicePrimaryCtxRetain(&found.ctx, found.device), error.ContextFailed);
+    if (ordinal >= try realCountLocked()) {
+        if (ordinal >= fakeCount()) return error.NoDevice;
+        // A fake device: a private context on device 0. cuCtxCreate makes it
+        // current on this thread, behind `current_ordinal`'s back.
+        const create = g.cuCtxCreate_v2 orelse return error.Unsupported;
+        try check(g.cuDeviceGet(&found.device, 0), error.NoDevice);
+        try check(create(&found.ctx, 0, found.device), error.ContextFailed);
+        found.primary = false;
+        current_ordinal = null;
+    } else {
+        try check(g.cuDeviceGet(&found.device, ordinal), error.NoDevice);
+        try check(g.cuDevicePrimaryCtxRetain(&found.ctx, found.device), error.ContextFailed);
+    }
     slot.* = found;
     _ = default_ordinal.cmpxchgStrong(-1, ordinal, .monotonic, .monotonic);
     return found;
+}
+
+/// Devices the driver enumerates; -1 until asked. Caller holds `lock` and has
+/// loaded the API.
+var real_count: c_int = -1;
+
+fn realCountLocked() Error!c_int {
+    if (real_count < 0) {
+        var n: c_int = 0;
+        try check(g.cuDeviceGetCount(&n), error.NoDevice);
+        real_count = n;
+    }
+    return real_count;
+}
+
+/// `GOMPUTE_FAKE_DEVICES=k`, a test knob: on a machine with fewer than k
+/// devices, ordinals up to k-1 are extra private contexts on device 0, so
+/// buffers, modules, streams and graphs really live in different contexts
+/// (a handle used in the wrong one fails as on a second card) while copies
+/// work across them as across cards. 0 when unset or unparsable. Read once.
+var fake_devices: ?c_int = null;
+
+fn fakeCount() c_int {
+    if (fake_devices) |k| return k;
+    const v = std.c.getenv("GOMPUTE_FAKE_DEVICES") orelse "";
+    const k = std.fmt.parseInt(c_int, std.mem.sliceTo(v, 0), 10) catch 0;
+    fake_devices = std.math.clamp(k, 0, max_devices);
+    return fake_devices.?;
+}
+
+/// How many devices `Context.init` takes: the driver's count, or
+/// `GOMPUTE_FAKE_DEVICES` when that is larger and a real device exists.
+/// `error.InitFailed` without a CUDA driver.
+pub fn deviceCount() Error!u32 {
+    acquire();
+    defer lock.unlock();
+    try loadApiLocked();
+    try check(g.cuInit(0), error.InitFailed);
+    const real = try realCountLocked();
+    if (real == 0) return 0;
+    return @intCast(@max(real, fakeCount()));
+}
+
+/// Makes the context of the device a handle was made on current; a handle
+/// with no ordinal (hand-built) adopts the first device retained.
+inline fn use(ordinal: c_int) void {
+    if (ordinal < 0) return ensureCurrent();
+    setCurrent(ordinal) catch {};
 }
 
 fn setCurrent(ordinal: c_int) Error!void {
@@ -243,7 +319,7 @@ const ModuleSlot = struct {
     image: []const u8 = &.{},
     module: CUmodule = null,
 };
-var module_slots: [max_modules]ModuleSlot = @splat(.{});
+var module_list: std.ArrayList(ModuleSlot) = .empty;
 
 /// JIT the image once per (device, image) instead of once per kernel handle --
 /// the artifact is one blob holding every kernel, so N handles used to mean N
@@ -255,12 +331,9 @@ var module_slots: [max_modules]ModuleSlot = @splat(.{});
 fn loadModuleCached(ordinal: c_int, image: [:0]const u8) Error!Module {
     acquire();
     defer lock.unlock();
-    var free_slot: ?*ModuleSlot = null;
-    for (&module_slots) |*s| {
-        if (s.module == null) {
-            if (free_slot == null) free_slot = s;
-        } else if (s.ordinal == ordinal and s.image.ptr == image.ptr and s.image.len == image.len) {
-            return .{ .module = s.module, .cached = true };
+    for (module_list.items) |*s| {
+        if (s.ordinal == ordinal and s.image.ptr == image.ptr and s.image.len == image.len) {
+            return .{ .module = s.module, .cached = true, .ordinal = ordinal };
         }
     }
 
@@ -271,9 +344,8 @@ fn loadModuleCached(ordinal: c_int, image: [:0]const u8) Error!Module {
     var m: CUmodule = null;
     try check(g.cuModuleLoadData(&m, image.ptr), error.ModuleLoadFailed);
 
-    const slot = free_slot orelse return .{ .module = m, .cached = false };
-    slot.* = .{ .ordinal = ordinal, .image = image, .module = m };
-    return .{ .module = m, .cached = true };
+    module_list.append(std.heap.page_allocator, .{ .ordinal = ordinal, .image = image, .module = m }) catch return .{ .module = m, .cached = false, .ordinal = ordinal };
+    return .{ .module = m, .cached = true, .ordinal = ordinal };
 }
 
 /// How many distinct (device, image) modules are currently JIT'd.
@@ -285,11 +357,7 @@ fn loadModuleCached(ordinal: c_int, image: [:0]const u8) Error!Module {
 pub fn loadedModuleCount() usize {
     acquire();
     defer lock.unlock();
-    var n: usize = 0;
-    for (&module_slots) |*s| {
-        if (s.module != null) n += 1;
-    }
-    return n;
+    return module_list.items.len;
 }
 
 /// Unload every cached module and release every retained primary context.
@@ -300,14 +368,17 @@ pub fn shutdown() void {
     acquire();
     defer lock.unlock();
     if (!loaded) return;
-    for (&module_slots) |*s| {
-        if (s.module != null) _ = g.cuModuleUnload(s.module);
-        s.* = .{};
-    }
+    for (module_list.items) |*s| _ = g.cuModuleUnload(s.module);
+    module_list.clearAndFree(std.heap.page_allocator);
     for (&ctx_slots) |*s| {
-        if (s.ctx != null) _ = g.cuDevicePrimaryCtxRelease_v2(s.device);
+        if (s.ctx != null) {
+            if (s.primary) {
+                _ = g.cuDevicePrimaryCtxRelease_v2(s.device);
+            } else if (g.cuCtxDestroy_v2) |destroy| _ = destroy(s.ctx);
+        }
         s.* = .{};
     }
+    real_count = -1;
     current_ordinal = null;
     default_ordinal.store(-1, .monotonic);
 }
@@ -415,10 +486,46 @@ pub const Context = struct {
         try check(g.cuDeviceGetAttribute(&v, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, self.device), error.InvalidArgument);
         return @intCast(v);
     }
+    /// This device's identity, size and clocks (`iface.DeviceInfo`).
+    pub fn info(self: *Context) Error!iface.DeviceInfo {
+        try self.makeCurrent();
+        var d: iface.DeviceInfo = .{ .ordinal = self.ordinal };
+        try check(g.cuDeviceGetName(&d.name_buf, d.name_buf.len, self.device), error.InvalidArgument);
+        d.name_len = std.mem.indexOfScalar(u8, &d.name_buf, 0) orelse d.name_buf.len;
+        if (g.cuDeviceGetUuid_v2) |get| try check(get(&d.uuid, self.device), error.InvalidArgument);
+        const attrs = [_]struct { c_int, *u32 }{
+            .{ CU_DEVICE_ATTRIBUTE_PCI_DOMAIN_ID, &d.pci_domain },
+            .{ CU_DEVICE_ATTRIBUTE_PCI_BUS_ID, &d.pci_bus },
+            .{ CU_DEVICE_ATTRIBUTE_PCI_DEVICE_ID, &d.pci_device },
+            .{ CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, &d.sms },
+            .{ CU_DEVICE_ATTRIBUTE_SINGLE_TO_DOUBLE_PRECISION_PERF_RATIO, &d.fp64_ratio },
+            .{ CU_DEVICE_ATTRIBUTE_CLOCK_RATE, &d.clock_khz },
+            .{ CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE, &d.mem_clock_khz },
+            .{ CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH, &d.bus_width_bits },
+        };
+        for (attrs) |a| {
+            var v: c_int = 0;
+            try check(g.cuDeviceGetAttribute(&v, a[0], self.device), error.InvalidArgument);
+            a[1].* = @intCast(@max(v, 0));
+        }
+        d.compute_capability = try self.computeCapability();
+        var total: usize = 0;
+        try check(g.cuDeviceTotalMem_v2(&total, self.device), error.InvalidArgument);
+        var free: usize = 0;
+        var ctx_total: usize = 0;
+        try check(g.cuMemGetInfo_v2(&free, &ctx_total), error.InvalidArgument);
+        d.mem_total = total;
+        d.mem_free = free;
+        acquire();
+        defer lock.unlock();
+        d.fake = !ctx_slots[@intCast(self.ordinal)].primary;
+        return d;
+    }
+
     /// Caller owns the returned Stream and must `deinit` it.
     pub fn createStream(self: *Context) Error!Stream {
         try self.makeCurrent();
-        var s: Stream = .{};
+        var s: Stream = .{ .ordinal = self.ordinal };
         try check(g.cuStreamCreate(&s.stream, 0), error.SyncFailed);
         return s;
     }
@@ -427,7 +534,7 @@ pub const Context = struct {
     /// against it invalidates the capture. Caller owns it and must `deinit` it.
     pub fn createStreamNonBlocking(self: *Context) Error!Stream {
         try self.makeCurrent();
-        var s: Stream = .{};
+        var s: Stream = .{ .ordinal = self.ordinal };
         try check(g.cuStreamCreate(&s.stream, CU_STREAM_NON_BLOCKING), error.SyncFailed);
         return s;
     }
@@ -435,7 +542,7 @@ pub const Context = struct {
     /// `elapsedUs` rejects it. Caller owns it and must `deinit` it.
     pub fn createEvent(self: *Context, timing: bool) Error!Event {
         try self.makeCurrent();
-        var e: Event = .{};
+        var e: Event = .{ .ordinal = self.ordinal };
         try check((g.cuEventCreate orelse return error.Unsupported)(&e.event, if (timing) 0 else CU_EVENT_DISABLE_TIMING), error.EventFailed);
         return e;
     }
@@ -443,7 +550,7 @@ pub const Context = struct {
     /// it; nothing here tracks it.
     pub fn alloc(self: *Context, bytes: usize) Error!Buffer {
         try self.makeCurrent();
-        var b: Buffer = .{ .bytes = bytes };
+        var b: Buffer = .{ .bytes = bytes, .ordinal = self.ordinal };
         try check(g.cuMemAlloc_v2(&b.handle, bytes), error.AllocFailed);
         return b;
     }
@@ -490,6 +597,9 @@ pub const Context = struct {
 pub const Buffer = struct {
     handle: CUdeviceptr = 0,
     bytes: usize = 0,
+    /// The device it was made on; -1 (hand-built) adopts the first one
+    /// retained (`use`).
+    ordinal: c_int = -1,
 
     /// `free` zeroes the handle and a default-constructed Buffer never had one.
     /// 0 is never a valid CUdeviceptr, so this is a caller mistake, not a copy
@@ -506,19 +616,19 @@ pub const Buffer = struct {
     }
 
     pub fn upload(self: *Buffer, host: *const anyopaque, n: usize) Error!void {
-        ensureCurrent();
+        use(self.ordinal);
         try check(g.cuMemcpyHtoD_v2(try self.devicePtr(), host, n), error.CopyFailed);
     }
     pub fn download(self: *Buffer, host: *anyopaque, n: usize) Error!void {
-        ensureCurrent();
+        use(self.ordinal);
         try check(g.cuMemcpyDtoH_v2(host, try self.devicePtr(), n), error.CopyFailed);
     }
     pub fn downloadAt(self: *Buffer, host: *anyopaque, offset: usize, n: usize) Error!void {
-        ensureCurrent();
+        use(self.ordinal);
         try check(g.cuMemcpyDtoH_v2(host, try self.offsetPtr(offset), n), error.CopyFailed);
     }
     pub fn uploadAt(self: *Buffer, host: *const anyopaque, offset: usize, n: usize) Error!void {
-        ensureCurrent();
+        use(self.ordinal);
         try check(g.cuMemcpyHtoD_v2(try self.offsetPtr(offset), host, n), error.CopyFailed);
     }
     /// Release the device memory. Idempotent.
@@ -527,7 +637,7 @@ pub const Buffer = struct {
         // pub with all-default fields -- so a hand-constructed `Buffer{}` freed
         // on a machine with no driver would call through garbage.
         if (!loaded or self.handle == 0) return;
-        ensureCurrent();
+        use(self.ordinal);
         _ = g.cuMemFree_v2(self.handle);
         self.* = .{};
     }
@@ -537,29 +647,29 @@ pub const Buffer = struct {
         return @ptrCast(&self.handle);
     }
     pub fn copyFrom(self: *Buffer, src: *const Buffer, src_offset: usize, dst_offset: usize, n: usize) Error!void {
-        ensureCurrent();
+        use(self.ordinal);
         try check(g.cuMemcpyDtoD_v2(try self.offsetPtr(dst_offset), try src.offsetPtr(src_offset), n), error.CopyFailed);
     }
     /// `copyFrom`, enqueued on `stream` and not waited on. Legal under capture.
     pub fn copyFromAsync(self: *Buffer, src: *const Buffer, src_offset: usize, dst_offset: usize, n: usize, stream: *Stream) Error!void {
-        ensureCurrent();
+        use(self.ordinal);
         try check(g.cuMemcpyDtoDAsync_v2(try self.offsetPtr(dst_offset), try src.offsetPtr(src_offset), n, stream.stream), error.CopyFailed);
     }
     /// Enqueued on `stream` and not waited on; `host` must be `allocPinned`
     /// memory and must stay put until `stream.synchronize()` returns.
     pub fn downloadAtAsync(self: *Buffer, host: *anyopaque, offset: usize, n: usize, stream: *Stream) Error!void {
-        ensureCurrent();
+        use(self.ordinal);
         try check(g.cuMemcpyDtoHAsync_v2(host, try self.offsetPtr(offset), n, stream.stream), error.CopyFailed);
     }
     pub fn uploadAtAsync(self: *Buffer, host: *const anyopaque, offset: usize, n: usize, stream: *Stream) Error!void {
-        ensureCurrent();
+        use(self.ordinal);
         try check(g.cuMemcpyHtoDAsync_v2(try self.offsetPtr(offset), host, n, stream.stream), error.CopyFailed);
     }
     /// Set the first `n` bytes to `value`, on the device and on `stream`. The
     /// memory controller does it in place: zeroing this way costs no bus
     /// traffic, where copying a resident block of zeros over it does.
     pub fn fillAsync(self: *Buffer, value: u8, n: usize, stream: *Stream) Error!void {
-        ensureCurrent();
+        use(self.ordinal);
         try check(g.cuMemsetD8Async(try self.devicePtr(), value, n, stream.stream), error.CopyFailed);
     }
 
@@ -575,10 +685,13 @@ pub const Module = struct {
     module: CUmodule = null,
     /// Owned by the process-wide cache; `deinit` must leave it alone.
     cached: bool = false,
+    /// The device it was made on; -1 (hand-built) adopts the first one
+    /// retained (`use`).
+    ordinal: c_int = -1,
 
     pub fn getKernel(self: *Module, name: [*:0]const u8) Error!Kernel {
-        ensureCurrent();
-        var k: Kernel = .{};
+        use(self.ordinal);
+        var k: Kernel = .{ .ordinal = self.ordinal };
         try check(g.cuModuleGetFunction(&k.func, self.module, name), error.KernelNotFound);
         return k;
     }
@@ -586,7 +699,7 @@ pub const Module = struct {
     /// on the device and stays loaded for the process; `shutdown()` unloads it.
     pub fn deinit(self: *Module) void {
         if (!self.cached and self.module != null) {
-            ensureCurrent();
+            use(self.ordinal);
             _ = g.cuModuleUnload(self.module);
         }
         self.* = .{};
@@ -596,13 +709,16 @@ pub const Module = struct {
 /// An entry point in a loaded module.
 pub const Kernel = struct {
     func: CUfunction = null,
+    /// The device it was made on; -1 (hand-built) adopts the first one
+    /// retained (`use`).
+    ordinal: c_int = -1,
     pub fn launch(self: Kernel, grid: Dim3, block: Dim3, shared_bytes: u32, args: []const iface.Arg) Error!void {
         try self.launchOnStream(grid, block, shared_bytes, args, null);
     }
     /// Launch on `stream` and return without waiting. `args` must stay put
     /// until the launch has actually run -- `stream.synchronize()`.
     pub fn launchOnStream(self: Kernel, grid: Dim3, block: Dim3, shared_bytes: u32, args: []const iface.Arg, stream: CUstream) Error!void {
-        ensureCurrent();
+        use(self.ordinal);
         try check(g.cuLaunchKernel(self.func, grid.x, grid.y, grid.z, block.x, block.y, block.z, shared_bytes, stream, @constCast(args.ptr), null), error.LaunchFailed);
     }
 };
@@ -610,18 +726,21 @@ pub const Kernel = struct {
 /// A queue of ordered asynchronous work. `null` is the default stream.
 pub const Stream = struct {
     stream: CUstream = null,
+    /// The device it was made on; -1 (hand-built) adopts the first one
+    /// retained (`use`).
+    ordinal: c_int = -1,
     pub fn synchronize(self: *Stream) Error!void {
-        ensureCurrent();
+        use(self.ordinal);
         try check(g.cuStreamSynchronize(self.stream), error.SyncFailed);
     }
     /// True once everything queued on this stream has finished. Never blocks.
     pub fn query(self: *Stream) Error!bool {
-        ensureCurrent();
+        use(self.ordinal);
         return ready(g.cuStreamQuery(self.stream), error.SyncFailed);
     }
     /// Later work on this stream waits for `event`; the host does not.
     pub fn waitEvent(self: *Stream, event: *const Event) Error!void {
-        ensureCurrent();
+        use(self.ordinal);
         try check((g.cuStreamWaitEvent orelse return error.Unsupported)(self.stream, event.event, 0), error.EventFailed);
     }
     /// Start recording instead of running: work enqueued on this stream until
@@ -629,29 +748,29 @@ pub const Stream = struct {
     /// stream, and nothing that waits on the host in between -- a
     /// `synchronize`, or a blocking copy, invalidates the capture.
     pub fn beginCapture(self: *Stream, mode: CaptureMode) Error!void {
-        ensureCurrent();
+        use(self.ordinal);
         try check((g.cuStreamBeginCapture_v2 orelse return error.Unsupported)(self.stream, mode), error.CaptureFailed);
     }
     /// Ends the capture begun on this stream and returns the recorded graph.
     /// Caller owns it and must `deinit` it. `error.CaptureFailed` if the capture
     /// was invalidated along the way.
     pub fn endCapture(self: *Stream) Error!Graph {
-        ensureCurrent();
-        var graph: Graph = .{};
+        use(self.ordinal);
+        var graph: Graph = .{ .ordinal = self.ordinal };
         try check((g.cuStreamEndCapture orelse return error.Unsupported)(self.stream, &graph.graph), error.CaptureFailed);
         return graph;
     }
     /// True between `beginCapture` and `endCapture`, including after the
     /// capture has been invalidated (it still needs its `endCapture`).
     pub fn isCapturing(self: *Stream) Error!bool {
-        ensureCurrent();
+        use(self.ordinal);
         var status: c_int = 0;
         try check((g.cuStreamIsCapturing orelse return error.Unsupported)(self.stream, &status), error.CaptureFailed);
         return status != 0;
     }
     pub fn deinit(self: *Stream) void {
         if (!loaded) return;
-        ensureCurrent();
+        use(self.ordinal);
         _ = g.cuStreamDestroy_v2(self.stream);
         self.* = .{};
     }
@@ -661,18 +780,21 @@ pub const Stream = struct {
 /// reads new node parameters from.
 pub const Graph = struct {
     graph: CUgraph = null,
+    /// The device it was made on; -1 (hand-built) adopts the first one
+    /// retained (`use`).
+    ordinal: c_int = -1,
 
     /// Caller owns the returned exec and must `deinit` it. The graph can be
     /// freed right after: the exec does not borrow it.
     pub fn instantiate(self: *const Graph) Error!GraphExec {
-        ensureCurrent();
-        var exec: GraphExec = .{};
+        use(self.ordinal);
+        var exec: GraphExec = .{ .ordinal = self.ordinal };
         try check((g.cuGraphInstantiateWithFlags orelse return error.Unsupported)(&exec.exec, self.graph, 0), error.GraphFailed);
         return exec;
     }
     pub fn deinit(self: *Graph) void {
         if (!loaded or self.graph == null) return;
-        ensureCurrent();
+        use(self.ordinal);
         if (g.cuGraphDestroy) |destroy| _ = destroy(self.graph);
         self.* = .{};
     }
@@ -681,12 +803,15 @@ pub const Graph = struct {
 /// An instantiated graph, ready to replay.
 pub const GraphExec = struct {
     exec: CUgraphExec = null,
+    /// The device it was made on; -1 (hand-built) adopts the first one
+    /// retained (`use`).
+    ordinal: c_int = -1,
 
     /// Enqueues one replay on `stream` and returns without waiting. A copy node
     /// reads and writes its pinned host memory when the replay runs, not when
     /// it was captured.
     pub fn launch(self: *GraphExec, stream: *Stream) Error!void {
-        ensureCurrent();
+        use(self.ordinal);
         try check((g.cuGraphLaunch orelse return error.Unsupported)(self.exec, stream.stream), error.GraphFailed);
     }
     /// Takes `graph`'s node parameters -- kernel arguments, copy addresses --
@@ -694,7 +819,7 @@ pub const GraphExec = struct {
     /// the driver rejects the update (a topology change, among others); the
     /// caller then instantiates `graph` instead.
     pub fn update(self: *GraphExec, graph: *const Graph) Error!bool {
-        ensureCurrent();
+        use(self.ordinal);
         var node: CUgraphNode = null;
         var result: c_int = 0;
         const rc = (g.cuGraphExecUpdate orelse return error.Unsupported)(self.exec, graph.graph, &node, &result);
@@ -707,7 +832,7 @@ pub const GraphExec = struct {
     }
     pub fn deinit(self: *GraphExec) void {
         if (!loaded or self.exec == null) return;
-        ensureCurrent();
+        use(self.ordinal);
         if (g.cuGraphExecDestroy) |destroy| _ = destroy(self.exec);
         self.* = .{};
     }
@@ -717,31 +842,34 @@ pub const GraphExec = struct {
 /// another stream, or time the gap between two of them.
 pub const Event = struct {
     event: CUevent = null,
+    /// The device it was made on; -1 (hand-built) adopts the first one
+    /// retained (`use`).
+    ordinal: c_int = -1,
 
     pub fn record(self: *Event, stream: *Stream) Error!void {
-        ensureCurrent();
+        use(self.ordinal);
         try check((g.cuEventRecord orelse return error.Unsupported)(self.event, stream.stream), error.EventFailed);
     }
     pub fn synchronize(self: *Event) Error!void {
-        ensureCurrent();
+        use(self.ordinal);
         try check((g.cuEventSynchronize orelse return error.Unsupported)(self.event), error.EventFailed);
     }
     /// True once the work before the last `record` has finished. Never blocks.
     pub fn query(self: *Event) Error!bool {
-        ensureCurrent();
+        use(self.ordinal);
         return ready((g.cuEventQuery orelse return error.Unsupported)(self.event), error.EventFailed);
     }
     /// Microseconds from `start` to `end`. Both need `timing` true and both must
     /// have completed.
     pub fn elapsedUs(start: *const Event, end: *const Event) Error!f32 {
-        ensureCurrent();
+        use(start.ordinal);
         var ms: f32 = 0;
         try check((g.cuEventElapsedTime orelse return error.Unsupported)(&ms, start.event, end.event), error.EventFailed);
         return ms * 1000;
     }
     pub fn deinit(self: *Event) void {
         if (!loaded or self.event == null) return;
-        ensureCurrent();
+        use(self.ordinal);
         if (g.cuEventDestroy_v2) |destroy| _ = destroy(self.event);
         self.* = .{};
     }
@@ -983,4 +1111,67 @@ test "multiprocessorCount reports at least one SM" {
     var ctx = Context.init(0) catch return error.SkipZigTest;
     defer ctx.deinit();
     try std.testing.expect(try ctx.multiprocessorCount() >= 1);
+}
+
+test "deviceCount and info describe the card" {
+    var ctx = Context.init(0) catch return error.SkipZigTest;
+    defer ctx.deinit();
+    try std.testing.expect(try deviceCount() >= 1);
+    const d = try ctx.info();
+    try std.testing.expect(d.name().len > 0);
+    try std.testing.expect(!std.mem.allEqual(u8, &d.uuid, 0));
+    try std.testing.expect(d.sms >= 1 and d.compute_capability >= 50);
+    try std.testing.expect(d.fp64_ratio >= 2 and d.fp64_ratio <= 64);
+    try std.testing.expect(d.mem_total > 0 and d.mem_free <= d.mem_total);
+    try std.testing.expect(d.clock_khz > 0 and d.bandwidth() > 0);
+    try std.testing.expect(!d.fake);
+}
+
+test "a fake second device is its own context on device 0" {
+    var ctx0 = Context.init(0) catch return error.SkipZigTest;
+    defer ctx0.deinit();
+    {
+        acquire();
+        defer lock.unlock();
+        if (try realCountLocked() > 1) return error.SkipZigTest; // a real second card owns ordinal 1
+        fake_devices = 2;
+    }
+    try std.testing.expectEqual(@as(u32, 2), try deviceCount());
+    var ctx1 = try Context.init(1);
+    defer ctx1.deinit();
+    try std.testing.expect(ctx1.ctx != ctx0.ctx);
+    const d1 = try ctx1.info();
+    try std.testing.expect(d1.fake and d1.ordinal == 1);
+    try std.testing.expectEqualSlices(u8, &(try ctx0.info()).uuid, &d1.uuid);
+
+    // One JIT per (device, image): the same image is two modules.
+    const before = loadedModuleCount();
+    var m0 = try ctx0.loadModuleFromMemory(add_one_ptx);
+    defer m0.deinit();
+    var m1 = try ctx1.loadModuleFromMemory(add_one_ptx);
+    defer m1.deinit();
+    try std.testing.expect(loadedModuleCount() >= before + 1);
+    const k0 = try m0.getKernel("add_one");
+    const k1 = try m1.getKernel("add_one");
+    try std.testing.expect(k0.ordinal == 0 and k1.ordinal == 1);
+
+    const n: u32 = 256;
+    var b1 = try ctx1.alloc(n * 4);
+    defer b1.free();
+    var b0 = try ctx0.alloc(n * 4);
+    defer b0.free();
+    var s1 = try ctx1.createStreamNonBlocking();
+    defer s1.deinit();
+    try std.testing.expect(s1.ordinal == 1 and b1.ordinal == 1);
+    try b1.fillAsync(0, n * 4, &s1);
+    var len = n;
+    try k1.launchOnStream(.{ .x = 1 }, .{ .x = n }, 0, &.{ b1.argPtr(), iface.arg(&len) }, s1.stream);
+    // A kernel of context 0 on a stream of context 1 fails, as across cards.
+    try std.testing.expectError(error.LaunchFailed, k0.launchOnStream(.{ .x = 1 }, .{ .x = n }, 0, &.{ b1.argPtr(), iface.arg(&len) }, s1.stream));
+    try s1.synchronize();
+    // Copies cross contexts (unified addressing), as across cards.
+    try b0.copyFrom(&b1, 0, 0, n * 4);
+    var host: [256]u32 = undefined;
+    try b0.download(&host, n * 4);
+    for (host) |v| try std.testing.expectEqual(@as(u32, 1), v);
 }

@@ -56,6 +56,44 @@ pub const Error = error{
     Unsupported,
 };
 
+/// What `Context.info` reports about one device: enough to tell cards apart
+/// (`uuid`, the PCI address), order them reproducibly, and price work on them.
+/// A field the backend cannot ask is 0 (HIP: `compute_capability`, the clocks
+/// and `fp64_ratio`; see hip.zig).
+pub const DeviceInfo = struct {
+    ordinal: c_int = 0,
+    name_buf: [256]u8 = @splat(0),
+    name_len: usize = 0,
+    uuid: [16]u8 = @splat(0),
+    pci_domain: u32 = 0,
+    pci_bus: u32 = 0,
+    pci_device: u32 = 0,
+    /// `major * 10 + minor`, as `Context.computeCapability`.
+    compute_capability: u32 = 0,
+    /// Streaming multiprocessors (CUDA) or compute units (HIP).
+    sms: u32 = 0,
+    /// FP32:FP64 throughput, as `Context.fp64Ratio`.
+    fp64_ratio: u32 = 0,
+    clock_khz: u32 = 0,
+    mem_clock_khz: u32 = 0,
+    bus_width_bits: u32 = 0,
+    mem_total: u64 = 0,
+    /// At the call: other processes and this one's own buffers move it.
+    mem_free: u64 = 0,
+    /// A `GOMPUTE_FAKE_DEVICES` stand-in: another context on device 0.
+    fake: bool = false,
+
+    pub fn name(self: *const DeviceInfo) []const u8 {
+        return self.name_buf[0..self.name_len];
+    }
+
+    /// Peak device-memory bandwidth from the memory clock and bus width
+    /// (double data rate), in bytes per second; 0 when either is unknown.
+    pub fn bandwidth(self: *const DeviceInfo) u64 {
+        return 2 * @as(u64, self.mem_clock_khz) * 1000 * (self.bus_width_bits / 8);
+    }
+};
+
 /// Which host threads a stream capture constrains. The tags are in the order
 /// both drivers number them (`CU_STREAM_CAPTURE_MODE_*`,
 /// `hipStreamCaptureMode*`), so `@intFromEnum` is the driver value.

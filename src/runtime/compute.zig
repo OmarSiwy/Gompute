@@ -17,6 +17,19 @@ pub const Arg = iface.Arg;
 /// The error set every call in this file returns; see `core/interface.zig`.
 pub const Error = iface.Error;
 
+/// What `Compute.info` reports; see `core/interface.zig`.
+pub const DeviceInfo = iface.DeviceInfo;
+
+/// Devices `initDevice` takes on `backend` (ordinals 0 to the count - 1);
+/// 0 on `.cpu`. `error.InitFailed` when the backend's driver is missing.
+pub fn deviceCount(backend: Backend) Error!u32 {
+    return switch (backend) {
+        .cuda => cuda.deviceCount(),
+        .hip => hip.deviceCount(),
+        .cpu => 0,
+    };
+}
+
 /// A device handle over whichever backend `init` found. Holds a context for
 /// both GPU backends and uses the one `backend` names.
 pub const Compute = struct {
@@ -100,6 +113,16 @@ pub const Compute = struct {
         return switch (self.backend) {
             .cuda => self.cuda_ctx.multiprocessorCount(),
             .hip => self.hip_ctx.multiprocessorCount(),
+            .cpu => error.Unsupported,
+        };
+    }
+
+    /// This device's identity, size and clocks; see `DeviceInfo`.
+    /// `error.Unsupported` on `.cpu`.
+    pub fn info(self: *Compute) Error!DeviceInfo {
+        return switch (self.backend) {
+            .cuda => self.cuda_ctx.info(),
+            .hip => self.hip_ctx.info(),
             .cpu => error.Unsupported,
         };
     }
