@@ -77,7 +77,7 @@ pub const Compute = struct {
         };
     }
 
-    /// (#3) Drops this handle only; the device's primary context is shared with
+    /// Drops this handle only; the device's primary context is shared with
     /// every other handle in the process and stays retained. Use `shutdown()`
     /// for real teardown.
     pub fn deinit(self: *Compute) void {
@@ -97,8 +97,11 @@ pub const Compute = struct {
         }
     }
 
-    /// How many times faster the device runs FP32 than FP64, e.g. 64 on an RTX
-    /// 4060. `error.Unsupported` on HIP (see `hip.Context.fp64Ratio`) and `.cpu`.
+    /// How many times faster the device runs FP32 than FP64: 64 on an RTX
+    /// 4060, 16 on an RX 7900 XTX, 2 on an MI300X. On HIP it is the vendor's
+    /// figure for the gfx family, not a measurement (`hip.Context.fp64Ratio`).
+    /// `error.Unsupported` on `.cpu`, and on HIP before ROCm 6.0 or for a gfx
+    /// family hip.zig's table does not know.
     pub fn fp64Ratio(self: *Compute) Error!u32 {
         return switch (self.backend) {
             .cuda => self.cuda_ctx.fp64Ratio(),
@@ -107,8 +110,8 @@ pub const Compute = struct {
         };
     }
 
-    /// Streaming multiprocessors (CUDA) or compute units (HIP 6.0+): 24 on an
-    /// RTX 4060 Laptop. `error.Unsupported` on `.cpu` and older HIP.
+    /// Streaming multiprocessors (CUDA) or compute units (HIP, ROCm 6.0+): 24
+    /// on an RTX 4060 Laptop. `error.Unsupported` on `.cpu` and older ROCm.
     pub fn multiprocessorCount(self: *Compute) Error!u32 {
         return switch (self.backend) {
             .cuda => self.cuda_ctx.multiprocessorCount(),
@@ -127,12 +130,45 @@ pub const Compute = struct {
         };
     }
 
-    /// The CUDA compute capability as `major * 10 + minor` (89 on sm_89).
-    /// `error.Unsupported` on HIP and `.cpu`.
+    /// The compute capability as `major * 10 + minor`: the CUDA one on CUDA
+    /// (89 on sm_89), the gfx major and minor on HIP (110 on gfx1100, 94 on
+    /// gfx942). The two scales do not compare. `error.Unsupported` on `.cpu`
+    /// and on a ROCm with neither `hipDeviceComputeCapability` nor the 6.0
+    /// properties call.
     pub fn computeCapability(self: *Compute) Error!u32 {
         return switch (self.backend) {
             .cuda => self.cuda_ctx.computeCapability(),
-            .hip, .cpu => error.Unsupported,
+            .hip => self.hip_ctx.computeCapability(),
+            .cpu => error.Unsupported,
+        };
+    }
+
+    /// Whether this device can read and write `peer`'s memory over a direct
+    /// link (NVLink, Infinity Fabric or PCIe P2P). False for the same device
+    /// and on `.cpu`; `error.InvalidArgument` when the two handles are not on
+    /// the same backend.
+    pub fn canAccessPeer(self: *Compute, peer: *const Compute) Error!bool {
+        if (self.backend != peer.backend) return error.InvalidArgument;
+        return switch (self.backend) {
+            .cuda => self.cuda_ctx.canAccessPeer(&peer.cuda_ctx),
+            .hip => self.hip_ctx.canAccessPeer(&peer.hip_ctx),
+            .cpu => false,
+        };
+    }
+
+    /// Let kernels on this device dereference `peer`'s buffers, and route a
+    /// `Buffer.copyFrom` between the two over the direct link instead of
+    /// through host memory. One direction; call it both ways for both.
+    /// Idempotent. `error.Unsupported` on `.cpu` and when `canAccessPeer` is
+    /// false (cross-device copies still work, staged by the driver);
+    /// `error.InvalidArgument` when the two handles are not on the same
+    /// backend.
+    pub fn enablePeerAccess(self: *Compute, peer: *const Compute) Error!void {
+        if (self.backend != peer.backend) return error.InvalidArgument;
+        return switch (self.backend) {
+            .cuda => self.cuda_ctx.enablePeerAccess(&peer.cuda_ctx),
+            .hip => self.hip_ctx.enablePeerAccess(&peer.hip_ctx),
+            .cpu => error.Unsupported,
         };
     }
 
@@ -237,8 +273,9 @@ pub const Buffer = union(Backend) {
             .cpu => unreachable,
         };
     }
-    /// Device-to-device copy of `n` bytes. Asserts `src` is on the same backend
-    /// as `self`.
+    /// Device-to-device copy of `n` bytes; across two devices a peer copy,
+    /// direct once `Compute.enablePeerAccess` was granted and staged by the
+    /// driver otherwise. Asserts `src` is on the same backend as `self`.
     pub fn copyFrom(self: *Buffer, src: *const Buffer, src_offset: usize, dst_offset: usize, n: usize) Error!void {
         switch (self.*) {
             .cuda => |*b| try b.copyFrom(&src.cuda, src_offset, dst_offset, n),
@@ -271,7 +308,7 @@ pub const Module = union(Backend) {
             .cpu => unreachable,
         };
     }
-    /// (#3) Drops this handle. A cached module stays loaded for the process;
+    /// Drops this handle. A cached module stays loaded for the process;
     /// `shutdown()` unloads it.
     pub fn deinit(self: *Module) void {
         switch (self.*) {
@@ -344,6 +381,14 @@ test "the .cpu arm fails politely instead of pretending" {
     try std.testing.expectError(error.InitFailed, c.createStream());
     try std.testing.expectError(error.Unsupported, c.fp64Ratio());
     try std.testing.expectError(error.Unsupported, c.multiprocessorCount());
+    try std.testing.expectError(error.Unsupported, c.computeCapability());
+    try std.testing.expectError(error.Unsupported, c.info());
+    try std.testing.expect(!try c.canAccessPeer(&c));
+    try std.testing.expectError(error.Unsupported, c.enablePeerAccess(&c));
+    // A peer on another backend is rejected before either driver is asked.
+    const other: Compute = .{ .backend = .hip };
+    try std.testing.expectError(error.InvalidArgument, c.canAccessPeer(&other));
+    try std.testing.expectError(error.InvalidArgument, c.enablePeerAccess(&other));
 }
 
 test "Compute.init picks a backend and never fails" {

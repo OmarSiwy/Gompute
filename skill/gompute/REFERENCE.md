@@ -46,7 +46,7 @@ This is a compile error if the build emitted no artifact for that backend.
 | `run(...)` | upload, launch, sync, download; device buffers are kept on the handle and grown on demand, so one `run` at a time per handle |
 | `alloc(count) Error!Buffer` | **elements** of `Spec.Value` |
 | `launch(...) Error!void` | no alloc, no copy, no sync; per-kind signature below |
-| `reduceBlocks(count) u32` | `min(ceil(count / block_size), 1024)` |
+| `reduceBlocks(count) u32` | blocks a `reduce` launch of `count` elements gets, at most 1024 |
 | `context` | `runtime.cuda.Context` / `runtime.hip.Context` |
 | `stream: Stream` | the stream `launch` enqueues on; default NULL stream |
 | `Buffer`, `Stream`, `backend`, `available` | |
@@ -62,8 +62,12 @@ This is a compile error if the build emitted no artifact for that backend.
 | `gather` | `&src, &idx, &out, count = idx.len, bound = src.len)` |
 | `scatter` | `&src, &idx, &out, count = src.len, bound = out.len)` |
 
-A `count` of 0 returns without launching. Past `(2^31-1) * block_size`
-elements, `Dim3.linear` panics.
+A `count` of 0 returns without launching. Each thread handles
+`16 / @sizeOf(T)` consecutive elements (4 for `f32`, 2 for `f64`, 16 for
+`u8`) with one 16-byte vector load and store per buffer and a scalar tail, so
+the grid is `ceil(count / (block_size * lanes))` blocks and a buffer must
+start 16-byte aligned, which `alloc` guarantees (256 bytes on both drivers).
+Past `(2^31-1) * block_size * lanes` elements, `Dim3.linear` panics.
 
 ### `g.AutoKernel(spec)`
 
@@ -98,12 +102,18 @@ launch.
 **Context**: `init(ordinal)`, `deinit`, `makeCurrent`, `synchronize`, `alloc`,
 `allocPinned`/`freePinned`, `loadModuleFromMemory(image)` (cached per device
 and image), `createStream`, `createStreamNonBlocking`, `createEvent`,
-`hasGraphs`, `hasEvents`, `fp64Ratio() !u32` (2 on datacenter parts, 64 on
-consumer parts; CUDA only), `multiprocessorCount() !u32` (SMs, or compute
-units on HIP 6.0+).
+`hasGraphs`, `hasEvents`, `info() !DeviceInfo`, `computeCapability() !u32`
+(`major * 10 + minor`: 89 on sm_89, 110 on gfx1100), `fp64Ratio() !u32`
+(FP32:FP64; 2 on NVIDIA datacenter parts, 64 on consumer parts; 1, 2 or 16 by
+gfx family on AMD), `multiprocessorCount() !u32` (SMs, or compute units),
+`canAccessPeer(&peer) !bool`, `enablePeerAccess(&peer) !void` (one
+direction, idempotent, `error.Unsupported` without a direct link). On HIP the
+four device queries need ROCm 6.0+ (`hipGetDevicePropertiesR0600`); an older
+runtime gets `error.Unsupported`.
 
 **Buffer**: `upload(host, n)`, `download(host, n)`, `uploadAt/downloadAt(host,
-offset, n)`, `copyFrom(src, src_off, dst_off, n)`, `copyFromAsync(..., &stream)`,
+offset, n)`, `copyFrom(src, src_off, dst_off, n)`, `copyFromAsync(..., &stream)`
+(a peer copy when the two buffers are on different ordinals),
 `uploadAtAsync/downloadAtAsync(host, offset, n, &stream)` (host must be pinned),
 `fillAsync(byte, n, &stream)`, `argPtr()`, `deviceAddr()`, `free()`
 (idempotent). Sizes are bytes and are not bounds-checked in-process. A null
@@ -123,13 +133,14 @@ so re-instantiate), `deinit`.
 `launch(grid, block, shared, args)`, `launchOnStream(..., stream_handle)`.
 
 `shutdown()` unloads every module and releases every context. Call it only
-once nothing else will touch the device. `cuda.loadedModuleCount()` reports
-how many (device, image) modules are JIT'd.
+once nothing else will touch the device. `cuda.loadedModuleCount()` and
+`hip.loadedModuleCount()` report how many (device, image) modules are JIT'd.
 
 `g.runtime.dynamic.Compute` is one tagged-union facade over CUDA, HIP and a
 `.cpu` arm that fails politely. It offers `init(?Backend)`, `initDevice`,
-`alloc`, `loadModule`, `createStream`, `synchronize`, `fp64Ratio`,
-`computeCapability` and `multiprocessorCount`. It
+`alloc`, `loadModule`, `createStream`, `synchronize`, `info`, `fp64Ratio`,
+`computeCapability`, `multiprocessorCount`, `canAccessPeer` and
+`enablePeerAccess`; `dynamic.deviceCount(backend)` counts the ordinals. It
 has no events or graphs; for those, use the vendor module.
 
 ## Errors
@@ -138,8 +149,9 @@ has no events or graphs; for those, use the vendor module.
 `ContextFailed`, `SyncFailed` (usually an earlier launch faulted),
 `AllocFailed`, `ModuleLoadFailed` (arch mismatch), `KernelNotFound`,
 `LaunchFailed`, `CopyFailed`, `InvalidArgument`, `BackendUnavailable`,
-`UnsupportedBackend` (reserved), `CaptureFailed`, `GraphFailed`,
-`EventFailed` and `Unsupported` (driver too old).
+`CaptureFailed`, `GraphFailed`, `EventFailed` and `Unsupported` (driver too
+old, a HIP runtime before ROCm 6.0 for the device queries, or no direct link
+for `enablePeerAccess`).
 `g.lastDriverError() -> { code: i64, backend: .none | .cuda | .hip }` is
 thread-local and cleared on success.
 
@@ -163,7 +175,8 @@ are the six names whose meaning differs between the roots. On the host
 
 | | |
 | --- | --- |
-| `globalIdX(bs)`, `localIdX()`, `blockIdX()` | thread indices; AMDGCN traps if a launch is wider than `bs` |
+| `globalIdX(bs)`, `localIdX()`, `blockIdX()` | thread indices from the launched geometry on both vendors; `bs` is ignored |
+| `shuffleXor(T, v, mask)` | the value of lane `this ^ mask` in a 32-lane group (`shfl.sync.bfly`; DPP / `ds_swizzle` / `v_permlanex16` on AMD); every lane of the group must reach it |
 | `gridDimX()` | NVPTX only; on AMD, pass the stride as an argument |
 | `barrier()` | `__syncthreads`, with the fences included on AMDGCN; every thread must reach it |
 | `spinPause()` | ~64 ns backoff; a no-op below sm_70/PTX 6.3 |

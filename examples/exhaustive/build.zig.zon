@@ -2,7 +2,7 @@
     .name = .gompute_exhaustive_example,
     .version = "0.0.0",
     .fingerprint = 0x75c10436eeb1abba,
-    .minimum_zig_version = "0.17.0",
+    .minimum_zig_version = "0.18.0-dev.349+d924f83bf",
     .dependencies = .{
         .gompute = .{ .path = "../.." },
     },

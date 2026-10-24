@@ -54,7 +54,7 @@ fn GpuRaw(comptime entry_name: ?[:0]const u8, comptime gpu: host.Gpu) type {
         module: gpu.rt.Module = .{},
         kernel: gpu.rt.Kernel = .{},
 
-        /// (#3) Handles on the same device share one primary context and one
+        /// Handles on the same device share one primary context and one
         /// JIT'd copy of the artifact, so this is cheap after the first one and
         /// a `Buffer` from any handle is valid in all of them.
         pub fn init(ordinal: c_int) iface.Error!Self {
@@ -65,7 +65,7 @@ fn GpuRaw(comptime entry_name: ?[:0]const u8, comptime gpu: host.Gpu) type {
             return .{ .context = opened.context, .module = opened.module, .kernel = opened.kernel };
         }
 
-        /// (#3) Drops this handle only; the shared context and module stay up for
+        /// Drops this handle only; the shared context and module stay up for
         /// the process. See `gompute.runtime.<backend>.shutdown()`.
         ///
         /// Resets rather than `undefined`, so a stray double-deinit stays a

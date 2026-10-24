@@ -25,7 +25,10 @@
           config.allowUnfree = true;
           config.cudaSupport = true;
         };
-        zig = zig-overlay.packages.${system}."0.17.0";
+        # Zig master, 0.18.0-dev.349+d924f83bf at the locked overlay revision:
+        # the same build ESPice pins. `build.zig.zon`'s minimum_zig_version and
+        # `.github/workflows/*` name the same version; move all three together.
+        zig = zig-overlay.packages.${system}.master;
         # The sandbox has no GPU and no nvidia-smi, so `.gpu = .auto` would
         # detect nothing. Nothing here calls emitKernels; anything that does
         # must pin `.gpu = .{ .name = "sm_89" }` to stay hermetic.
@@ -44,7 +47,7 @@
               # into the binary; the sandbox has none, so it guesses musl and the
               # libc-linked tests cannot find /lib/ld-musl. Static musl needs no
               # loader. The glibc-only libm oracle tests skip here; they run in
-              # the dev shell. (-Ddynamic-linker would do, but 0.17 corrupts it.)
+              # the dev shell.
               zig build ${step} --prefix "$out" ${pkgs.lib.optionalString pkgs.stdenv.isLinux "-Dtarget=native-linux-musl"}
             '';
           };
@@ -56,7 +59,6 @@
 
         devShells.default = pkgs.mkShell {
           # Build only needs Zig; CUDA/HIP libraries are dlopen'd at run time.
-          # ZLS has no 0.17 release yet (the maker/configurer split broke it).
           buildInputs = [ zig ];
 
           LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
@@ -65,9 +67,12 @@
             pkgs.rocmPackages.rocm-runtime
           ];
 
+          # One global cache per Zig store path: two builds of the same Zig
+          # version (ESPice and VerA pin their own) sharing ~/.cache/zig evict
+          # each other's build runner on every `zig build`.
           shellHook = ''
-            echo "Gompute dev shell"
-            echo "  zig: $(zig version)"
+            export ZIG_GLOBAL_CACHE_DIR="''${XDG_CACHE_HOME:-$HOME/.cache}/zig-${builtins.baseNameOf zig}"
+            echo "Gompute dev shell: zig $(zig version)"
           '';
         };
       }

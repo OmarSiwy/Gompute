@@ -34,6 +34,26 @@ pub fn kindOf(comptime Spec: type) Kind {
     return if (@hasDecl(Spec, "kind")) Spec.kind else .map;
 }
 
+/// Consecutive elements one device thread handles: as many as fill one 16-byte
+/// access of the spec's widest buffer element (4 for f32, 2 for f64, 8 for
+/// f16, 16 for u8; 1 for a 16-byte vector element, and for gather/scatter,
+/// whose accesses are random anyway). A warp then moves 512 bytes per
+/// instruction instead of 128, which is what both vendors' memory pipelines
+/// want for a streaming kernel; the host grid shrinks by the same factor.
+/// `src/device/export.zig` and `src/host/kernel.zig` both read this, so the
+/// grid and the kernel cannot disagree.
+pub fn deviceLanes(comptime Spec: type) u32 {
+    // `comptime`: a runtime switch analyzes every prong, and a map spec has
+    // no `In`.
+    const widest: usize = comptime switch (kindOf(Spec)) {
+        .map, .map_indexed, .reduce => @sizeOf(Spec.Value),
+        .map_to => @max(@sizeOf(Spec.In), @sizeOf(Spec.Out)),
+        .zip => @max(@sizeOf(Spec.A), @max(@sizeOf(Spec.B), @sizeOf(Spec.Out))),
+        .gather, .scatter => 16,
+    };
+    return @max(1, 16 / widest);
+}
+
 /// Broadcast a scalar so one generic map body compiles at scalar and vector
 /// width: `x * splat(@TypeOf(x), p.scale)`.
 pub inline fn splat(comptime T: type, value: anytype) T {
@@ -567,6 +587,40 @@ test isCIdentifier {
     // on -- the name is emitted as a symbol verbatim.
     for ([_][]const u8{ "", "0scale", "my kernel", "my-kernel", "my.kernel", "add()", "über" }) |bad|
         try std.testing.expect(!isCIdentifier(bad));
+}
+
+test deviceLanes {
+    const P = struct { scale: f32 };
+    const id = struct {
+        fn f32s(x: f32, _: P) f32 {
+            return x;
+        }
+        fn f64s(x: f64, _: P) f64 {
+            return x;
+        }
+        fn u8s(x: u8, _: P) u8 {
+            return x;
+        }
+        fn v4(x: @Vector(4, f32), _: P) @Vector(4, f32) {
+            return x;
+        }
+        fn widen(x: f32, _: P) f64 {
+            return x;
+        }
+        fn add(a: f32, b: f32, _: P) f32 {
+            return a + b;
+        }
+    };
+    try std.testing.expectEqual(@as(u32, 4), deviceLanes(Map("l_f32", f32, P, id.f32s, .{})));
+    try std.testing.expectEqual(@as(u32, 2), deviceLanes(Map("l_f64", f64, P, id.f64s, .{})));
+    try std.testing.expectEqual(@as(u32, 16), deviceLanes(Map("l_u8", u8, P, id.u8s, .{})));
+    // A 16-byte element is already one access wide.
+    try std.testing.expectEqual(@as(u32, 1), deviceLanes(Map("l_v4", @Vector(4, f32), P, id.v4, .{})));
+    // Mixed widths: the wider side decides, so neither access exceeds 16 bytes.
+    try std.testing.expectEqual(@as(u32, 2), deviceLanes(MapTo("l_widen", f32, f64, P, id.widen, .{})));
+    try std.testing.expectEqual(@as(u32, 4), deviceLanes(Zip("l_zip", f32, f32, f32, P, id.add, .{})));
+    try std.testing.expectEqual(@as(u32, 4), deviceLanes(Sum("l_sum", f32, P, .{})));
+    try std.testing.expectEqual(@as(u32, 1), deviceLanes(Gather("l_gather", f32, u32, .{})));
 }
 
 test blockSizeValid {

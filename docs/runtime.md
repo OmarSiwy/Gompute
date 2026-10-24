@@ -33,7 +33,11 @@ std.debug.print("running on {t}\n", .{gpu.backend});
 | `compute.loadModule(image: [:0]const u8) Error!Module` | PTX or HSACO. Cached per (device, image), so the same blob JITs once per process. |
 | `compute.createStream() Error!Stream` | |
 | `compute.synchronize() Error!void` | Block until the device is idle. |
+| `compute.info() Error!DeviceInfo` | Name, uuid, PCI address, SMs or compute units, compute capability, FP64 ratio, clocks, bus width, memory. `error.Unsupported` on `.cpu`. |
+| `compute.fp64Ratio()`, `compute.multiprocessorCount()`, `compute.computeCapability()` | `Error!u32` each. `error.Unsupported` on `.cpu`, and on a HIP runtime older than ROCm 6.0. |
+| `compute.canAccessPeer(&other) Error!bool`, `compute.enablePeerAccess(&other) Error!void` | A direct link to another device's memory; see [Several devices](#several-devices). |
 | `compute.deinit() void` | Releases your handle only. |
+| `rt.deviceCount(backend) Error!u32` | The ordinals `initDevice` accepts; 0 on `.cpu`. |
 | `rt.shutdown()` | Unload every module, release every context. Process teardown, not handle teardown. |
 
 ## Getting at the compiled kernels
@@ -109,7 +113,8 @@ that happened one launch earlier.
 | `download(host: *anyopaque, n: usize) Error!void` | Device → host. |
 | `uploadAt(host, offset: usize, n: usize) Error!void` | The same, starting `offset` **bytes** into the buffer. |
 | `downloadAt(host, offset: usize, n: usize) Error!void` | |
-| `copyFrom(src: *const Buffer, src_offset, dst_offset, n) Error!void` | Device → device, no host round trip. |
+| `copyFrom(src: *const Buffer, src_offset, dst_offset, n) Error!void` | Device → device, no host round trip of yours. Between buffers on two ordinals it is a peer copy: over the direct link after `enablePeerAccess`, staged by the driver otherwise. |
+| `copyFromAsync(src, src_offset, dst_offset, n, &stream) Error!void` | The same, stream-ordered and not waited on. |
 | `argPtr() Arg` | The buffer as a kernel argument. |
 | `deviceAddr() u64` | The raw device pointer, for kernels that want it as a scalar. |
 | `free() void` | Idempotent. Use-after-free is *not* checked. |
@@ -131,9 +136,57 @@ A stream orders the work put on it and runs independently of work on other
 streams. Two streams let a copy overlap a launch. `compute.synchronize()`
 waits for the whole device; `stream.synchronize()` waits for just that queue.
 
-There is no event API and no cross-stream dependency mechanism. If you need
-those, use `g.runtime.cuda` directly. The facade only carries what both vendors
-spell the same way.
+The facade has no events and no graphs. `g.runtime.cuda` and `g.runtime.hip`
+both do, with the same shape: `Event`, `Stream.waitEvent`, `beginCapture` /
+`endCapture`, `Graph.instantiate`. See [Graph replay](advanced.html#graph-replay).
+
+## Several devices
+
+Every handle carries the ordinal it was made on and makes that device's
+context current on the calling thread, so several devices are several handles,
+and nothing else changes:
+
+- `rt.deviceCount(backend)` says how many ordinals there are.
+  `GOMPUTE_FAKE_DEVICES=k` makes ordinals up to `k-1` extra contexts on device
+  0, so a two-device program runs on one card; `Context.info` tells a real
+  second card (its own `uuid`) from a fake one (`fake`, the same `uuid`).
+- `Compute.initDevice(backend, ordinal)` or `Kernel(spec, .cuda).init(ordinal)`
+  opens one handle per device.
+- `run` synchronizes, so launching through it on N devices serializes them.
+  To overlap, give each device a non-blocking stream and pinned host memory,
+  queue the upload, the launch and the download on each stream, then wait for
+  every stream:
+
+```zig
+const n = try rt.deviceCount(.cuda);
+var handle: [16]g.Kernel(kernels.scale_relu, .cuda) = undefined;
+var stream: [16]g.runtime.cuda.Stream = undefined;
+var dev: [16]g.runtime.cuda.Buffer = undefined;
+var pinned: [16][]u8 = undefined;
+const part = data.len / n;
+for (0..n) |d| {
+    handle[d] = try g.Kernel(kernels.scale_relu, .cuda).init(@intCast(d));
+    stream[d] = try handle[d].context.createStreamNonBlocking();
+    handle[d].stream = stream[d];
+    dev[d] = try handle[d].alloc(part);
+    pinned[d] = try handle[d].context.allocPinned(part * @sizeOf(f32));
+    @memcpy(pinned[d], std.mem.sliceAsBytes(data[d * part ..][0..part]));
+    try dev[d].uploadAtAsync(pinned[d].ptr, 0, pinned[d].len, &stream[d]);
+    try handle[d].launch(&dev[d], part, .{ .scale = 2 });
+    try dev[d].downloadAtAsync(pinned[d].ptr, 0, pinned[d].len, &stream[d]);
+}
+for (0..n) |d| try stream[d].synchronize();
+```
+
+- A `copyFrom` between buffers on two ordinals is a peer copy. After
+  `context.enablePeerAccess(&other.context)` it goes over the direct link
+  (NVLink, PCIe P2P, XGMI); without one the driver stages it through host
+  memory, which is correct and slower. `canAccessPeer` says which you will
+  get; `enablePeerAccess` returns `error.Unsupported` when there is no link,
+  which is also what a fake-device pair answers. Enable it in both directions
+  if both devices read each other's buffers.
+- Events order streams across devices: record on one device's stream, wait on
+  the other's.
 
 ## Lifetime
 

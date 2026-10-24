@@ -106,17 +106,6 @@ does not report device-side faults; the next `synchronize` does. If a
 synchronize fails and the launch before it looked fine, the launch before it is
 the suspect. `lastDriverError().code` has the vendor's own code.
 
-## A raw kernel is right on CUDA and wrong on HIP
-
-`globalIdX(block_size)` is asymmetric. NVPTX reads the real block dimension out
-of hardware and ignores the argument; AMDGCN uses the argument, because it has
-no portable way to read it. Pass a 256 and launch with 128 and NVIDIA covers
-for you while AMD computes wrong indices.
-
-Generated `map` kernels guarantee the match by construction. Raw kernels do not,
-so the `block_size` you pass `globalIdX` **must** be the `block.x` you launch
-with.
-
 ## Compile error naming a `Params` field
 
 ```
@@ -147,6 +136,13 @@ Also expected, if two indices are equal. Two threads writing one slot race, and
 which one lands is unspecified on both vendors. There is no `scatterAdd`;
 combining duplicates needs a device float atomic, which is gfx9+ and
 `--unsafe-fp-atomics` on AMD.
+
+## `error.Unsupported` from `enablePeerAccess`
+
+The two devices have no direct link (no NVLink, PCIe P2P or XGMI path between
+them), or they are two `GOMPUTE_FAKE_DEVICES` contexts on one card. Nothing is
+broken: a `copyFrom` between their buffers still works, staged by the driver
+through host memory. `canAccessPeer` answers the question without the error.
 
 ## Getting the driver's own answer
 

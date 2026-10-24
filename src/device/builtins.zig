@@ -1,10 +1,10 @@
-//! Device-only thread-index builtins for Zig 0.17.0.
+//! Device-only thread indices, barrier, warp shuffle and device-scope atomics.
 //!
 //! Almost no atomics here: Zig's own `@atomicRmw`, `@atomicLoad` and `@atomicStore`
 //! on `addrspace(.global)` pointers lower correctly on both targets, with one
 //! hole. On NVPTX, LLVM drops the ordering of `@atomicRmw`: `.acq_rel` and
 //! `.seq_cst` emit a plain relaxed `atom.global.*` with no fence (LLVM 21 did
-//! the same to `@cmpxchgStrong`; LLVM 22, in Zig 0.17, fences that one). Pair a relaxed RMW with an
+//! the same to `@cmpxchgStrong`; LLVM 22 fences that one). Pair a relaxed RMW with an
 //! `@atomicLoad(.acquire)` / `@atomicStore(.release)` instead, which do lower
 //! to `ld.acquire.sys` / `st.release.sys` -- system scope, stronger than the
 //! `.gpu` a kernel needs, since Zig cannot name a sync scope --
@@ -14,91 +14,89 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-extern fn @"llvm.amdgcn.workitem.id.x"() callconv(.c) u32;
-extern fn @"llvm.amdgcn.workgroup.id.x"() callconv(.c) u32;
 extern fn @"llvm.amdgcn.s.barrier"() callconv(.c) void;
 extern fn @"llvm.amdgcn.s.sleep"(u32) callconv(.c) void;
+extern fn @"llvm.amdgcn.ds.bpermute"(i32, i32) callconv(.c) i32;
+extern fn @"llvm.amdgcn.mbcnt.lo"(u32, u32) callconv(.c) u32;
+extern fn @"llvm.amdgcn.mbcnt.hi"(u32, u32) callconv(.c) u32;
 
-extern fn @"llvm.nvvm.read.ptx.sreg.tid.x"() callconv(.c) u32;
-extern fn @"llvm.nvvm.read.ptx.sreg.ctaid.x"() callconv(.c) u32;
-extern fn @"llvm.nvvm.read.ptx.sreg.ntid.x"() callconv(.c) u32;
 extern fn @"llvm.nvvm.read.ptx.sreg.nctaid.x"() callconv(.c) u32;
+extern fn @"llvm.nvvm.shfl.sync.bfly.i32"(u32, i32, i32, i32) callconv(.c) i32;
 extern fn @"llvm.nvvm.barrier0"() callconv(.c) void;
 extern fn @"llvm.nvvm.nanosleep"(u32) callconv(.c) void;
 
 /// The flat thread index, `blockIdx.x * blockDim.x + threadIdx.x`.
 ///
-/// `block_size` MUST equal the block size the kernel is actually launched with.
-/// Generated `map` kernels satisfy that by construction -- the host always
-/// launches at `Spec.block_size` -- but `RawKernel.launch` takes an arbitrary
-/// `block: Dim3`, so a hand-written kernel calling `globalIdX(256)` and launched
-/// with `block.x = 128` is wrong.
-///
-/// Worse, it is wrong asymmetrically: NVPTX reads the real block dimension from
-/// `ntid.x` and ignores `block_size` entirely, so the same code gives correct
-/// indices on CUDA and wrong ones on HIP.
-///
-/// AMDGCN traps when a launch is *wider* than `block_size`: a thread whose
-/// `threadIdx.x` is past the end proves the mismatch, and the next sync on the
-/// host reports the aborted kernel. A *narrower* launch is still silent -- no
-/// thread can see it without the real block size, which is the wall below.
-///
-/// ponytail: AMDGCN should read `workgroup_size_x` out of the HSA dispatch
-/// packet, which is the exact counterpart of `ntid.x`. It cannot be expressed
-/// here yet: `llvm.amdgcn.dispatch.ptr` returns `ptr addrspace(4)` and Zig
-/// 0.17 rejects `addrspace(.constant)` on amdgcn ("pointers with address space
-/// 'constant' are not supported on amdgcn"). Declaring it `.global` would
-/// mis-type the intrinsic. Revisit when Zig supports the constant address
-/// space; until then the contract above is the mitigation, and it is untested
-/// on hardware -- no AMD device was available.
+/// Reads the block size the kernel was actually launched with on both
+/// vendors: `%ntid.x` on NVPTX, the dispatch packet's `workgroup_size_x` on
+/// AMDGCN (Zig's `@workGroupSize` emits the load the language cannot spell,
+/// `addrspace(.constant)` being rejected on amdgcn). `block_size` is ignored;
+/// it stays in the signature because every kernel written against 1.4.0
+/// passes it, and it used to be what AMDGCN multiplied by.
 pub inline fn globalIdX(comptime block_size: u32) usize {
-    return switch (builtin.target.cpu.arch) {
-        .nvptx64 => @as(usize, @"llvm.nvvm.read.ptx.sreg.ctaid.x"()) *
-            @"llvm.nvvm.read.ptx.sreg.ntid.x"() + @"llvm.nvvm.read.ptx.sreg.tid.x"(),
-        .amdgcn => blk: {
-            const tid = @"llvm.amdgcn.workitem.id.x"();
-            if (tid >= block_size) @trap();
-            break :blk @as(usize, @"llvm.amdgcn.workgroup.id.x"()) * block_size + tid;
-        },
-        else => @compileError("device globalIdX used on a non-GPU target"),
-    };
+    _ = block_size;
+    return @as(usize, @workGroupId(0)) * @workGroupSize(0) + @workItemId(0);
 }
 
 /// The thread's index within its own block, `threadIdx.x`. Indexes block-local
-/// shared scratch, so it is always in `0..block_size`.
+/// shared scratch, so it is always in `0..blockDim.x`.
 pub inline fn localIdX() u32 {
-    return switch (builtin.target.cpu.arch) {
-        .nvptx64 => @"llvm.nvvm.read.ptx.sreg.tid.x"(),
-        .amdgcn => @"llvm.amdgcn.workitem.id.x"(),
-        else => @compileError("device localIdX used on a non-GPU target"),
-    };
+    return @workItemId(0);
 }
 
 /// The block's index within the grid, `blockIdx.x`.
 pub inline fn blockIdX() u32 {
+    return @workGroupId(0);
+}
+
+/// `v` from the lane whose index is this lane's XOR `mask`, within groups of
+/// 32 lanes: `__shfl_xor_sync(~0, v, mask)` on NVPTX, and on AMDGCN a
+/// `ds_bpermute` that LLVM lowers to DPP, `v_permlanex16` or `ds_swizzle`
+/// for the masks that have one. 32-lane groups on both vendors, so a wave64
+/// is two independent groups and nothing here depends on the wave width.
+///
+/// Every lane of the group must be active and reach the call: launch with a
+/// block size that is a multiple of 32, and call it outside any branch that
+/// splits a group. `T` is any type of 32 bits or less, or a multiple of 32
+/// bits, moved 32 bits at a time.
+pub inline fn shuffleXor(comptime T: type, v: T, comptime mask: u5) T {
+    const bits = @bitSizeOf(T);
+    if (bits <= 32) {
+        const U = @Int(.unsigned, bits);
+        const r = shfl32(@as(U, @bitCast(v)), mask);
+        return @bitCast(@as(U, @truncate(r)));
+    }
+    if (bits % 32 != 0) @compileError("shuffleXor: " ++ @typeName(T) ++ " is not a multiple of 32 bits");
+    var words: [bits / 32]u32 = @bitCast(v);
+    inline for (&words) |*w| w.* = shfl32(w.*, mask);
+    return @bitCast(words);
+}
+
+inline fn shfl32(v: u32, comptime mask: u5) u32 {
     return switch (builtin.target.cpu.arch) {
-        .nvptx64 => @"llvm.nvvm.read.ptx.sreg.ctaid.x"(),
-        .amdgcn => @"llvm.amdgcn.workgroup.id.x"(),
-        else => @compileError("device blockIdX used on a non-GPU target"),
+        .nvptx64 => @bitCast(@"llvm.nvvm.shfl.sync.bfly.i32"(0xffff_ffff, @bitCast(v), mask, 0x1f)),
+        .amdgcn => blk: {
+            // The lane within the wave, 0..63 on wave64 and 0..31 on wave32,
+            // where `mbcnt.hi` adds nothing. `ds_bpermute` takes a byte index.
+            const lane = @"llvm.amdgcn.mbcnt.hi"(~@as(u32, 0), @"llvm.amdgcn.mbcnt.lo"(~@as(u32, 0), 0));
+            break :blk @bitCast(@"llvm.amdgcn.ds.bpermute"(@bitCast((lane ^ mask) << 2), @bitCast(v)));
+        },
+        else => @compileError("device shuffleXor used on a non-GPU target"),
     };
 }
 
 /// The number of blocks in the grid, `gridDim.x`.
 ///
-/// NVPTX ONLY. There is no portable counterpart, which is why the generated
-/// `reduce` kernel takes its grid stride as a kernel argument instead of
-/// calling this: the host computed the grid, so it can just say what it is.
+/// NVPTX ONLY. Zig has `@workGroupSize` but no grid-size builtin, and the
+/// AMDGCN answer is the dispatch packet's `grid_size_x`, whose pointer lives
+/// in the constant address space Zig rejects on amdgcn. The generated
+/// `reduce` takes its grid stride as a kernel argument instead: the host
+/// computed the grid, so it can just say what it is.
 ///
-/// ponytail: AMDGCN is missing on purpose, not by oversight.
-/// `llvm.amdgcn.grid.size.x` looks like the answer and is not -- it is a *clang*
-/// builtin (`__builtin_amdgcn_grid_size_x`) that clang expands to a dispatch-packet
-/// load, not an LLVM intrinsic. Declaring it `extern` in Zig compiles, and
-/// `ld.lld -shared` links it, because a shared object is allowed undefined
-/// symbols; the HSACO then carries a real `@gotpcrel32` call to a function that
-/// does not exist and the device rejects it at load. The genuine route is
-/// `llvm.amdgcn.dispatch.ptr`, which returns `ptr addrspace(4)` and needs the
-/// constant address space Zig 0.17 rejects on amdgcn -- the same wall
-/// `globalIdX` documents above.
+/// ponytail: declaring `llvm.amdgcn.grid.size.x` does not work around it: it
+/// is a clang builtin, not an LLVM intrinsic, and the HSACO ends up calling a
+/// function that does not exist. Revisit when Zig grows `@gridSize` or
+/// accepts `addrspace(.constant)` on amdgcn.
 pub inline fn gridDimX() usize {
     return switch (builtin.target.cpu.arch) {
         .nvptx64 => @"llvm.nvvm.read.ptx.sreg.nctaid.x"(),

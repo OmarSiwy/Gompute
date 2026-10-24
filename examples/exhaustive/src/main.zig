@@ -60,6 +60,10 @@ fn skip(reason: []const u8) void {
 fn same(comptime T: type, a: T, b: T) bool {
     return switch (@typeInfo(T)) {
         .float => std.math.approxEqAbs(T, a, b, 1024 * std.math.floatEps(T)),
+        .vector => |v| blk: {
+            inline for (0..v.len) |l| if (!same(v.child, a[l], b[l])) break :blk false;
+            break :blk true;
+        },
         else => a == b,
     };
 }
@@ -100,6 +104,12 @@ pub fn main() !void {
 
     // ── Second kernel root + run-time kernel selection ──────────────────
     section("second root", 5, testSecondRoot);
+
+    // ── Every kind, GPU against CPU, at every length that has a tail ────
+    section("kinds", 14, testKinds);
+
+    // ── Every device at once, and copies between them ───────────────────
+    section("devices", 3, testDevices);
 
     // ── A generated kernel captured into a graph and replayed ───────────
     section("graph replay", 3, testGraphReplay);
@@ -251,6 +261,187 @@ fn testMathBits() void {
         check("math_bits_" ++ @typeName(T), mismatches == 0);
     }
     print("  done\n", .{});
+}
+
+// ── Every kind on the GPU, the CPU path as the oracle ───────────────────
+
+/// Lengths around every edge the generated entries have: 0 and 1, the lane
+/// group (2, 4, 8, 16), the block (64, 100, 128, 256) and a few blocks, each
+/// one less, exact and one more, plus one that is none of those.
+const edge_lengths = [_]usize{ 0, 1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 99, 100, 101, 127, 128, 129, 255, 256, 257, 511, 512, 513, 1023, 1024, 1025, 4095, 4096, 4097, 70001 };
+const max_len = edge_lengths[edge_lengths.len - 1];
+
+/// One kind on both backends over every edge length. Floats compare within
+/// `same`'s tolerance (a reduce reorders), everything else bit for bit. One
+/// `check` per spec: the first length that disagrees is reported.
+fn kindCase(comptime Spec: type, label: []const u8, params_in: anytype) void {
+    const kind = comptime g.spec.kindOf(Spec);
+    // Typed at the call site (an untyped literal cannot cross `anytype`);
+    // gather and scatter take none.
+    const params = if (kind == .gather or kind == .scatter) {} else @as(Spec.Parameters, params_in);
+    var gpu = g.Kernel(Spec, .cuda).init(0) catch return skip("no CUDA device");
+    defer gpu.deinit();
+    var cpu = g.Kernel(Spec, .cpu).init(0) catch unreachable;
+    const Store = struct {
+        var a: [max_len]Spec.Value = undefined;
+        var b: [max_len]Spec.Value = undefined;
+        var ga: [max_len]Spec.Value = undefined;
+        var gb: [max_len]Spec.Value = undefined;
+        var in: [max_len]if (kind == .map_to) Spec.In else u8 = undefined;
+        var idx: [max_len]if (kind == .gather or kind == .scatter) Spec.Index else u8 = undefined;
+    };
+    for (edge_lengths) |len| {
+        // Deterministic, type-generic fill: small integers through a float.
+        for (0..len) |i| {
+            const f: f32 = @as(f32, @floatFromInt((i * 37) % 251)) - 125;
+            Store.a[i] = fill(Spec.Value, f);
+            Store.b[i] = fill(Spec.Value, -f * 0.5);
+            if (kind == .map_to) Store.in[i] = fill(Spec.In, f);
+            // Gather reads, so repeats are fine; scatter writes, and two
+            // threads on one slot are a documented race, so its indices are
+            // a permutation. Every fifth one lands past the end of `out`.
+            if (kind == .gather) Store.idx[i] = @intCast((i * 11 + 3) % (len + 2));
+            if (kind == .scatter) Store.idx[i] = @intCast(if (i % 5 == 0) len + 1 else len - 1 - i);
+        }
+        @memcpy(Store.ga[0..len], Store.a[0..len]);
+        @memcpy(Store.gb[0..len], Store.b[0..len]);
+        const ok = switch (kind) {
+            .map, .map_indexed => blk: {
+                gpu.run(Store.ga[0..len], params) catch break :blk false;
+                cpu.run(Store.a[0..len], params) catch unreachable;
+                break :blk allSame(Spec.Value, Store.ga[0..len], Store.a[0..len]);
+            },
+            .map_to => blk: {
+                gpu.run(Store.in[0..len], Store.ga[0..len], params) catch break :blk false;
+                cpu.run(Store.in[0..len], Store.a[0..len], params) catch unreachable;
+                break :blk allSame(Spec.Value, Store.ga[0..len], Store.a[0..len]);
+            },
+            .zip => blk: {
+                var out: [max_len]Spec.Value = undefined;
+                var gout: [max_len]Spec.Value = undefined;
+                gpu.run(Store.a[0..len], Store.b[0..len], gout[0..len], params) catch break :blk false;
+                cpu.run(Store.a[0..len], Store.b[0..len], out[0..len], params) catch unreachable;
+                break :blk allSame(Spec.Value, gout[0..len], out[0..len]);
+            },
+            .reduce => blk: {
+                const got = gpu.run(Store.a[0..len], params) catch break :blk false;
+                const want = cpu.run(Store.a[0..len], params) catch unreachable;
+                break :blk reduceSame(Spec.Value, got, want, len);
+            },
+            .gather, .scatter => blk: {
+                gpu.run(Store.a[0..len], Store.idx[0..len], Store.gb[0..len]) catch break :blk false;
+                cpu.run(Store.a[0..len], Store.idx[0..len], Store.b[0..len]) catch unreachable;
+                break :blk allSame(Spec.Value, Store.gb[0..len], Store.b[0..len]);
+            },
+        };
+        if (!ok) {
+            print("  {s}: GPU and CPU disagree at len {d}\n", .{ label, len });
+            return check(label, false);
+        }
+    }
+    check(label, true);
+}
+
+fn fill(comptime T: type, f: f32) T {
+    return switch (@typeInfo(T)) {
+        .float => @floatCast(f),
+        .int => @intCast(@as(i32, @intFromFloat(f)) & (if (@typeInfo(T).int.signedness == .unsigned) 0xff else 0x7f)),
+        .vector => |v| @splat(fill(v.child, f)),
+        else => @compileError("fill: " ++ @typeName(T)),
+    };
+}
+
+/// A float reduce reorders, so it gets a relative tolerance that grows with
+/// the length; an integer one must agree exactly.
+fn reduceSame(comptime T: type, got: T, want: T, len: usize) bool {
+    return switch (@typeInfo(T)) {
+        .float => std.math.approxEqRel(T, got, want, @as(T, @floatFromInt(len + 1)) * 1e-6) or (got == 0 and want == 0),
+        else => got == want,
+    };
+}
+
+fn testKinds() void {
+    print("\n[kinds]\n", .{});
+    if (!g.AutoKernel(k2.x_sum_f32).Cuda.available) return skip("this build emitted no CUDA artifacts");
+    const p: k2.Params = .{ .offset = 2 };
+    kindCase(k.scale_relu, "map f32 (4 per thread)", k.ScalarParams{ .scale = 2 });
+    kindCase(k.double_f64, "map f64 (2 per thread)", k.ScalarParams{ .scale = 0 });
+    kindCase(k.saturate_i16, "map i16 (8 per thread)", k.ScalarParams{ .scale = 0 });
+    kindCase(k2.x_map_u8, "map u8 (16 per thread)", p);
+    kindCase(k2.x_map_v4, "map v4f32 (1 per thread)", p);
+    kindCase(k2.x_indexed, "mapIndexed", p);
+    kindCase(k2.x_to_u8, "mapTo f32->u8", p);
+    kindCase(k2.x_widen, "mapTo f32->f64", p);
+    kindCase(k2.x_zip_f32, "zip", p);
+    kindCase(k2.x_sum_f32, "sum f32", p);
+    kindCase(k2.x_max_i32, "max i32 (block 100)", p);
+    kindCase(k2.x_xor_u32, "reduce xor u32 (block 64)", p);
+    kindCase(k2.x_gather, "gather", {});
+    kindCase(k2.x_scatter, "scatter", {});
+    print("  done\n", .{});
+}
+
+// ── Several devices: one handle, stream and pinned slice per device ──────
+
+/// Shards one map over every device the backend has, launches on all of them
+/// without waiting, then waits once per device. `GOMPUTE_FAKE_DEVICES=2`
+/// makes a one-card machine run it with two contexts; one real card skips.
+fn testDevices() void {
+    print("\n[devices]\n", .{});
+    if (!g.AutoKernel(k2.add_offset).Cuda.available) return skip("this build emitted no CUDA artifacts");
+    const count = g.runtime.dynamic.deviceCount(.cuda) catch return skip("no CUDA driver");
+    if (count < 2) return skip("one device; set GOMPUTE_FAKE_DEVICES=2 to shard across two contexts");
+    const K = g.Kernel(k2.add_offset, .cuda);
+    const Dev = struct { kernel: K, stream: K.Stream, buf: K.Buffer, host: []u8 };
+    const n: usize = 1000;
+    const per = n / 2;
+    var devs: [2]Dev = undefined;
+    var input: [n]f32 = undefined;
+    for (&input, 0..) |*x, i| x.* = @floatFromInt(i);
+
+    for (&devs, 0..) |*d, o| {
+        d.kernel = K.init(@intCast(o)) catch return;
+        d.stream = d.kernel.context.createStreamNonBlocking() catch return;
+        d.kernel.stream = d.stream;
+        d.buf = d.kernel.alloc(per) catch return;
+        d.host = d.kernel.context.allocPinned(per * 4) catch return;
+        @memcpy(d.host, std.mem.sliceAsBytes(input[o * per ..][0..per]));
+    }
+    defer for (&devs) |*d| {
+        d.kernel.context.freePinned(d.host);
+        d.buf.free();
+        d.stream.deinit();
+        d.kernel.deinit();
+    };
+    // Enqueue everything on both devices, then wait: the two halves overlap.
+    for (&devs) |*d| {
+        d.buf.uploadAtAsync(d.host.ptr, 0, per * 4, &d.stream) catch return;
+        d.kernel.launch(&d.buf, per, .{ .offset = 10 }) catch return;
+        d.buf.downloadAtAsync(d.host.ptr, 0, per * 4, &d.stream) catch return;
+    }
+    for (&devs) |*d| d.stream.synchronize() catch return;
+    var ok = true;
+    for (&devs, 0..) |*d, o| {
+        const got: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, d.host));
+        for (got, 0..) |v, i| ok = ok and v == input[o * per + i] + 10;
+    }
+    check("sharded_map_on_every_device", ok);
+
+    // A copy between the two is a peer copy; the first device's buffer ends
+    // up holding the second's half.
+    devs[0].buf.copyFrom(&devs[1].buf, 0, 0, per * 4) catch return;
+    devs[0].buf.download(devs[0].host.ptr, per * 4) catch return;
+    const copied: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, devs[0].host));
+    var copy_ok = true;
+    for (copied, 0..) |v, i| copy_ok = copy_ok and v == input[per + i] + 10;
+    check("peer_copy", copy_ok);
+
+    // Direct access is a property of the pair of cards: granted, or
+    // `error.Unsupported` (always, for two contexts on one card). Either is a
+    // valid answer; anything else is a bug.
+    const link = devs[0].kernel.context.enablePeerAccess(&devs[1].kernel.context);
+    check("peer_access_answer", if (link) true else |e| e == error.Unsupported);
+    print("  {d} devices, peer access: {s}\n", .{ count, if (link) "direct" else |_| "staged" });
 }
 
 // ── Runtime dynamic: module load + buffer + kernel launch ───────────────

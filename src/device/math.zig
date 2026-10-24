@@ -1948,6 +1948,9 @@ const libm = struct {
     ///
     /// Returns null off glibc; the callers skip rather than assert.
     fn real(comptime F: type, name: [*:0]const u8) ?*const F {
+        // Comptime, so a Windows or macOS test binary never references
+        // `dlopen` at all (mingw has none).
+        if (comptime builtin.os.tag != .linux) return null;
         const h = dlopen("libm.so.6", 0x2) orelse return null; // RTLD_NOW
         return @ptrCast(@alignCast(dlsym(h, name) orelse return null));
     }
@@ -2137,11 +2140,15 @@ test "f32 exp, log, log2 and log10 match libm to 1 ulp" {
 
     // 600k random bit patterns each: every binade, the subnormals and the
     // negative half (nan for the logs, underflow for exp) all in proportion.
+    // log10f's 2 is glibc's slack, as for f64 `log10`: glibc 2.39 (Ubuntu
+    // 24.04) measures 2 ulp from this body at 0x1.2dd712p-1, newer glibc's
+    // correctly rounded log10f 0. The independent oracle for every f32 body
+    // is the exhaustive check against f64 below, where this one is 0.82 ulp.
     inline for (.{
-        .{ "expf", softExpf, "expf", false },
-        .{ "logf", softLnf, "logf", true },
-        .{ "log2f", softLog2f, "log2f", true },
-        .{ "log10f", softLog10f, "log10f", true },
+        .{ "expf", softExpf, "expf", false, 1.0 },
+        .{ "logf", softLnf, "logf", true, 1.0 },
+        .{ "log2f", softLog2f, "log2f", true, 1.0 },
+        .{ "log10f", softLog10f, "log10f", true, 2.0 },
     }) |spec| {
         const mine: *const fn (f32) f32 = spec[1];
         var d = D{ .name = spec[0], .mine = mine, .theirs = libm.real(Fn32, spec[2]).? };
@@ -2154,8 +2161,8 @@ test "f32 exp, log, log2 and log10 match libm to 1 ulp" {
             d.around(0x1.62e42ep6, 50_000);
             d.around(-0x1.9fe368p6, 50_000);
         }
-        try d.specials(&edges, 1.0);
-        try d.report(1.0);
+        try d.specials(&edges, spec[4]);
+        try d.report(spec[4]);
     }
 }
 

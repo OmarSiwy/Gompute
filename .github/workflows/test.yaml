@@ -1,0 +1,124 @@
+name: test
+
+# The merge gate. What it proves: every unit suite, the CPU codegen fold, the
+# NVPTX and AMDGCN compile probes and the libm oracle, on every OS a release
+# claims (the libm tests skip off glibc); both examples built and run on the
+# CPU; the exhaustive example's device code compiled for sm_89 and gfx1100
+# without running it; and the sandboxed musl `zig build test` behind
+# `nix flake check`. What it cannot prove: no runner has a GPU, so the
+# hardware suite is `examples/exhaustive` run by hand on a card, and HIP has
+# never run on hardware at all. Every step gates on its exit code; a
+# `| tail` would swallow it.
+#
+# The Zig here is the build build.zig.zon and flake.lock pin; the three move
+# together. Mirrors purge old nightlies at their leisure, so when this exact
+# build stops downloading, bump all three, do not float to `master`.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  merge_group: # the merge queue tests the merged result before it lands
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to the same PR supersedes the run; main and the queue never cancel.
+concurrency:
+  group: test-${{ github.workflow_ref }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  ZIG_VERSION: 0.18.0-dev.349+d924f83bf
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Unit suites, codegen fold, device probes
+        run: zig build test --summary failures
+
+  examples:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Basic example on the CPU
+        run: zig build run --summary failures
+        working-directory: examples/basic
+      # No GPU here: `.auto` compiles both backends out (with its warning),
+      # every GPU section skips and the AutoKernel cases run on the CPU.
+      - name: Exhaustive example on the CPU
+        run: zig build run --summary failures
+        working-directory: examples/exhaustive
+      # The whole artifact pipeline for both backends, PTX and HSACO, compiled
+      # and embedded but never launched.
+      - name: Exhaustive example's device code for sm_89 and gfx1100
+        run: zig build -Dcuda-arch=sm_89 -Dhip-arch=gfx1100 --summary failures
+        working-directory: examples/exhaustive
+
+  # Every target the README claims, compiled and not run (a foreign binary
+  # cannot run here): the host runtime with both device backends embedded.
+  # The pattern and the pinned Zig are VerA's `cross` workflow's.
+  cross:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-linux-gnu, x86_64-macos, aarch64-macos, x86_64-windows, wasm32-wasi]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: examples/exhaustive for ${{ matrix.target }}
+        run: zig build -Dtarget=${{ matrix.target }} -Dcuda-arch=sm_89 -Dhip-arch=gfx1100 --summary failures
+        working-directory: examples/exhaustive
+
+  # wasm does run: every GPU section skips (no loader) and the CPU paths and
+  # AutoKernel's fallback run under wasmtime.
+  wasm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - name: examples/exhaustive under wasmtime
+        working-directory: examples/exhaustive
+        run: |
+          zig build -Dtarget=wasm32-wasi -Dcuda-arch=sm_89 -Dhip-arch=gfx1100 --summary failures
+          nix shell nixpkgs#wasmtime -c wasmtime zig-out/bin/exhaustive.wasm
+
+  nix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      # checks.default is `zig build test` for native-linux-musl in the
+      # sandbox, with the overlay's pinned Zig.
+      - name: nix flake check
+        run: nix flake check -L

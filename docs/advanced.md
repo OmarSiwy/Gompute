@@ -92,10 +92,16 @@ not two launches and not an intermediate buffer.
 
 ## Vectorized CPU kernels
 
-The CPU backend runs a generic map function at the target's vector width. Write
-the operation over `anytype` and use `g.splat` so the same source compiles at
-both scalar and vector width. `x * p.scale` is illegal when `x` is a vector and
-`p.scale` is an `f32`:
+A concrete `fn (T, Params) T` compiles to a plain loop, and Zig 0.18's LLVM
+auto-vectorizes it where it can prove the loop: the codegen probe's concrete
+`map` is a 4x-unrolled AVX2 loop at `-Dcpu=native`, and concrete `zip`, `mapTo`
+and `mapIndexed` widen the same way. Two things the auto-vectorizer never
+gives you: `g.math` at vector width, because its table-driven bodies have no
+loop to widen, and a width that does not depend on the optimizer. For those,
+write the operation over `anytype`; the CPU backend then instantiates it at
+`std.simd.suggestVectorLength(T)` lanes itself. Use `g.splat` so the same
+source compiles at both scalar and vector width. `x * p.scale` is illegal
+when `x` is a vector and `p.scale` is an `f32`:
 
 ```zig
 fn scaleRelu(x: anytype, p: Params) @TypeOf(x) {
@@ -106,9 +112,8 @@ fn scaleRelu(x: anytype, p: Params) @TypeOf(x) {
 pub const scale_relu = g.map("scale_relu", f32, Params, scaleRelu, .{});
 ```
 
-The GPU path still instantiates it at scalar type, one thread per element, so
-one definition serves both. A non-generic `fn (T, Params) T` keeps the plain
-scalar loop, unchanged.
+The GPU path instantiates it at scalar type, once per lane of the 16-byte
+vector each thread loads, so one definition serves both.
 
 ## Hand-written raw kernels
 
@@ -144,11 +149,9 @@ try raw.launch(g.Dim3.linear(count, 256), .{ .x = 256 }, 0, &args);
 try raw.synchronize();
 ```
 
-The block size passed to `globalIdX` **must** match the block size you launch
-with. Generated `map` kernels guarantee that by construction; raw kernels do
-not, and the mismatch is asymmetric: NVPTX reads the real block dimension and
-ignores the argument, while AMDGCN uses it. So the same code can be correct on
-CUDA and silently wrong on HIP.
+`globalIdX` reads the block size the kernel was launched with on both vendors
+(`%ntid.x`, and on AMD the dispatch packet), so any `block` works. Its
+argument is ignored; it stays because kernels written for 1.4.0 pass one.
 
 For shared memory, barriers, multidimensional indexing, textures, or a custom
 ABI, use a raw kernel and the low-level [runtime](runtime.html) modules under
@@ -159,7 +162,11 @@ Inside a raw kernel, `g.builtins` has the rest of the device intrinsics:
 `barrier()` for a block-wide execution barrier and shared-memory fence. Every
 thread in the block must reach that barrier, or NVIDIA hangs and AMD is
 undefined.
-`gridDimX()` exists on NVPTX only, since AMDGCN has no portable way to read it;
+`shuffleXor(T, v, mask)` swaps a value with the lane `mask` away inside a
+32-lane group, `__shfl_xor_sync` on NVIDIA and DPP / `ds_swizzle` /
+`v_permlanex16` on AMD; every lane of the group must reach it, so launch with
+a block that is a multiple of 32. The generated `reduce` folds with it.
+`gridDimX()` exists on NVPTX only, since Zig cannot read AMD's grid size;
 pass the stride as a kernel argument instead, which is what the generated
 `reduce` kernels do. `spinPause()` backs off inside a spin loop; it compiles to
 nothing on NVPTX targets below sm_70 with PTX 6.3. `g.builtins` is only present
