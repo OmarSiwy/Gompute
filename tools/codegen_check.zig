@@ -25,8 +25,11 @@ const pairs = [_]Pair{
 };
 
 fn endsWithSymbol(line: []const u8, symbol: []const u8) bool {
-    return std.mem.endsWith(u8, line, symbol) and
-        (line.len == symbol.len or !isSymbolChar(line[line.len - symbol.len - 1]));
+    if (!std.mem.endsWith(u8, line, symbol)) return false;
+    const prefix = line[0 .. line.len - symbol.len];
+    // A lone `_` is Mach-O's C-symbol prefix (`_manual_scale_relu`), not a
+    // longer identifier.
+    return prefix.len == 0 or std.mem.eql(u8, prefix, "_") or !isSymbolChar(prefix[prefix.len - 1]);
 }
 
 /// `.` and `$` are separators in the mangled names Zig emits (`cg.gompute_...`),
@@ -192,6 +195,12 @@ test foldedTogether {
 
     // Only one of the two folded away -> they are not the same code.
     try std.testing.expect(!foldedTogether("\tmanual_scale_relu = something_else\n", p));
+    // Mach-O: every C symbol carries a leading `_`, and the fold is the same.
+    try std.testing.expect(foldedTogether(
+        "_manual_scale_relu = _codegen.gompute_inferred\n" ++
+            "_gompute_scale_relu = _codegen.gompute_inferred\n",
+        p,
+    ));
     // A symbol that merely ends with the name must not count.
     try std.testing.expect(!foldedTogether("\tx_manual_scale_relu = y_gompute_scale_relu\n", p));
 
