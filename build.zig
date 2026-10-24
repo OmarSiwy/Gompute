@@ -393,6 +393,8 @@ pub fn build(b: *std.Build) void {
 
     // The lowerings `src/device/builtins.zig` promises for `t_raw_atomics`.
     // LLVM 21 spells these `atom.global.add.u32`, LLVM 22 `atom.relaxed.sys.global.add.u32`.
+    // The last two are the 16-byte accesses `src/device/export.zig` promises
+    // for every elementwise entry: four f32 per thread in and out.
     const ptx_atomics = b.addCheckFile(device_probe.getEmittedAsm(), .{ .expected_matches = &.{
         ".global.add.u32",
         ".global.min.u32",
@@ -400,6 +402,8 @@ pub fn build(b: *std.Build) void {
         "st.release.sys.global.b32",
         "ld.acquire.gpu.global.u32",
         "st.release.gpu.global.u32",
+        "ld.global.v4.b32",
+        "st.global.v4.b32",
     } });
 
     // AMDGCN is the other half of the same claim, and it is cheaper to check:
@@ -428,6 +432,8 @@ pub fn build(b: *std.Build) void {
     // `t_raw_atomics` adds the acquire invalidate, the release wait and the
     // spin pause. The last two are `barrier()` in `t_reduce`: `s_barrier` alone
     // orders no memory, so it must sit between `__syncthreads`' fences.
+    // `global_load_b128`/`global_store_b128` are the 16-byte accesses of the
+    // elementwise entries, the AMD half of the PTX `v4` check above.
     const amd_trap = b.addCheckFile(device_probe_amd.getEmittedAsm(), .{ .expected_matches = &.{
         "s_trap 2",
         "atomic_add_u32",
@@ -436,6 +442,8 @@ pub fn build(b: *std.Build) void {
         "s_sleep 1",
         "s_waitcnt_vscnt null, 0x0\n\t;;#ASMEND",
         "s_barrier\n\t;;#ASMSTART\n\tbuffer_gl0_inv",
+        "global_load_b128",
+        "global_store_b128",
     } });
 
     const test_step = b.step("test", "Run Gompute unit tests");

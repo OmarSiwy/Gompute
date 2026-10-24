@@ -148,6 +148,13 @@ which one lands is unspecified on both vendors. There is no `scatterAdd`;
 combining duplicates needs a device float atomic, which is gfx9+ and
 `--unsafe-fp-atomics` on AMD.
 
+## `error.Unsupported` from `enablePeerAccess`
+
+The two devices have no direct link (no NVLink, PCIe P2P or XGMI path between
+them), or they are two `GOMPUTE_FAKE_DEVICES` contexts on one card. Nothing is
+broken: a `copyFrom` between their buffers still works, staged by the driver
+through host memory. `canAccessPeer` answers the question without the error.
+
 ## Getting the driver's own answer
 
 When the library's error is not specific enough:

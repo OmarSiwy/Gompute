@@ -55,3 +55,42 @@ fn mathOf(comptime T: type) fn (T, MathParams) T {
 pub const math_function_count = 16;
 pub const math_f64 = g.map("math_f64", f64, MathParams, mathOf(f64), .{});
 pub const math_f32 = g.map("math_f32", f32, MathParams, mathOf(f32), .{});
+
+// ── Every kind, for the GPU-against-CPU sweep in main.zig ────────────────
+// One spec per kind and per lane width the generated entries take (f32: 4
+// per thread, f64: 2, i16: 8, u8: 16, a 16-byte vector: 1), so the vector
+// path, its straddling tail and the n == 1 path all run on hardware.
+
+fn axpy(a: f32, b: f32, p: Params) f32 {
+    return a * p.offset + b;
+}
+fn toByte(x: f32, p: Params) u8 {
+    return @intFromFloat(@min(@max(x + p.offset, 0), 255));
+}
+fn widen(x: f32, p: Params) f64 {
+    return @as(f64, x) * 1.5 + p.offset;
+}
+fn stripe(x: f32, i: u64, p: Params) f32 {
+    return x + @as(f32, @floatFromInt(i % 7)) * p.offset;
+}
+fn incByte(x: u8, _: Params) u8 {
+    return x +% 3;
+}
+fn scaleV4(x: @Vector(4, f32), p: Params) @Vector(4, f32) {
+    return x * @as(@Vector(4, f32), @splat(p.offset));
+}
+fn xorFold(a: u32, b: u32) u32 {
+    return a ^ b;
+}
+
+pub const x_sum_f32 = g.sum("x_sum_f32", f32, Params, .{});
+pub const x_max_i32 = g.max("x_max_i32", i32, Params, .{ .block_size = 100 });
+pub const x_xor_u32 = g.reduce("x_xor_u32", u32, Params, xorFold, 0, .{ .block_size = 64 });
+pub const x_zip_f32 = g.zip("x_zip_f32", f32, f32, f32, Params, axpy, .{});
+pub const x_to_u8 = g.mapTo("x_to_u8", f32, u8, Params, toByte, .{ .block_size = 64 });
+pub const x_widen = g.mapTo("x_widen", f32, f64, Params, widen, .{});
+pub const x_indexed = g.mapIndexed("x_indexed", f32, Params, stripe, .{ .block_size = 128 });
+pub const x_map_u8 = g.map("x_map_u8", u8, Params, incByte, .{});
+pub const x_map_v4 = g.map("x_map_v4", @Vector(4, f32), Params, scaleV4, .{});
+pub const x_gather = g.gather("x_gather", f32, u32, .{});
+pub const x_scatter = g.scatter("x_scatter", f32, u32, .{});

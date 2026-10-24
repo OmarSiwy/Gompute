@@ -22,14 +22,81 @@ const hipGraphNode_t = ?*anyopaque;
 const hipEvent_t = ?*anyopaque;
 
 const hipErrorNotReady: hipError_t = 600;
+const hipErrorPeerAccessAlreadyEnabled: hipError_t = 704;
 const hipErrorGraphExecUpdateFailure: hipError_t = 910;
 const hipStreamNonBlocking: c_uint = 1;
 const hipEventDisableTiming: c_uint = 2;
-/// `hipDeviceAttributeMultiprocessorCount` in ROCm 7.2's `hipDeviceAttribute_t`
-/// (clr 7.2.3), valid from HIP 6.0 (`hip_6`); older runtimes are not asked.
-const hipDeviceAttributeMultiprocessorCount: c_int = 63;
-/// `hipRuntimeGetVersion` of HIP 6.0 (major * 10,000,000 + minor * 100,000 + patch).
-const hip_6: c_int = 60_000_000;
+
+/// `hipDeviceProp_tR0600`: the device-properties layout ROCm 6.0 froze, and
+/// the one `hipGetDevicePropertiesR0600` fills, so a binary built against one
+/// header keeps working on later runtimes. It is also the only stable way to
+/// ask: `hipDeviceAttribute_t` was renumbered in ROCm 6.0, so an attribute
+/// number cannot be hardcoded across versions. Named up to the last field
+/// read; the runs nothing here reads are opaque padding. Measured against
+/// ROCm 7.2.3's `hip_runtime_api.h` on x86_64 Linux: 1472 bytes, 8-aligned,
+/// at the offsets the comptime block below pins.
+const DeviceProp = extern struct {
+    name: [256]u8,
+    uuid: [16]u8,
+    luid: [8]u8,
+    luidDeviceNodeMask: c_uint,
+    _pad0: [4]u8,
+    totalGlobalMem: usize,
+    sharedMemPerBlock: usize,
+    regsPerBlock: c_int,
+    warpSize: c_int,
+    memPitch: usize,
+    maxThreadsPerBlock: c_int,
+    maxThreadsDim: [3]c_int,
+    maxGridSize: [3]c_int,
+    /// kHz.
+    clockRate: c_int,
+    totalConstMem: usize,
+    major: c_int,
+    minor: c_int,
+    textureAlignment: usize,
+    texturePitchAlignment: usize,
+    deviceOverlap: c_int,
+    multiProcessorCount: c_int,
+    kernelExecTimeoutEnabled: c_int,
+    integrated: c_int,
+    canMapHostMemory: c_int,
+    computeMode: c_int,
+    _pad1: [176]u8,
+    pciBusID: c_int,
+    pciDeviceID: c_int,
+    pciDomainID: c_int,
+    _pad2: [8]u8,
+    unifiedAddressing: c_int,
+    /// kHz.
+    memoryClockRate: c_int,
+    /// Bits.
+    memoryBusWidth: c_int,
+    l2CacheSize: c_int,
+    _pad3: [4]u8,
+    maxThreadsPerMultiProcessor: c_int,
+    _pad4: [532]u8,
+    /// NUL-terminated, e.g. "gfx1100:sramecc+:xnack-".
+    gcnArchName: [256]u8,
+    _pad5: [56]u8,
+};
+
+comptime {
+    if (@sizeOf(DeviceProp) != 1472 or @alignOf(DeviceProp) != 8) @compileError("DeviceProp is not the 1472-byte, 8-aligned hipDeviceProp_tR0600");
+    for (.{
+        .{ "name", 0 },                 .{ "uuid", 256 },                        .{ "luid", 272 },
+        .{ "luidDeviceNodeMask", 280 }, .{ "totalGlobalMem", 288 },              .{ "sharedMemPerBlock", 296 },
+        .{ "regsPerBlock", 304 },       .{ "warpSize", 308 },                    .{ "memPitch", 312 },
+        .{ "maxThreadsPerBlock", 320 }, .{ "maxThreadsDim", 324 },               .{ "maxGridSize", 336 },
+        .{ "clockRate", 348 },          .{ "totalConstMem", 352 },               .{ "major", 360 },
+        .{ "minor", 364 },              .{ "textureAlignment", 368 },            .{ "texturePitchAlignment", 376 },
+        .{ "deviceOverlap", 384 },      .{ "multiProcessorCount", 388 },         .{ "kernelExecTimeoutEnabled", 392 },
+        .{ "integrated", 396 },         .{ "canMapHostMemory", 400 },            .{ "computeMode", 404 },
+        .{ "pciBusID", 584 },           .{ "pciDeviceID", 588 },                 .{ "pciDomainID", 592 },
+        .{ "unifiedAddressing", 604 },  .{ "memoryClockRate", 608 },             .{ "memoryBusWidth", 612 },
+        .{ "l2CacheSize", 616 },        .{ "maxThreadsPerMultiProcessor", 624 }, .{ "gcnArchName", 1160 },
+    }) |f| if (@offsetOf(DeviceProp, f[0]) != f[1]) @compileError("DeviceProp." ++ f[0] ++ " is not at its hipDeviceProp_tR0600 offset");
+}
 
 const Api = struct {
     lib: DynLib,
@@ -64,6 +131,12 @@ const Api = struct {
     hipStreamCreateWithFlags: *const fn (*hipStream_t, c_uint) callconv(.c) hipError_t,
     hipStreamQuery: *const fn (hipStream_t) callconv(.c) hipError_t,
     hipMemcpyDtoDAsync: *const fn (hipDeviceptr_t, hipDeviceptr_t, usize, hipStream_t) callconv(.c) hipError_t,
+    // Peer to peer (HIP 1.x): `Buffer.copyFrom` across devices and
+    // `Context.enablePeerAccess`. Device ids, where CUDA takes contexts.
+    hipDeviceCanAccessPeer: *const fn (*c_int, c_int, c_int) callconv(.c) hipError_t,
+    hipDeviceEnablePeerAccess: *const fn (c_int, c_uint) callconv(.c) hipError_t,
+    hipMemcpyPeer: *const fn (hipDeviceptr_t, c_int, hipDeviceptr_t, c_int, usize) callconv(.c) hipError_t,
+    hipMemcpyPeerAsync: *const fn (hipDeviceptr_t, c_int, hipDeviceptr_t, c_int, usize, hipStream_t) callconv(.c) hipError_t,
     // Graphs, optional so an older ROCm still runs plain launches
     // (`Context.hasGraphs`). The same shapes as cuda.zig's, down to
     // `hipGraphExecUpdate`'s error-node and result out-parameters.
@@ -84,9 +157,10 @@ const Api = struct {
     hipEventElapsedTime: ?*const fn (*f32, hipEvent_t, hipEvent_t) callconv(.c) hipError_t,
     hipEventDestroy: ?*const fn (hipEvent_t) callconv(.c) hipError_t,
     hipStreamWaitEvent: ?*const fn (hipStream_t, hipEvent_t, c_uint) callconv(.c) hipError_t,
-    // Device queries, optional (`Context.multiprocessorCount`).
-    hipDeviceGetAttribute: ?*const fn (*c_int, c_int, c_int) callconv(.c) hipError_t,
-    hipRuntimeGetVersion: ?*const fn (*c_int) callconv(.c) hipError_t,
+    // Device properties, optional: the versioned call is ROCm 6.0+
+    // (`Context.properties`), `hipDeviceComputeCapability` older than that.
+    hipGetDevicePropertiesR0600: ?*const fn (*DeviceProp, c_int) callconv(.c) hipError_t,
+    hipDeviceComputeCapability: ?*const fn (*c_int, *c_int, hipDevice_t) callconv(.c) hipError_t,
     // Device enumeration and identity, optional (`deviceCount`, `Context.info`).
     hipGetDeviceCount: ?*const fn (*c_int) callconv(.c) hipError_t,
     hipDeviceGetName: ?*const fn ([*]u8, c_int, hipDevice_t) callconv(.c) hipError_t,
@@ -151,7 +225,7 @@ fn loadApiLocked() Error!void {
     loaded = true;
 }
 
-/// Check hipError_t, stash raw code for #7 error detail.
+/// Check a hipError_t, recording the raw code for `lastDriverError`.
 inline fn check(rc: hipError_t, err: Error) Error!void {
     // Records on failure AND clears on success, same as cuda.zig: assigning
     // only on failure left lastDriverError() reporting a stale code
@@ -283,6 +357,19 @@ inline fn ensureCurrent() void {
     if (d >= 0) setCurrent(d) catch {};
 }
 
+/// The device of a live handle's ordinal, which the peer calls take where
+/// CUDA takes a context. No lock: a slot is written once, under `lock`, before
+/// any handle with that ordinal exists, and cleared only by `shutdown`.
+inline fn deviceOf(ordinal: c_int) hipDevice_t {
+    return ctx_slots[@intCast(ordinal)].device;
+}
+
+/// Two handles on different devices. Hand-built handles (ordinal -1) adopt the
+/// default device, so they never count as a second one.
+inline fn crossDevice(a: c_int, b: c_int) bool {
+    return a != b and a >= 0 and b >= 0;
+}
+
 const ModuleSlot = struct {
     ordinal: c_int = -1,
     image: []const u8 = &.{},
@@ -304,6 +391,14 @@ fn loadModuleCached(ordinal: c_int, image: []const u8) Error!Module {
     try check(g.hipModuleLoadData(&m, image.ptr), error.ModuleLoadFailed);
     module_list.append(std.heap.page_allocator, .{ .ordinal = ordinal, .image = image, .module = m }) catch return .{ .module = m, .cached = false, .ordinal = ordinal };
     return .{ .module = m, .cached = true, .ordinal = ordinal };
+}
+
+/// See `cuda.loadedModuleCount`: how many distinct (device, image) modules
+/// are currently loaded.
+pub fn loadedModuleCount() usize {
+    acquire();
+    defer lock.unlock();
+    return module_list.items.len;
 }
 
 /// Unload every cached module and release every retained context. Nothing calls
@@ -328,6 +423,61 @@ pub fn shutdown() void {
     real_count = -1;
 }
 
+/// A `c_int` the runtime documents as non-negative, as the `u32` DeviceInfo
+/// stores it; a negative one, which would be a runtime bug, clamps to 0
+/// instead of tripping `@intCast`.
+inline fn nonNeg(v: c_int) u32 {
+    return @intCast(@max(v, 0));
+}
+
+/// A gfx target as `parseGfx` reads it off a `gcnArchName`.
+const Gfx = struct { major: u32, minor: u8, stepping: u8 };
+
+/// The target in a `gcnArchName`: "gfx" + digits, then an optional ":feature"
+/// list. The last two digits are the hex minor and stepping and the rest is
+/// the decimal major, so "gfx90a:sramecc+:xnack-" is 9, 0, 0xa and "gfx1100"
+/// is 11, 0, 0. Stops at the first NUL too, so the struct's fixed-width field
+/// passes as is. Null when the name does not parse.
+fn parseGfx(name: []const u8) ?Gfx {
+    const end = std.mem.findAny(u8, name, &.{ ':', 0 }) orelse name.len;
+    const arch = name[0..end];
+    if (!std.mem.startsWith(u8, arch, "gfx") or arch.len < 6) return null;
+    const digits = arch[3..];
+    return .{
+        .major = std.fmt.parseInt(u32, digits[0 .. digits.len - 2], 10) catch return null,
+        .minor = std.fmt.charToDigit(digits[digits.len - 2], 16) catch return null,
+        .stepping = std.fmt.charToDigit(digits[digits.len - 1], 16) catch return null,
+    };
+}
+
+/// The vendor's peak vector FP32:FP64 ratio of a gfx family: 2 on the MI50
+/// and MI60 (gfx906), the MI100 (gfx908), the MI300 (gfx94x) and the MI350
+/// (gfx95x); 1 on the MI200 (gfx90a); 16 on every other Vega and on all of
+/// RDNA (gfx10 to gfx12). Null for a family outside the table, which is
+/// everything before Vega. Datasheet figures, unverified on hardware.
+fn ratioOf(major: u32, minor: u8, stepping: u8) ?u32 {
+    return switch (major) {
+        9 => switch (minor) {
+            0 => switch (stepping) {
+                6, 8 => 2,
+                0xa => 1,
+                else => 16,
+            },
+            4, 5 => 2,
+            else => 16,
+        },
+        10, 11, 12 => 16,
+        else => null,
+    };
+}
+
+/// `ratioOf` for a `gcnArchName`; null when the name does not parse or the
+/// family is outside the table.
+fn archRatio(name: []const u8) ?u32 {
+    const gfx = parseGfx(name) orelse return null;
+    return ratioOf(gfx.major, gfx.minor, gfx.stepping);
+}
+
 /// One device. Cheap to copy; the expensive part -- the retained primary context
 /// -- is process-wide and shared. Every method makes this device's context
 /// current on the calling thread first, so a Context is usable from any thread.
@@ -336,7 +486,7 @@ pub const Context = struct {
     ctx: hipCtx_t = null,
     ordinal: c_int = 0,
 
-    /// (#3) Retains the device's primary context rather than creating a private
+    /// Retains the device's primary context rather than creating a private
     /// one, so buffers allocated through one handle are valid in all the others.
     pub fn init(ordinal: c_int) Error!Context {
         const slot = try retainPrimary(ordinal);
@@ -344,7 +494,7 @@ pub const Context = struct {
         try self.makeCurrent();
         return self;
     }
-    /// (#3) Releases this handle only. The context is shared and stays retained
+    /// Releases this handle only. The context is shared and stays retained
     /// for the process; use `shutdown()` for real teardown. Safe to repeat.
     pub fn deinit(self: *Context) void {
         self.* = .{};
@@ -390,7 +540,7 @@ pub const Context = struct {
         self.makeCurrent() catch return;
         _ = g.hipHostFree(mem.ptr);
     }
-    /// (#3) Cached per (device, image): JITs once per process, not per handle.
+    /// Cached per (device, image): JITs once per process, not per handle.
     pub fn loadModuleFromMemory(self: *Context, image: []const u8) Error!Module {
         try self.makeCurrent();
         return loadModuleCached(self.ordinal, image);
@@ -408,59 +558,106 @@ pub const Context = struct {
         _ = self;
         return present(&event_fns);
     }
-    /// See `cuda.Context.fp64Ratio`. Always `error.Unsupported` for now.
-    ///
-    /// ponytail: HIP has no stable way to ask. The CUDA-compat attribute is not
-    /// implemented on AMD, `hipDeviceAttribute_t` values moved between ROCm 5
-    /// and 6, and the gfx name lives in `hipDeviceProp_t`, whose layout moved
-    /// too (`hipGetDevicePropertiesR0600`). Map the gfx name to a ratio once
-    /// someone has a ROCm box to check the layout on.
+    /// See `cuda.Context.fp64Ratio`: 16 on an RX 7900 XTX (gfx1100), 2 on an
+    /// MI300X (gfx942), 1 on an MI250X (gfx90a). HIP has no attribute for it,
+    /// so this is `ratioOf` applied to the device's `gcnArchName`: the
+    /// vendor's datasheet figure, not a measurement. `error.Unsupported`
+    /// before ROCm 6.0 and for a gfx family the table does not know.
     pub fn fp64Ratio(self: *Context) Error!u32 {
-        _ = self;
-        return error.Unsupported;
+        try self.makeCurrent();
+        const p = try self.properties();
+        return archRatio(&p.gcnArchName) orelse error.Unsupported;
+    }
+    /// See `cuda.Context.computeCapability`, except that on HIP it is the gfx
+    /// major and minor: 110 on a gfx1100, 94 on a gfx942, a number no `sm_`
+    /// target shares. `error.Unsupported` on a runtime with neither
+    /// `hipDeviceComputeCapability` nor the ROCm 6.0 properties call.
+    pub fn computeCapability(self: *Context) Error!u32 {
+        try self.makeCurrent();
+        var major: c_int = 0;
+        var minor: c_int = 0;
+        if (g.hipDeviceComputeCapability) |get| {
+            try check(get(&major, &minor, self.device), error.InvalidArgument);
+        } else {
+            const p = try self.properties();
+            major = p.major;
+            minor = p.minor;
+        }
+        return nonNeg(major * 10 + minor);
+    }
+    /// See `cuda.Context.canAccessPeer`. False for the same device, which
+    /// includes a `GOMPUTE_FAKE_DEVICES` context.
+    pub fn canAccessPeer(self: *const Context, peer: *const Context) Error!bool {
+        var v: c_int = 0;
+        try check(g.hipDeviceCanAccessPeer(&v, self.device, peer.device), error.InvalidArgument);
+        return v != 0;
+    }
+    /// See `cuda.Context.enablePeerAccess`. HIP grants it to the *current*
+    /// device, so `self` is made current first. `error.Unsupported` when
+    /// `canAccessPeer` is false, asked here because the runtime reports that
+    /// case as an invalid device, not as unsupported; cross-device copies
+    /// still work, staged through the host.
+    pub fn enablePeerAccess(self: *Context, peer: *const Context) Error!void {
+        try self.makeCurrent();
+        if (!try self.canAccessPeer(peer)) return error.Unsupported;
+        const rc = g.hipDeviceEnablePeerAccess(peer.device, 0);
+        if (rc == hipErrorPeerAccessAlreadyEnabled) return iface.recordDriverResult(.hip, 0);
+        try check(rc, error.ContextFailed);
     }
     /// See `cuda.Context.multiprocessorCount`: compute units on AMD (96 on a
-    /// gfx1100 RX 7900 XTX). `error.Unsupported` before HIP 6.0.
-    /// ponytail: the attribute value is ROCm 7.2's, unchecked against ROCm 5
-    /// (the enum moved, see `fp64Ratio`), so pre-6.0 runtimes are not asked.
+    /// gfx1100 RX 7900 XTX), or WGPs, half as many, when the device runs in
+    /// WGP mode. `error.Unsupported` before ROCm 6.0.
     pub fn multiprocessorCount(self: *Context) Error!u32 {
-        const get = g.hipDeviceGetAttribute orelse return error.Unsupported;
-        const version = g.hipRuntimeGetVersion orelse return error.Unsupported;
-        var rt: c_int = 0;
-        try check(version(&rt), error.Unsupported);
-        if (rt < hip_6) return error.Unsupported;
         try self.makeCurrent();
-        var v: c_int = 0;
-        try check(get(&v, hipDeviceAttributeMultiprocessorCount, self.ordinal), error.InvalidArgument);
-        return @intCast(v);
+        return nonNeg((try self.properties()).multiProcessorCount);
     }
-    /// See `cuda.Context.info`. Name, uuid, PCI address and memory where the
-    /// runtime exports them, compute units from `multiprocessorCount`.
-    /// ponytail: the clocks, the compute capability and the FP64 ratio stay 0:
-    /// `hipDeviceAttribute_t` numbering moved between ROCm 5 and 6 (see
-    /// `fp64Ratio`). Fill them once someone has a ROCm box to check on.
+    /// `hipGetDevicePropertiesR0600` for this device, zero-filled first so a
+    /// field the runtime leaves alone reads as 0. `error.Unsupported` before
+    /// ROCm 6.0, which does not export the versioned call.
+    fn properties(self: *const Context) Error!DeviceProp {
+        const get = g.hipGetDevicePropertiesR0600 orelse return error.Unsupported;
+        var p = std.mem.zeroes(DeviceProp);
+        try check(get(&p, self.device), error.InvalidArgument);
+        return p;
+    }
+    /// See `cuda.Context.info`. Everything is read off `properties` on ROCm
+    /// 6.0 and later. Before that, the calls that predate the frozen layout
+    /// still fill the name, uuid, PCI address and memory, and the rest is 0.
     pub fn info(self: *Context) Error!iface.DeviceInfo {
         try self.makeCurrent();
         var d: iface.DeviceInfo = .{ .ordinal = self.ordinal };
-        if (g.hipDeviceGetName) |get| {
-            try check(get(&d.name_buf, d.name_buf.len, self.device), error.InvalidArgument);
-            d.name_len = std.mem.indexOfScalar(u8, &d.name_buf, 0) orelse d.name_buf.len;
+        if (self.properties()) |p| {
+            d.name_buf = p.name;
+            d.uuid = p.uuid;
+            d.pci_domain = nonNeg(p.pciDomainID);
+            d.pci_bus = nonNeg(p.pciBusID);
+            d.pci_device = nonNeg(p.pciDeviceID);
+            d.compute_capability = nonNeg(p.major * 10 + p.minor);
+            d.sms = nonNeg(p.multiProcessorCount);
+            d.fp64_ratio = archRatio(&p.gcnArchName) orelse 0;
+            d.clock_khz = nonNeg(p.clockRate);
+            d.mem_clock_khz = nonNeg(p.memoryClockRate);
+            d.bus_width_bits = nonNeg(p.memoryBusWidth);
+            d.mem_total = p.totalGlobalMem;
+        } else |err| {
+            if (err != error.Unsupported) return err;
+            if (g.hipDeviceGetName) |get| try check(get(&d.name_buf, d.name_buf.len, self.device), error.InvalidArgument);
+            if (g.hipDeviceGetPCIBusId) |get| {
+                // "dddd:bb:dd.f", hexadecimal.
+                var buf: [32]u8 = @splat(0);
+                try check(get(&buf, buf.len, self.device), error.InvalidArgument);
+                var it = std.mem.tokenizeAny(u8, std.mem.sliceTo(&buf, 0), ":.");
+                for ([_]*u32{ &d.pci_domain, &d.pci_bus, &d.pci_device }) |field|
+                    field.* = std.fmt.parseInt(u32, it.next() orelse break, 16) catch 0;
+            }
+            if (g.hipDeviceTotalMem) |get| {
+                var total: usize = 0;
+                try check(get(&total, self.device), error.InvalidArgument);
+                d.mem_total = total;
+            }
         }
+        d.name_len = std.mem.findScalar(u8, &d.name_buf, 0) orelse d.name_buf.len;
         if (g.hipDeviceGetUuid) |get| try check(get(&d.uuid, self.device), error.InvalidArgument);
-        if (g.hipDeviceGetPCIBusId) |get| {
-            // "dddd:bb:dd.f", hexadecimal.
-            var buf: [32]u8 = @splat(0);
-            try check(get(&buf, buf.len, self.device), error.InvalidArgument);
-            var it = std.mem.tokenizeAny(u8, std.mem.sliceTo(&buf, 0), ":.");
-            for ([_]*u32{ &d.pci_domain, &d.pci_bus, &d.pci_device }) |field|
-                field.* = std.fmt.parseInt(u32, it.next() orelse break, 16) catch 0;
-        }
-        d.sms = self.multiprocessorCount() catch 0;
-        if (g.hipDeviceTotalMem) |get| {
-            var total: usize = 0;
-            try check(get(&total, self.device), error.InvalidArgument);
-            d.mem_total = total;
-        }
         if (g.hipMemGetInfo) |get| {
             var free: usize = 0;
             var total: usize = 0;
@@ -543,14 +740,26 @@ pub const Buffer = struct {
     pub fn argPtr(self: *Buffer) iface.Arg {
         return @ptrCast(&self.handle);
     }
+    /// Device-to-device copy of `n` bytes. Across two devices it is a peer
+    /// copy: direct when `Context.enablePeerAccess` was granted, staged by
+    /// the runtime otherwise. Either way it is `n` bytes in and `n` bytes
+    /// out, never a host round trip of the caller's.
     pub fn copyFrom(self: *Buffer, src: *const Buffer, src_offset: usize, dst_offset: usize, n: usize) Error!void {
         use(self.ordinal);
-        try check(g.hipMemcpyDtoD(try self.offsetPtr(dst_offset), try src.offsetPtr(src_offset), n), error.CopyFailed);
+        const dst = try self.offsetPtr(dst_offset);
+        const from = try src.offsetPtr(src_offset);
+        if (crossDevice(self.ordinal, src.ordinal))
+            return check(g.hipMemcpyPeer(dst, deviceOf(self.ordinal), from, deviceOf(src.ordinal), n), error.CopyFailed);
+        try check(g.hipMemcpyDtoD(dst, from, n), error.CopyFailed);
     }
     /// `copyFrom`, enqueued on `stream` and not waited on. Legal under capture.
     pub fn copyFromAsync(self: *Buffer, src: *const Buffer, src_offset: usize, dst_offset: usize, n: usize, stream: *Stream) Error!void {
         use(self.ordinal);
-        try check(g.hipMemcpyDtoDAsync(try self.offsetPtr(dst_offset), try src.offsetPtr(src_offset), n, stream.stream), error.CopyFailed);
+        const dst = try self.offsetPtr(dst_offset);
+        const from = try src.offsetPtr(src_offset);
+        if (crossDevice(self.ordinal, src.ordinal))
+            return check(g.hipMemcpyPeerAsync(dst, deviceOf(self.ordinal), from, deviceOf(src.ordinal), n, stream.stream), error.CopyFailed);
+        try check(g.hipMemcpyDtoDAsync(dst, from, n, stream.stream), error.CopyFailed);
     }
     pub fn downloadAt(self: *Buffer, host: *anyopaque, offset: usize, n: usize) Error!void {
         use(self.ordinal);
@@ -594,7 +803,7 @@ pub const Module = struct {
         try check(g.hipModuleGetFunction(&k.func, self.module, name), error.KernelNotFound);
         return k;
     }
-    /// (#3) Drops this handle. A cached module stays loaded for the process;
+    /// Drops this handle. A cached module stays loaded for the process;
     /// `shutdown()` unloads it.
     pub fn deinit(self: *Module) void {
         if (!self.cached and self.module != null) {
@@ -773,6 +982,11 @@ test "a handle-less Buffer errors instead of panicking, and free is idempotent" 
     try std.testing.expectError(error.InvalidArgument, buffer.uploadAtAsync(&byte, 4, 1, &stream));
     try std.testing.expectError(error.InvalidArgument, buffer.downloadAtAsync(&byte, 4, 1, &stream));
     try std.testing.expectError(error.InvalidArgument, buffer.fillAsync(0, 1, &stream));
+    // Two hand-built buffers share the default device (ordinal -1 on both),
+    // so this is the DtoD path, and it fails on the null handle before any
+    // peer or copy call could be reached.
+    const other: Buffer = .{};
+    try std.testing.expectError(error.InvalidArgument, buffer.copyFromAsync(&other, 0, 0, 1, &stream));
     buffer.free();
     buffer.free();
     // And the same again for the Stream, which used to reach hipStreamDestroy
@@ -803,7 +1017,7 @@ test "the graph and event surface matches cuda.zig's, and handle-less deinit is 
         .{ Stream, cuda.Stream }, .{ Buffer, cuda.Buffer },       .{ Context, cuda.Context },
     }) |pair| {
         std.testing.refAllDecls(pair[0]);
-        inline for (.{ "instantiate", "launch", "update", "record", "synchronize", "query", "elapsedUs", "waitEvent", "beginCapture", "endCapture", "isCapturing", "copyFromAsync", "createStreamNonBlocking", "createEvent" }) |name| {
+        inline for (.{ "instantiate", "launch", "update", "record", "synchronize", "query", "elapsedUs", "waitEvent", "beginCapture", "endCapture", "isCapturing", "copyFrom", "copyFromAsync", "createStreamNonBlocking", "createEvent", "canAccessPeer", "enablePeerAccess", "computeCapability", "fp64Ratio", "multiprocessorCount", "info" }) |name| {
             if (@hasDecl(pair[1], name)) try std.testing.expectEqual(
                 @typeInfo(@TypeOf(@field(pair[1], name))).@"fn".param_types.len,
                 @typeInfo(@TypeOf(@field(pair[0], name))).@"fn".param_types.len,
@@ -811,6 +1025,8 @@ test "the graph and event surface matches cuda.zig's, and handle-less deinit is 
         }
     }
     try std.testing.expect(CaptureMode == cuda.CaptureMode);
+    // Nothing in this suite loads a HIP module, so the cache is empty.
+    try std.testing.expectEqual(@as(usize, 0), loadedModuleCount());
     if (loaded) return;
     var graph: Graph = .{};
     graph.deinit();
@@ -818,4 +1034,35 @@ test "the graph and event surface matches cuda.zig's, and handle-less deinit is 
     exec.deinit();
     var event: Event = .{};
     event.deinit();
+    // The device queries make the context current before they read `g`, so
+    // without a runtime they fail at the dlopen and never touch it undefined.
+    var ctx: Context = .{};
+    try std.testing.expectError(error.InitFailed, ctx.computeCapability());
+    try std.testing.expectError(error.InitFailed, ctx.fp64Ratio());
+    try std.testing.expectError(error.InitFailed, ctx.multiprocessorCount());
+    try std.testing.expectError(error.InitFailed, ctx.info());
+    try std.testing.expectError(error.InitFailed, ctx.enablePeerAccess(&ctx));
+}
+
+test "the gfx family in a gcnArchName maps to the vendor's FP64 ratio" {
+    try std.testing.expectEqual(Gfx{ .major = 9, .minor = 0, .stepping = 6 }, parseGfx("gfx906").?);
+    try std.testing.expectEqual(Gfx{ .major = 9, .minor = 0, .stepping = 0xa }, parseGfx("gfx90a").?);
+    try std.testing.expectEqual(Gfx{ .major = 9, .minor = 4, .stepping = 2 }, parseGfx("gfx942").?);
+    try std.testing.expectEqual(Gfx{ .major = 11, .minor = 0, .stepping = 0 }, parseGfx("gfx1100:sramecc+:xnack-").?);
+    try std.testing.expectEqual(Gfx{ .major = 12, .minor = 0, .stepping = 1 }, parseGfx("gfx1201").?);
+    try std.testing.expectEqual(@as(?Gfx, null), parseGfx(""));
+    try std.testing.expectEqual(@as(?Gfx, null), parseGfx("gfx"));
+    try std.testing.expectEqual(@as(?Gfx, null), parseGfx("gfx9-generic"));
+
+    for ([_]struct { []const u8, ?u32 }{
+        .{ "gfx906", 2 },    .{ "gfx908", 2 },   .{ "gfx90a", 1 },                   .{ "gfx942", 2 },
+        .{ "gfx950", 2 },    .{ "gfx900", 16 },  .{ "gfx90c", 16 },                  .{ "gfx1030", 16 },
+        .{ "gfx1100", 16 },  .{ "gfx1201", 16 }, .{ "gfx1100:sramecc+:xnack-", 16 }, .{ "gfx803", null },
+        .{ "gfx000", null }, .{ "", null },
+    }) |case| try std.testing.expectEqual(case[1], archRatio(case[0]));
+
+    // The real input: the struct's NUL-padded field, passed whole.
+    var arch: [256]u8 = @splat(0);
+    @memcpy(arch[0..6], "gfx906");
+    try std.testing.expectEqual(@as(?u32, 2), archRatio(&arch));
 }

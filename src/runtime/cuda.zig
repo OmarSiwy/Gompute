@@ -21,7 +21,9 @@ const CUgraphExec = ?*anyopaque;
 const CUgraphNode = ?*anyopaque;
 const CUevent = ?*anyopaque;
 
+const CUDA_ERROR_PEER_ACCESS_UNSUPPORTED: CUresult = 217;
 const CUDA_ERROR_NOT_READY: CUresult = 600;
+const CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED: CUresult = 704;
 const CUDA_ERROR_GRAPH_EXEC_UPDATE_FAILURE: CUresult = 910;
 const CU_STREAM_NON_BLOCKING: c_uint = 1;
 const CU_EVENT_DISABLE_TIMING: c_uint = 2;
@@ -80,6 +82,12 @@ const Api = struct {
     cuStreamSynchronize: *const fn (CUstream) callconv(.c) CUresult,
     cuStreamQuery: *const fn (CUstream) callconv(.c) CUresult,
     cuMemcpyDtoDAsync_v2: *const fn (CUdeviceptr, CUdeviceptr, usize, CUstream) callconv(.c) CUresult,
+    // Peer to peer (CUDA 4.0): `Buffer.copyFrom` across devices and
+    // `Context.enablePeerAccess`.
+    cuDeviceCanAccessPeer: *const fn (*c_int, CUdevice, CUdevice) callconv(.c) CUresult,
+    cuCtxEnablePeerAccess: *const fn (CUcontext, c_uint) callconv(.c) CUresult,
+    cuMemcpyPeer: *const fn (CUdeviceptr, CUcontext, CUdeviceptr, CUcontext, usize) callconv(.c) CUresult,
+    cuMemcpyPeerAsync: *const fn (CUdeviceptr, CUcontext, CUdeviceptr, CUcontext, usize, CUstream) callconv(.c) CUresult,
     // Graphs, optional: `cuGraphInstantiateWithFlags` needs driver 11.4, and an
     // older one must still run plain launches (`Context.hasGraphs`).
     // `cuStreamBeginCapture` is `_v2` in cuda.h since 10.1 (the mode
@@ -314,6 +322,19 @@ inline fn ensureCurrent() void {
     if (d >= 0) setCurrent(d) catch {};
 }
 
+/// The retained context of a device a live handle names. No lock: a slot is
+/// written once, under `lock`, before any handle with that ordinal exists, and
+/// cleared only by `shutdown`.
+inline fn ctxOf(ordinal: c_int) CUcontext {
+    return ctx_slots[@intCast(ordinal)].ctx;
+}
+
+/// Two handles on different devices. Hand-built handles (ordinal -1) adopt the
+/// default device, so they never count as a second one.
+inline fn crossDevice(a: c_int, b: c_int) bool {
+    return a != b and a >= 0 and b >= 0;
+}
+
 const ModuleSlot = struct {
     ordinal: c_int = -1,
     image: []const u8 = &.{},
@@ -352,8 +373,7 @@ fn loadModuleCached(ordinal: c_int, image: [:0]const u8) Error!Module {
 ///
 /// With one artifact per kernel root, this is the count of roots this process
 /// has actually paid to compile -- the thing a consumer with 37 device models
-/// wants to stay at 1. ponytail: CUDA only; add the HIP twin when someone has
-/// the hardware to check it on.
+/// wants to stay at 1.
 pub fn loadedModuleCount() usize {
     acquire();
     defer lock.unlock();
@@ -383,7 +403,7 @@ pub fn shutdown() void {
     default_ordinal.store(-1, .monotonic);
 }
 
-/// Check CUresult, stash raw code for #7 error detail.
+/// Check a CUresult, recording the raw code for `lastDriverError`.
 inline fn check(rc: CUresult, err: Error) Error!void {
     // Records on failure AND clears on success -- assigning only on failure left
     // lastDriverError() reporting a stale code indefinitely, so a caller could
@@ -413,9 +433,9 @@ pub const Context = struct {
     ctx: CUcontext = null,
     ordinal: c_int = 0,
 
-    /// (#6) Init with any device ordinal, not just 0.
+    /// Init with any device ordinal, not just 0.
     ///
-    /// (#3) Retains the device's *primary* context rather than creating a
+    /// Retains the device's *primary* context rather than creating a
     /// private one, so every handle on a device shares it and buffers allocated
     /// through one are valid in all the others. Also makes it current on the
     /// calling thread.
@@ -426,7 +446,7 @@ pub const Context = struct {
         return self;
     }
 
-    /// (#3) Releases this handle only. The primary context is shared and stays
+    /// Releases this handle only. The primary context is shared and stays
     /// retained for the process; use `shutdown()` for real teardown. Safe to
     /// call any number of times.
     pub fn deinit(self: *Context) void {
@@ -475,6 +495,31 @@ pub const Context = struct {
         try check(g.cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, self.device), error.InvalidArgument);
         try check(g.cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, self.device), error.InvalidArgument);
         return @intCast(major * 10 + minor);
+    }
+
+    /// Whether this device can read and write `peer`'s memory over a direct
+    /// link (NVLink or PCIe P2P). False for the same device, which includes a
+    /// `GOMPUTE_FAKE_DEVICES` context.
+    pub fn canAccessPeer(self: *const Context, peer: *const Context) Error!bool {
+        var v: c_int = 0;
+        try check(g.cuDeviceCanAccessPeer(&v, self.device, peer.device), error.InvalidArgument);
+        return v != 0;
+    }
+
+    /// Let kernels on this device dereference `peer`'s buffers, and route a
+    /// `copyFrom` between the two over the direct link instead of through
+    /// host memory. One direction; call it both ways for both. Idempotent.
+    /// `error.Unsupported` when `canAccessPeer` is false: cross-device copies
+    /// still work, the driver stages them through the host.
+    pub fn enablePeerAccess(self: *Context, peer: *const Context) Error!void {
+        try self.makeCurrent();
+        const rc = g.cuCtxEnablePeerAccess(peer.ctx, 0);
+        if (rc == CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED) return iface.recordDriverResult(.cuda, 0);
+        if (rc == CUDA_ERROR_PEER_ACCESS_UNSUPPORTED) {
+            iface.recordDriverResult(.cuda, rc);
+            return error.Unsupported;
+        }
+        try check(rc, error.ContextFailed);
     }
 
     /// How many streaming multiprocessors the device has: 24 on an RTX 4060
@@ -580,7 +625,7 @@ pub const Context = struct {
         self.makeCurrent() catch return;
         _ = g.cuMemFreeHost(mem.ptr);
     }
-    /// (#3) Cached per (device, image): the artifact holds every kernel, so this
+    /// Cached per (device, image): the artifact holds every kernel, so this
     /// JITs once per process instead of once per handle.
     pub fn loadModuleFromMemory(self: *Context, image: [:0]const u8) Error!Module {
         try self.makeCurrent();
@@ -646,14 +691,26 @@ pub const Buffer = struct {
     pub fn argPtr(self: *Buffer) iface.Arg {
         return @ptrCast(&self.handle);
     }
+    /// Device-to-device copy of `n` bytes. Across two devices it is a peer
+    /// copy: direct when `Context.enablePeerAccess` was granted, staged by
+    /// the driver otherwise. Either way it is `n` bytes in and `n` bytes out,
+    /// never a host round trip of the caller's.
     pub fn copyFrom(self: *Buffer, src: *const Buffer, src_offset: usize, dst_offset: usize, n: usize) Error!void {
         use(self.ordinal);
-        try check(g.cuMemcpyDtoD_v2(try self.offsetPtr(dst_offset), try src.offsetPtr(src_offset), n), error.CopyFailed);
+        const dst = try self.offsetPtr(dst_offset);
+        const from = try src.offsetPtr(src_offset);
+        if (crossDevice(self.ordinal, src.ordinal))
+            return check(g.cuMemcpyPeer(dst, ctxOf(self.ordinal), from, ctxOf(src.ordinal), n), error.CopyFailed);
+        try check(g.cuMemcpyDtoD_v2(dst, from, n), error.CopyFailed);
     }
     /// `copyFrom`, enqueued on `stream` and not waited on. Legal under capture.
     pub fn copyFromAsync(self: *Buffer, src: *const Buffer, src_offset: usize, dst_offset: usize, n: usize, stream: *Stream) Error!void {
         use(self.ordinal);
-        try check(g.cuMemcpyDtoDAsync_v2(try self.offsetPtr(dst_offset), try src.offsetPtr(src_offset), n, stream.stream), error.CopyFailed);
+        const dst = try self.offsetPtr(dst_offset);
+        const from = try src.offsetPtr(src_offset);
+        if (crossDevice(self.ordinal, src.ordinal))
+            return check(g.cuMemcpyPeerAsync(dst, ctxOf(self.ordinal), from, ctxOf(src.ordinal), n, stream.stream), error.CopyFailed);
+        try check(g.cuMemcpyDtoDAsync_v2(dst, from, n, stream.stream), error.CopyFailed);
     }
     /// Enqueued on `stream` and not waited on; `host` must be `allocPinned`
     /// memory and must stay put until `stream.synchronize()` returns.
@@ -695,7 +752,7 @@ pub const Module = struct {
         try check(g.cuModuleGetFunction(&k.func, self.module, name), error.KernelNotFound);
         return k;
     }
-    /// (#3) Drops this handle. A cached module is shared with every other handle
+    /// Drops this handle. A cached module is shared with every other handle
     /// on the device and stays loaded for the process; `shutdown()` unloads it.
     pub fn deinit(self: *Module) void {
         if (!self.cached and self.module != null) {
@@ -1169,9 +1226,20 @@ test "a fake second device is its own context on device 0" {
     // A kernel of context 0 on a stream of context 1 fails, as across cards.
     try std.testing.expectError(error.LaunchFailed, k0.launchOnStream(.{ .x = 1 }, .{ .x = n }, 0, &.{ b1.argPtr(), iface.arg(&len) }, s1.stream));
     try s1.synchronize();
-    // Copies cross contexts (unified addressing), as across cards.
+    // A copy between two ordinals is a peer copy (cuMemcpyPeer with both
+    // contexts), which is what two cards take too.
     try b0.copyFrom(&b1, 0, 0, n * 4);
     var host: [256]u32 = undefined;
     try b0.download(&host, n * 4);
     for (host) |v| try std.testing.expectEqual(@as(u32, 1), v);
+    // And back the other way, stream-ordered.
+    try b1.fillAsync(0, n * 4, &s1);
+    try b1.copyFromAsync(&b0, 0, 0, n * 4, &s1);
+    try s1.synchronize();
+    try b1.download(&host, n * 4);
+    for (host) |v| try std.testing.expectEqual(@as(u32, 1), v);
+    // Two contexts on one device have no direct link to enable; the copies
+    // above worked without one.
+    try std.testing.expect(!try ctx0.canAccessPeer(&ctx1));
+    try std.testing.expectError(error.Unsupported, ctx0.enablePeerAccess(&ctx1));
 }

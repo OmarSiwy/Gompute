@@ -1,7 +1,8 @@
 # Guide
 
-Gompute is a Zig **0.17.0** library for defining a one-dimensional GPU/CPU
-kernel once and specializing the whole abstraction at compile time.
+Gompute is a Zig library for defining a one-dimensional GPU/CPU kernel once and
+specializing the whole abstraction at compile time. It pins one Zig build,
+0.18.0-dev.349+d924f83bf at the moment; see [Versions](reference.html#versions).
 
 ## Dependencies
 

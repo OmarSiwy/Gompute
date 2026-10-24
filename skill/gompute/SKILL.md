@@ -1,6 +1,6 @@
 ---
 name: gompute
-description: Write, build and launch one-dimensional GPU/CPU kernels with the Gompute Zig 0.17 library. Use when a Zig project imports `gompute`, when the user wants to run a map/zip/reduce/gather/scatter over a slice on CUDA, HIP or the CPU from one source, wire `emitKernels` into build.zig, hoist allocations out of `run`, capture launches into a CUDA/HIP graph, write a raw device kernel, or choose between `Kernel`, `AutoKernel`, `RawKernel` and `g.runtime`. Also use when deciding what a Gompute feature costs at run time.
+description: Write, build and launch one-dimensional GPU/CPU kernels with the Gompute Zig library. Use when a Zig project imports `gompute`, when the user wants to run a map/zip/reduce/gather/scatter over a slice on CUDA, HIP or the CPU from one source, wire `emitKernels` into build.zig, hoist allocations out of `run`, capture launches into a CUDA/HIP graph, write a raw device kernel, or choose between `Kernel`, `AutoKernel`, `RawKernel` and `g.runtime`. Also use when deciding what a Gompute feature costs at run time.
 ---
 
 # Gompute
@@ -11,8 +11,9 @@ point, all from the same source file. The backend is part of the type, so
 `Kernel(spec, .cpu)` compiles to the loop you would have written yourself;
 `zig build test` checks that against the emitted assembly.
 
-Pinned to **Zig 0.17.0**. GPU backends work on Linux only (macOS compiles them,
-but there is no driver). Windows and wasm are CPU-only.
+Pinned to **Zig 0.18.0-dev.349+d924f83bf** (Zig master; the pin moves with
+`build.zig.zon`). GPU backends work on Linux and Windows (macOS compiles them,
+but there is no driver). wasm is CPU-only.
 
 ## Pick the right layer
 
@@ -84,22 +85,25 @@ every kernel root.
 
 | Constructor | `run` arguments | CPU path |
 | --- | --- | --- |
-| `g.map(name, T, P, f, o)` | `(data: []T, p)`, in place | SIMD if `f` takes `anytype`, else scalar |
-| `g.mapFn(name, f, o)` | same; `T` and `P` read off `f` | same (concrete `f` only) |
-| `g.mapTo(name, In, Out, P, f, o)` | `(in: []const In, out: []Out, p)` | SIMD if `f` takes `anytype`, else scalar |
-| `g.zip(name, A, B, Out, P, f, o)` | `(a, b, out, p)`, all the same length | SIMD if `f` takes `anytype`, else scalar |
-| `g.mapIndexed(name, T, P, f, o)` | `(data: []T, p)`; `f(x, i: u64, p)` | SIMD if `f` takes `anytype` (`i` is then a vector of indices), else scalar |
+| `g.map(name, T, P, f, o)` | `(data: []T, p)`, in place | explicit SIMD if `f` takes `anytype`, else a plain loop LLVM auto-vectorizes |
+| `g.mapFn(name, f, o)` | same; `T` and `P` read off `f` | a plain loop (concrete `f` only) |
+| `g.mapTo(name, In, Out, P, f, o)` | `(in: []const In, out: []Out, p)` | explicit SIMD if `f` takes `anytype`, else a plain loop |
+| `g.zip(name, A, B, Out, P, f, o)` | `(a, b, out, p)`, all the same length | explicit SIMD if `f` takes `anytype`, else a plain loop |
+| `g.mapIndexed(name, T, P, f, o)` | `(data: []T, p)`; `f(x, i: u64, p)` | explicit SIMD if `f` takes `anytype` (`i` is then a vector of indices), else a plain loop |
 | `g.reduce(name, T, P, combine, identity, o)` | `(data: []const T, p) !T` | scalar fold |
 | `g.sum` `g.min` `g.max` `g.any` `g.all` `(name, T, P, o)` | `(data, p) !T` | 4-register vector accumulator, one `@reduce` at the end |
 | `g.gather(name, T, Idx, o)` | `(src, idx, out)`: `out[i] = src[idx[i]]` | scalar, bounds-skipping |
 | `g.scatter(name, T, Idx, o)` | `(src, idx, out)`: `out[idx[i]] = src[i]` | scalar, bounds-skipping |
 
-"Scalar" means scalar machine code. **Zig 0.16 and 0.17 ship LLVM's loop vectorizer
-disabled**, so a plain loop over a concrete `fn (f32, P) f32` is `vaddss`, one
-element at a time, even at `ReleaseFast -mcpu=native`. A generic (`anytype`)
-body is the only way to get SIMD on the CPU. When a generic `mapTo`/`zip`
-body's result type differs from its input's, name it with
-`g.Lanes(@TypeOf(x), Out)`.
+"Explicit SIMD" is a `@Vector` loop at `std.simd.suggestVectorLength(T)`
+lanes that the library writes out. A concrete body is a plain loop, which
+Zig 0.18's LLVM auto-vectorizes where it can prove the loop (the codegen
+probe's concrete `map` is a 4x-unrolled AVX2 loop at `-Dcpu=native`; on 0.17
+the vectorizer was off and it was one element per instruction). The generic
+form is still what gives `g.math` its lane-exact vector bodies, which
+table-driven code never gets from the auto-vectorizer, and a width that does
+not depend on the optimizer. When a generic `mapTo`/`zip` body's result type
+differs from its input's, name it with `g.Lanes(@TypeOf(x), Out)`.
 
 The rules you can't see from the signatures:
 
@@ -134,10 +138,14 @@ loop and one kernel.
 
 ## Writing kernels that are fast on both sides
 
-1. **Make every elementwise body generic** (`x: anytype`, `g.splat` for
-   scalars), whether it's a `map`, `mapTo`, `zip` or `mapIndexed`. A concrete
-   function is correct but scalar on the CPU: measured, generic `zip` is 2.8×
-   faster and a generic `mapTo` calling `exp` is 2.45× faster.
+1. **Make a body generic when it calls `g.math`** (`x: anytype`, `g.splat`
+   for scalars): that is the only way the transcendentals run at vector width
+   (a generic `mapTo` calling `exp` measured 2.45× faster than the concrete
+   one on Zig 0.17.0). A plain arithmetic body stays concrete: Zig 0.18's
+   loop vectorizer widens and unrolls it, and it measured faster than the
+   generic form (scale-relu `map` 0.044 against 0.066 ns per element at 256K
+   elements; `zip` equal). The 2.8× generic-vs-concrete `zip` gap was a 0.17
+   number, with the vectorizer off.
 2. **Prefer a preset over a custom `reduce`.** Presets get the vector
    accumulator (3.6× faster than per-chunk `@reduce` on 64K f32). A custom
    `combine` stays scalar on the CPU.
@@ -204,6 +212,35 @@ try kernel.stream.synchronize();
   (`kernel.context.allocPinned`).
 - `deinit` clears `kernel.stream` but does not destroy it. You own the stream.
 
+## GPU: several devices
+
+One handle per ordinal; every handle carries its device and makes it current
+on the calling thread. `run` synchronizes, so to overlap N devices queue
+async copies and launches on one non-blocking stream per device, then wait:
+
+```zig
+const n = try g.runtime.dynamic.deviceCount(.cuda); // GOMPUTE_FAKE_DEVICES=2 fakes a second one
+for (0..n) |d| {
+    handle[d] = try g.Kernel(spec, .cuda).init(@intCast(d));
+    stream[d] = try handle[d].context.createStreamNonBlocking();
+    handle[d].stream = stream[d];
+    dev[d] = try handle[d].alloc(part);
+    pinned[d] = try handle[d].context.allocPinned(part * @sizeOf(f32));
+    // ... fill pinned[d] ...
+    try dev[d].uploadAtAsync(pinned[d].ptr, 0, pinned[d].len, &stream[d]);
+    try handle[d].launch(&dev[d], part, p);
+    try dev[d].downloadAtAsync(pinned[d].ptr, 0, pinned[d].len, &stream[d]);
+}
+for (0..n) |d| try stream[d].synchronize();
+```
+
+`buf.copyFrom(&other_device_buf, ...)` between two ordinals is a peer copy:
+direct after `context.enablePeerAccess(&other.context)` (one direction per
+call, idempotent), staged through host memory by the driver otherwise.
+`canAccessPeer` says which; `enablePeerAccess` returns `error.Unsupported`
+without a link, which a fake-device pair also answers. `context.info()` picks
+devices: a real second card has its own `uuid`, a fake one the same.
+
 ## Raw kernels
 
 When a pure scalar function can't express the kernel: shared memory,
@@ -237,6 +274,7 @@ ordering you pass. Order through an acquire load or a release store instead.
 | Silently 100× slower | `AutoKernel` fell back on a broken artifact | `initStrict()`, assert `selected()` |
 | `error.SyncFailed` | the *previous* launch faulted | check `g.lastDriverError()` |
 | Two executables ship each other's PTX | `emitKernels` twice on one dep (it panics now) | `addKernels`, one per exe |
+| `error.Unsupported` from `enablePeerAccess` | no direct link between the two devices, or a fake-device pair | nothing: `copyFrom` still works, staged by the driver |
 
 `g.lastDriverError()` returns the raw `CUresult`/`hipError_t` behind the last
 failure on this thread. It is cleared on every success.

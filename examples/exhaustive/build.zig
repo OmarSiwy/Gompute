@@ -34,6 +34,10 @@ pub fn build(b: *std.Build) void {
 
     // Two roots: separately compiled, separately cached, merged into one name
     // map. `.kernels_root` is implicitly the root named "kernels".
+    // `-Dcuda-arch`/`-Dhip-arch` pin the device targets, which is how CI
+    // compiles both backends on a machine with no GPU; unset, `.auto` probes.
+    const cuda_arch = b.option([]const u8, "cuda-arch", "CUDA device target, e.g. sm_89 (default: probe this machine)");
+    const hip_arch = b.option([]const u8, "hip-arch", "HIP device target, e.g. gfx1100 (default: probe this machine)");
     gompute_build.emitKernels(b, dep, exe, .{
         .kernels_root = b.path("src/kernels.zig"),
         .kernel_roots = &.{
@@ -41,6 +45,8 @@ pub fn build(b: *std.Build) void {
         },
         .target = target,
         .optimize = optimize,
+        .cuda = .{ .gpu = if (cuda_arch) |a| .{ .name = a } else .auto },
+        .hip = .{ .gpu = if (hip_arch) |a| .{ .name = a } else .auto },
     });
     b.installArtifact(exe);
 

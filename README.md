@@ -1,6 +1,6 @@
 # Gompute
 
-A Zig **0.17.0** library for defining a one-dimensional GPU/CPU kernel once and
+A Zig library for defining a one-dimensional GPU/CPU kernel once and
 specializing the whole abstraction at compile time. CUDA (PTX), HIP (HSACO) and
 native CPU backends.
 
@@ -24,8 +24,8 @@ than removing any features.
 zig fetch --save git+https://github.com/OmarSiwy/Gompute.git
 ```
 
-Requires Zig 0.17.0 exactly (the `0.16.0` tag is the last Zig 0.16 build). Builds on Linux, Windows, macOS and
-wasm. The CUDA/HIP drivers are loaded at run time (`dlopen` / `LoadLibraryA`), and
+Requires Zig 0.18.0-dev.349+d924f83bf (Zig master, pinned; the `0.17.0-v1.4.0` tag is
+the last Zig 0.17 build). Builds on Linux, Windows, macOS and wasm. The CUDA/HIP drivers are loaded at run time (`dlopen` / `LoadLibraryA`), and
 a machine without one falls back to the CPU; see [Platform support](docs/reference.md#platform-support).
 The GPU backends need `exe.root_module.linkSystemLibrary("c", .{})`.
 
@@ -72,6 +72,7 @@ zig build docs -Dopen   # ...and open it in a browser
 
 cd examples/basic     && zig build run   # CPU path
 cd examples/exhaustive && zig build run  # GPU, needs libc + a driver
+cd examples/bench && zig build run -Doptimize=ReleaseFast   # the numbers in skill/gompute/OVERHEAD.md
 ```
 
 ## Documentation

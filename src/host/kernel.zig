@@ -102,8 +102,9 @@ fn CpuKernel(comptime Spec: type) type {
 
         /// Lanes for a generic body touching element types `Ts`: the narrowest
         /// suggestion among them, so the widest type still fills one register.
-        /// Zig 0.16 and 0.17 ship LLVM's loop vectorizer off, so a loop not widened
-        /// here is scalar.
+        /// A concrete body is left to LLVM's loop vectorizer (on since Zig
+        /// 0.18); a generic one is widened here so `g.math` runs its
+        /// lane-exact vector forms, which no vectorizer finds on its own.
         fn widthOf(comptime Ts: anytype) usize {
             if (!(@hasDecl(Spec, "is_generic") and Spec.is_generic)) return 1;
             var n: usize = 64;
@@ -409,7 +410,7 @@ fn GpuKernel(comptime Spec: type, comptime gpu: Gpu) type {
         /// `init` on a warm device costs ~0.3 us.
         scratch: [3]Buffer = @splat(.{}),
 
-        /// (#3) Handles on the same device share one primary context and one
+        /// Handles on the same device share one primary context and one
         /// JIT'd copy of the artifact, so this is cheap after the first one and
         /// a `Buffer` from any handle is valid in all of them.
         pub fn init(ordinal: c_int) iface.Error!Self {
@@ -417,7 +418,7 @@ fn GpuKernel(comptime Spec: type, comptime gpu: Gpu) type {
             return .{ .context = opened.context, .module = opened.module, .kernel = opened.kernel };
         }
 
-        /// (#3) Drops this handle only. The device context and the loaded module
+        /// Drops this handle only. The device context and the loaded module
         /// are process-wide and shared with every other handle on the device, so
         /// this no longer tears them down; call `gompute.runtime.<backend>
         /// .shutdown()` if you genuinely want that. Still safe to call, still
@@ -515,7 +516,10 @@ fn GpuKernel(comptime Spec: type, comptime gpu: Gpu) type {
             inline for (bufs, 0..) |buffer, i| args[i] = buffer.argPtr();
             args[bufs.len] = iface.arg(&len);
             args[bufs.len + 1] = iface.arg(&packed_params);
-            try self.dispatch(iface.Dim3.linear(count, Spec.block_size), &args);
+            // A block covers `block_size * lanes` elements: each thread moves
+            // one 16-byte group (`spec.deviceLanes`), so the grid is that much
+            // smaller than one block per `block_size` elements.
+            try self.dispatch(iface.Dim3.linear(count, Spec.block_size * spec.deviceLanes(Spec)), &args);
         }
 
         fn mapLaunch(
@@ -613,10 +617,11 @@ fn GpuKernel(comptime Spec: type, comptime gpu: Gpu) type {
             try self.dispatch(.{ .x = blocks }, &args);
         }
 
-        /// How many blocks `count` elements get. Saturates at
+        /// How many blocks `count` elements get: enough for every thread to
+        /// own one 16-byte group (`spec.deviceLanes` elements), saturating at
         /// `max_reduce_blocks`; the grid-stride loop covers the rest.
         pub fn reduceBlocks(count: usize) u32 {
-            const covering = @divCeil(count, Spec.block_size);
+            const covering = @divCeil(count, Spec.block_size * spec.deviceLanes(Spec));
             return @intCast(@min(covering, max_reduce_blocks));
         }
 
@@ -1120,10 +1125,11 @@ test "an index past the end is skipped, never a write outside the buffer" {
 test "reduce grid saturates at the block cap that keeps the host fold small" {
     const Spec = spec.Sum("t_blocks", f32, TestParams, .{ .block_size = 256 });
     const K = GpuKernel(Spec, gpu_cuda);
+    // Four f32 per thread, so a block covers 1024 elements.
     try std.testing.expectEqual(@as(u32, 1), K.reduceBlocks(1));
-    try std.testing.expectEqual(@as(u32, 1), K.reduceBlocks(256));
-    try std.testing.expectEqual(@as(u32, 2), K.reduceBlocks(257));
-    try std.testing.expectEqual(@as(u32, max_reduce_blocks), K.reduceBlocks(256 * 1024));
+    try std.testing.expectEqual(@as(u32, 1), K.reduceBlocks(1024));
+    try std.testing.expectEqual(@as(u32, 2), K.reduceBlocks(1025));
+    try std.testing.expectEqual(@as(u32, max_reduce_blocks), K.reduceBlocks(1024 * 1024));
     // Past the cap the grid stops growing; the kernel's grid-stride loop covers
     // the rest, which is the whole reason the fold buffer can be fixed-size.
     try std.testing.expectEqual(@as(u32, max_reduce_blocks), K.reduceBlocks(1 << 30));

@@ -2,17 +2,21 @@
 
 ## Versions
 
-Gompute pins one Zig release at a time; every Zig release so far has moved
-`std.Build`, `@typeInfo` or the GPU backends under it. Git tags name the Zig
-release a commit builds with; the package version is separate.
+Gompute pins one Zig build at a time; every Zig release so far has moved
+`std.Build`, `@typeInfo` or the GPU backends under it. `main` follows Zig
+master at a pinned nightly, the same build ESPice pins. A release is a `v<version>` tag (the older tags carried the Zig
+release in their name); the package version is separate.
 
-| Git tag | Gompute | Zig    |
-| ------- | ------- | ------ |
-| `0.16.0` | 1.0.0  | 0.16.0 |
-| `main`   | 1.0.0  | 0.17.0 |
+| Git tag         | Gompute | Zig                      |
+| --------------- | ------- | ------------------------ |
+| `0.16.0`        | 1.0.0   | 0.16.0                   |
+| `0.17.0-v1.0.0` | 1.0.0   | 0.17.0                   |
+| `0.17.0-v1.4.0` | 1.4.0   | 0.17.0                   |
+| `v1.5.0`        | 1.5.0   | 0.18.0-dev.349+d924f83bf |
 
-`minimum_zig_version` in `build.zig.zon` is the same value. Nothing older or
-newer is supported.
+`minimum_zig_version` in `build.zig.zon`, the overlay revision in `flake.lock`
+and the version in `.github/workflows/*` name the same build and move
+together. Nothing older or newer is supported.
 
 ## Platform support
 
@@ -24,7 +28,7 @@ newer is supported.
 | `wasm32-wasi` | Yes         | Compiles; every GPU init returns `error.InitFailed`         |
 
 The drivers are loaded at run time: `std.DynLib` on Linux, macOS and the BSDs,
-`LoadLibraryA` on Windows (Zig 0.17's std has no Windows `DynLib`), and a stub
+`LoadLibraryA` on Windows (Zig's std has no Windows `DynLib`), and a stub
 that never opens anything on wasm (`src/runtime/dynlib.zig`). A missing
 driver is the same `error.InitFailed` on every platform, so `AutoKernel`
 falls back to `.cpu` everywhere.
@@ -42,9 +46,10 @@ Things that are easy to get wrong because nothing in the API says them out loud.
 | `run` | Uploads, launches, **synchronizes** and downloads on every call. Device buffers are kept on the handle and grown on demand, so one handle must not `run` from two threads at once; give each thread its own (a warm `init` is ~0.3 µs). See [Advanced](advanced.html) to skip the copies. |
 | `deinit` | Always safe, and safe to call twice. On `.cpu` it is a no-op. It releases *your handle*, not the shared device state. |
 | Contexts and modules | Shared process-wide, per device. Two `Kernel`s on one GPU share one CUDA primary context and JIT the artifact once, so buffers allocated through one are usable by the other. `runtime.cuda.shutdown()` is the only real teardown. |
+| Several devices | One handle per ordinal, each with its own stream. A `copyFrom` between buffers on two ordinals is a peer copy. See [Several devices](runtime.html#several-devices). |
 | Threads | Safe. A context is made current per thread on first use. |
 | `Buffer` | `free()` is idempotent. Use-after-free is not checked. `upload`/`download` do not bounds-check against `Buffer.bytes`; the driver catches the overrun and you get `error.CopyFailed`. |
-| Errors | One flat set of 16, listed [below](#errors). `lastDriverError()` returns the raw CUDA/HIP code behind the last failure, which is the only way to tell "no driver" from "out of memory". It is cleared on success. |
+| Errors | One flat set of 15, listed [below](#errors). `lastDriverError()` returns the raw CUDA/HIP code behind the last failure, which is the only way to tell "no driver" from "out of memory". It is cleared on success. |
 | `block_size` | Must be 1…1024. Not required to be a multiple of the warp/wave size, but anything else wastes part of every warp. |
 | Empty input | `run` on a zero-length slice returns without launching. |
 
@@ -68,11 +73,10 @@ union.
 | `error.CopyFailed` | A host↔device or device↔device copy failed. An overrun past `Buffer.bytes` lands here, since the copy is not bounds-checked in-process. |
 | `error.InvalidArgument` | Caller-side validation: a null or freed `Buffer`, or a launch geometry `Dim3.linearChecked` will not express. |
 | `error.BackendUnavailable` | `Kernel(spec, .cuda)` was instantiated in a build that emitted no CUDA artifact. The type still compiles; `init` refuses. |
-| `error.UnsupportedBackend` | Reserved. Nothing returns it today. |
 | `error.CaptureFailed` | A stream capture failed to begin or end, or was invalidated in between (a host-blocking call ran during it). |
 | `error.GraphFailed` | A graph failed to instantiate, launch or update for a reason other than a topology change, which `GraphExec.update` reports as `false`. |
 | `error.EventFailed` | Creating, recording, waiting on or timing an event failed; timing an event created with `timing = false` lands here. |
-| `error.Unsupported` | The driver is too old for the call: graphs and events need CUDA 11.4+ or a ROCm that exports them. `hasGraphs()` / `hasEvents()` say so first. |
+| `error.Unsupported` | The driver is too old for the call: graphs and events need CUDA 11.4+ or a ROCm that exports them (`hasGraphs()` / `hasEvents()` say so first), and `info`, `fp64Ratio`, `computeCapability` and `multiprocessorCount` need ROCm 6.0+ on HIP. Also `enablePeerAccess` between two devices with no direct link, including a `GOMPUTE_FAKE_DEVICES` pair; copies between them still work. |
 
 The error tells you *which step* failed; `lastDriverError()` tells you *why*.
 
@@ -156,7 +160,7 @@ hoist the allocation and the copies. See [Advanced](advanced.html):
 | `launch(...) Error!void` | Launch only: no allocation, no copy, no synchronize. |
 | `context` | The underlying `runtime.cuda.Context` / `runtime.hip.Context`. `context.synchronize()` is how you wait for a bare `launch`. |
 | `Buffer` | The backend's buffer type. `void` on `.cpu`. |
-| `reduceBlocks(count: usize) u32` | Block count for a `reduce` launch, so you can size the partials buffer. |
+| `reduceBlocks(count: usize) u32` | Blocks a `reduce` launch of `count` elements gets, at most 1024, so you can size the partials buffer. |
 | `stream: Stream` | Where `launch` enqueues; the NULL stream by default. Set it to capture launches into a graph; see [Advanced](advanced.html#graph-replay). |
 
 `AutoKernel(spec)` adds:
@@ -200,6 +204,16 @@ buffers, positionally. All of them take `.{ .block_size = 256 }`-style options.
 `zip` exists so `c = a + b` does not force you to pack the operands into one
 `[]struct { a: f32, b: f32 }`. That is array-of-structs, and it interleaves two
 streams that each want to be coalesced on their own.
+
+On the GPU every generated kernel gives each thread `16 / @sizeOf(T)`
+consecutive elements (4 for `f32`, 2 for `f64`, 8 for `f16` and `i16`, 16 for
+`u8`, 1 for a 16-byte vector element): one 16-byte load and store per buffer,
+a scalar `eval` per lane, and a scalar tail for the last partial group. The
+reduce kernel's grid-stride loop loads the same way and folds the lanes before
+its shared-memory tree. The grid is `ceil(count / (block_size * lanes))`
+blocks. The vector access relies on buffers from `alloc`, which both drivers
+align to 256 bytes; `launch` takes base pointers only, so there is no offset to
+misalign.
 
 ### Reduce
 
@@ -368,10 +382,20 @@ AMDGPU backend cannot match. **An NVIDIA-only test matrix will not see this.**
 `Kernel(Spec, .cpu)` and the hand-written loop beside it end up as the *same
 machine code*. In practice LLVM folds them into one symbol, along with the
 `mapFn` variant, which is the strongest form that assertion can take. If they
-ever diverge the build fails with an instruction-level diff.
+ever diverge the build fails with an instruction-level diff. Zig 0.18 turned
+LLVM's loop vectorizer back on, and the fold still holds: on an x86-64 host
+with `-Dcpu=native` the shared body is a 4x-unrolled AVX2 loop, and
+`manual_scale_relu`, `gompute_scale_relu` and the `mapFn` variant are still one
+symbol, as are `manual_zip` and `gompute_zip`.
 
 That is the library's central claim, that the abstraction is resolved at compile
 time and leaves no runtime residue, so it is checked rather than asserted.
 
 HIP is cross-compiled and its symbols inspected, but **nothing in this package
-has been executed on AMD hardware**; no such device was available.
+has been executed on AMD hardware**; no such device was available. Its device
+queries (`Context.info`, `fp64Ratio`, `computeCapability`,
+`multiprocessorCount`) read `hipGetDevicePropertiesR0600`, the properties
+layout ROCm 6.0 froze, and `hipDeviceComputeCapability`; an older ROCm gets
+`error.Unsupported` from them. The FP64 ratio comes from the gfx family:
+gfx906, gfx908, gfx94x and gfx950 report 2, gfx90a 1, every other gfx9, gfx10,
+gfx11 and gfx12 part 16, and an unknown family `error.Unsupported`.

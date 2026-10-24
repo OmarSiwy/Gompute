@@ -44,7 +44,6 @@ pub const Error = error{
     CopyFailed,
     InvalidArgument,
     BackendUnavailable,
-    UnsupportedBackend,
     /// Stream capture failed to begin or end, or was invalidated in between.
     CaptureFailed,
     /// A graph failed to instantiate, launch or update for a reason other than
@@ -58,8 +57,9 @@ pub const Error = error{
 
 /// What `Context.info` reports about one device: enough to tell cards apart
 /// (`uuid`, the PCI address), order them reproducibly, and price work on them.
-/// A field the backend cannot ask is 0 (HIP: `compute_capability`, the clocks
-/// and `fp64_ratio`; see hip.zig).
+/// A field the runtime cannot answer is 0: on HIP before ROCm 6.0 the clocks,
+/// the bus width, `compute_capability`, `sms` and `fp64_ratio`, and on any
+/// ROCm `fp64_ratio` for a gfx family hip.zig's table does not know.
 pub const DeviceInfo = struct {
     ordinal: c_int = 0,
     name_buf: [256]u8 = @splat(0),

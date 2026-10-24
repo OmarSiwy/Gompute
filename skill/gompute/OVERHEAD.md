@@ -1,9 +1,15 @@
 # What each feature costs
 
-Measured on an RTX 4060 Laptop (sm_89, driver CUDA 12.x) with a Ryzen host,
-`ReleaseFast -Dcpu=native`, median of 200 runs. The kernel is `add_offset`
-(`x + p.offset`, f32), so these numbers are pure overhead and bandwidth.
-Expect the same shape on other hardware, though the exact numbers will move.
+Two measurement sets. The 1.4.0 rows (first `init`, `run()`, launches, graphs,
+the math library tables) were measured on Zig 0.17.0 on an RTX 4060 Laptop
+(sm_89) with an i9-14900HX host, `ReleaseFast -Dcpu=native`, median of 200
+runs, kernel `add_offset` (`x + p.offset`, f32). The 1.5.0 rows (the 16-byte
+device lanes, the CPU bodies on Zig 0.18) come from `examples/bench` on the
+same machine with Zig 0.18.0-dev.349: 20 back-to-back launches timed with
+events after a warm-up, and for the A/B the minimum of five alternating rounds
+in one process, because this laptop's clocks drift more between runs than the
+differences being measured. Expect the same shape on other hardware, though
+the exact numbers will move.
 
 ## Compile time: free at run time
 
@@ -22,15 +28,29 @@ Expect the same shape on other hardware, though the exact numbers will move.
 | Path | Cost |
 | --- | --- |
 | `init`/`deinit` | nothing, both inline to no code |
-| generic `map` | `suggestVectorLength(T)` lanes per step, scalar tail of < lanes elements |
-| generic `mapTo`, `zip`, `mapIndexed` | the same SIMD chunking as `map`. Measured: `zip` a·s+b 0.40 → 0.15 ns/elem (2.8×); `mapTo` of `exp` 2.93 → 1.20 (2.45×) |
-| concrete `map`, `mapTo`, `zip`, `mapIndexed`, `gather`, `scatter` | a plain scalar loop. **Zig 0.16 and 0.17 ship LLVM's loop vectorizer disabled**, so this is one element per instruction |
-| `sum`/`min`/`max`/`any`/`all` | 4 vector registers of accumulators, a single `@reduce` at the end; tail < 4×lanes scalar. **1.8 µs for 64K f32** (old per-chunk `@reduce`: 9.9 µs) |
+| concrete `map`, `mapTo`, `zip`, `mapIndexed` | a plain loop, which Zig 0.18's LLVM loop vectorizer widens where it can prove the loop: the codegen probe's concrete `map` is a 4x-unrolled AVX2 loop at `-Dcpu=native` |
+| generic (`anytype`) `map`, `mapTo`, `zip`, `mapIndexed` | `suggestVectorLength(T)` lanes per step by hand, scalar tail of < lanes elements. What it buys on 0.18 is `g.math`'s lane-exact vector forms, which no vectorizer finds; for plain arithmetic the concrete body is as fast or faster (below) |
+| concrete `gather`, `scatter` | a plain scalar loop; random access, nothing to widen |
+| `sum`/`min`/`max`/`any`/`all` | 4 vector registers of accumulators, a single `@reduce` at the end; tail < 4×lanes scalar. A strict float sum never auto-vectorizes, so this stays explicit |
 | custom `reduce` | scalar fold, one dependent `combine` per element |
 | `.pre` on a reduce | one scalar call per element, inlined |
 | `g.math` at vector width | see "Device math against the libraries it replaces" below |
 
-`map` n=1M f32 on the CPU: **266 µs** (memory-bound). `map` n=1024: **0.29 µs**.
+Zig 0.18, ns per element, median of 11 (`examples/bench`):
+
+| Body | n = 256K (L2) | n = 16M (DRAM) |
+| --- | ---: | ---: |
+| `map` scale-relu, concrete | 0.044 | 0.19 |
+| `map` scale-relu, generic | 0.066 | 0.24 |
+| `zip` a·s+b, concrete | 0.27 | 0.49 |
+| `zip` a·s+b, generic | 0.27 | 0.49 |
+| `sum` preset | 0.027 | 0.18 |
+| `map` of `g.math.exp`, concrete (scalar `exp`) | 1.27 | 1.24 |
+
+On 0.17.0, with the vectorizer off, the generic bodies were the fast ones
+(`zip` 0.40 → 0.15 ns/elem, `mapTo` of `exp` 2.93 → 1.20); on 0.18 the
+concrete arithmetic bodies match or beat them, and a generic body is for
+`g.math`.
 
 ## GPU backend
 
@@ -44,6 +64,27 @@ Expect the same shape on other hardware, though the exact numbers will move.
 | `launch` + `context.synchronize()` | 4.8 µs | 11.8 µs | the launch itself |
 | 10 × `launch` + sync | 19.9 µs | 90.5 µs | ~1.5 µs CPU-side per extra launch |
 | graph of 10 launches, replay + sync | 13.0 µs | 85.2 µs | one driver call for all ten |
+
+Device kernels with 16-byte lanes (1.5.0: 4 f32, 2 f64 or 8 i16 per thread,
+one vector load and store each) against the 1.4.0 shape of one element per
+thread, the same process alternating both, minimum of five rounds, µs per
+launch:
+
+| Kernel | n | 1 per thread | 16 B per thread | |
+| --- | ---: | ---: | ---: | --- |
+| `map` f32 | 1M | 11.9 | 8.3 | 1.44× |
+| `zip` f32 | 1M | 9.4 | 6.6 | 1.42× |
+| `map` f64 | 1M | 11.4 | 11.3 | same |
+| `map` f32 | 16M | 600 | 596 | same: 200 GB/s, 78% of the card's 256 GB/s |
+| `map` f64 | 16M | 1293 | 1288 | same |
+| `zip` f32 | 16M | 908 | 978 | within the run-to-run drift |
+
+Once the working set leaves the 24 MB L2 the bus is saturated either way;
+inside it, four times fewer load and store instructions is a third off. The
+AMD side is the same code (`global_load_b128`), unmeasured. Fraction of peak
+at 16M for the rest, from the same bench: `sum` f32 84% (214 GB/s), `map`
+i16 160 µs for 64 MB (L2-assisted), `map` of `g.math.exp` 50% (the f64 math
+path, compute-bound on a 1/64-rate FP64 part).
 
 What to take from it:
 
@@ -172,10 +213,13 @@ Measured: 255 ms becomes 0.29 ms on the critical path, as long as the app has
 - Nothing in the library allocates on the host. `run` keeps up to three device
   buffers on the handle (grown on demand, freed by `deinit`); `launch`
   allocates nothing. One handle must not `run` from two threads at once.
-- Contexts and modules are shared process-wide per device (16 devices,
-  64 module images; past that, a module is loaded uncached, which is slower
-  but still correct). `deinit` releases your handle only.
+- Contexts and modules are shared process-wide per device (16 devices; the
+  module list grows, and a failed growth loads that module uncached, which is
+  slower but still correct). `deinit` releases your handle only.
   `g.runtime.cuda.shutdown()` is the real teardown.
+- A `copyFrom` between buffers on two ordinals is a peer copy: over the
+  direct link after `enablePeerAccess`, staged through host memory by the
+  driver otherwise.
 - One global spin lock guards init-time tables only. Launches never take it.
 - Safe to use from several threads: a context is made current per thread on
   first use (one TLS check per call after that). Two threads writing one

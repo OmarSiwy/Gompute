@@ -92,10 +92,16 @@ not two launches and not an intermediate buffer.
 
 ## Vectorized CPU kernels
 
-The CPU backend runs a generic map function at the target's vector width. Write
-the operation over `anytype` and use `g.splat` so the same source compiles at
-both scalar and vector width. `x * p.scale` is illegal when `x` is a vector and
-`p.scale` is an `f32`:
+A concrete `fn (T, Params) T` compiles to a plain loop, and Zig 0.18's LLVM
+auto-vectorizes it where it can prove the loop: the codegen probe's concrete
+`map` is a 4x-unrolled AVX2 loop at `-Dcpu=native`, and concrete `zip`, `mapTo`
+and `mapIndexed` widen the same way. Two things the auto-vectorizer never
+gives you: `g.math` at vector width, because its table-driven bodies have no
+loop to widen, and a width that does not depend on the optimizer. For those,
+write the operation over `anytype`; the CPU backend then instantiates it at
+`std.simd.suggestVectorLength(T)` lanes itself. Use `g.splat` so the same
+source compiles at both scalar and vector width. `x * p.scale` is illegal
+when `x` is a vector and `p.scale` is an `f32`:
 
 ```zig
 fn scaleRelu(x: anytype, p: Params) @TypeOf(x) {
@@ -106,9 +112,8 @@ fn scaleRelu(x: anytype, p: Params) @TypeOf(x) {
 pub const scale_relu = g.map("scale_relu", f32, Params, scaleRelu, .{});
 ```
 
-The GPU path still instantiates it at scalar type, one thread per element, so
-one definition serves both. A non-generic `fn (T, Params) T` keeps the plain
-scalar loop, unchanged.
+The GPU path instantiates it at scalar type, once per lane of the 16-byte
+vector each thread loads, so one definition serves both.
 
 ## Hand-written raw kernels
 

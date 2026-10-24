@@ -84,7 +84,7 @@ ones, from the values it hands you:
 fn deviceImports(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     _: ?*anyopaque,
 ) []const std.Build.Module.Import {
     const contract = b.createModule(.{
