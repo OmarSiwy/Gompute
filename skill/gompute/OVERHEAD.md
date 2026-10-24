@@ -102,11 +102,13 @@ What to take from it:
   saves about 35% (19.9 → 13.0 µs). When each kernel is bandwidth-bound, the
   saving shrinks to ~6%, because the GPU time dominates. Graphs remove
   CPU-side submission cost, not kernel time.
-- `reduce` on the GPU: a grid-stride kernel capped at 1024 blocks, then one
-  shared-memory tree per block. The host downloads ≤1024 partials and folds
-  them, which costs microseconds next to the download that carries them.
-  Shared memory, not warp shuffles: about 15% slower than a shuffle tree, but
-  one body on both vendors.
+- `reduce` on the GPU: a grid-stride kernel capped at 1024 blocks, then per
+  block five xor shuffles inside each 32-lane group, one barrier, and one
+  group folding the group results (a shared-memory tree when the block size is
+  not a multiple of 32). The host downloads ≤1024 partials and folds them,
+  which costs microseconds next to the download that carries them. Against
+  the shared-memory tree it replaced: `sum` f32 at 1M elements 9.9 → 5.7 µs;
+  at 16M both run at the bus limit (~270 µs, 96% of peak).
 - `gather`/`scatter` `run` uploads `out` as well (unselected slots keep their
   value), so expect one more copy than `mapTo`.
 - Device math is one software body per function so CPU and GPU agree on

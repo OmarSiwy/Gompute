@@ -81,21 +81,25 @@ const DeviceProp = extern struct {
     _pad5: [56]u8,
 };
 
+// ROCm exists for 64-bit hosts only; on a 32-bit target (wasm) `size_t` is 4
+// bytes, the struct is never filled, and the layout does not apply.
 comptime {
-    if (@sizeOf(DeviceProp) != 1472 or @alignOf(DeviceProp) != 8) @compileError("DeviceProp is not the 1472-byte, 8-aligned hipDeviceProp_tR0600");
-    for (.{
-        .{ "name", 0 },                 .{ "uuid", 256 },                        .{ "luid", 272 },
-        .{ "luidDeviceNodeMask", 280 }, .{ "totalGlobalMem", 288 },              .{ "sharedMemPerBlock", 296 },
-        .{ "regsPerBlock", 304 },       .{ "warpSize", 308 },                    .{ "memPitch", 312 },
-        .{ "maxThreadsPerBlock", 320 }, .{ "maxThreadsDim", 324 },               .{ "maxGridSize", 336 },
-        .{ "clockRate", 348 },          .{ "totalConstMem", 352 },               .{ "major", 360 },
-        .{ "minor", 364 },              .{ "textureAlignment", 368 },            .{ "texturePitchAlignment", 376 },
-        .{ "deviceOverlap", 384 },      .{ "multiProcessorCount", 388 },         .{ "kernelExecTimeoutEnabled", 392 },
-        .{ "integrated", 396 },         .{ "canMapHostMemory", 400 },            .{ "computeMode", 404 },
-        .{ "pciBusID", 584 },           .{ "pciDeviceID", 588 },                 .{ "pciDomainID", 592 },
-        .{ "unifiedAddressing", 604 },  .{ "memoryClockRate", 608 },             .{ "memoryBusWidth", 612 },
-        .{ "l2CacheSize", 616 },        .{ "maxThreadsPerMultiProcessor", 624 }, .{ "gcnArchName", 1160 },
-    }) |f| if (@offsetOf(DeviceProp, f[0]) != f[1]) @compileError("DeviceProp." ++ f[0] ++ " is not at its hipDeviceProp_tR0600 offset");
+    if (@sizeOf(usize) == 8) {
+        if (@sizeOf(DeviceProp) != 1472 or @alignOf(DeviceProp) != 8) @compileError("DeviceProp is not the 1472-byte, 8-aligned hipDeviceProp_tR0600");
+        for (.{
+            .{ "name", 0 },                 .{ "uuid", 256 },                        .{ "luid", 272 },
+            .{ "luidDeviceNodeMask", 280 }, .{ "totalGlobalMem", 288 },              .{ "sharedMemPerBlock", 296 },
+            .{ "regsPerBlock", 304 },       .{ "warpSize", 308 },                    .{ "memPitch", 312 },
+            .{ "maxThreadsPerBlock", 320 }, .{ "maxThreadsDim", 324 },               .{ "maxGridSize", 336 },
+            .{ "clockRate", 348 },          .{ "totalConstMem", 352 },               .{ "major", 360 },
+            .{ "minor", 364 },              .{ "textureAlignment", 368 },            .{ "texturePitchAlignment", 376 },
+            .{ "deviceOverlap", 384 },      .{ "multiProcessorCount", 388 },         .{ "kernelExecTimeoutEnabled", 392 },
+            .{ "integrated", 396 },         .{ "canMapHostMemory", 400 },            .{ "computeMode", 404 },
+            .{ "pciBusID", 584 },           .{ "pciDeviceID", 588 },                 .{ "pciDomainID", 592 },
+            .{ "unifiedAddressing", 604 },  .{ "memoryClockRate", 608 },             .{ "memoryBusWidth", 612 },
+            .{ "l2CacheSize", 616 },        .{ "maxThreadsPerMultiProcessor", 624 }, .{ "gcnArchName", 1160 },
+        }) |f| if (@offsetOf(DeviceProp, f[0]) != f[1]) @compileError("DeviceProp." ++ f[0] ++ " is not at its hipDeviceProp_tR0600 offset");
+    }
 }
 
 const Api = struct {
@@ -188,7 +192,8 @@ var loaded = false;
 var lock: std.atomic.Mutex = .unlocked;
 
 fn acquire() void {
-    while (!lock.tryLock()) std.Thread.yield() catch std.atomic.spinLoopHint();
+    // Single-threaded targets (wasm) have no `Thread.yield`, and no contention.
+    while (!lock.tryLock()) if (builtin.single_threaded) std.atomic.spinLoopHint() else std.Thread.yield() catch std.atomic.spinLoopHint();
 }
 
 const lib_names = switch (builtin.target.os.tag) {
@@ -320,7 +325,8 @@ var fake_devices: ?c_int = null;
 
 fn fakeCount() c_int {
     if (fake_devices) |k| return k;
-    const v = std.c.getenv("GOMPUTE_FAKE_DEVICES") orelse "";
+    // Read through libc, which every target with a driver to load links.
+    const v = if (builtin.link_libc) std.c.getenv("GOMPUTE_FAKE_DEVICES") orelse "" else "";
     const k = std.fmt.parseInt(c_int, std.mem.sliceTo(v, 0), 10) catch 0;
     fake_devices = std.math.clamp(k, 0, max_devices);
     return fake_devices.?;

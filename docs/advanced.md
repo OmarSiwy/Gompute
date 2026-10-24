@@ -149,11 +149,9 @@ try raw.launch(g.Dim3.linear(count, 256), .{ .x = 256 }, 0, &args);
 try raw.synchronize();
 ```
 
-The block size passed to `globalIdX` **must** match the block size you launch
-with. Generated `map` kernels guarantee that by construction; raw kernels do
-not, and the mismatch is asymmetric: NVPTX reads the real block dimension and
-ignores the argument, while AMDGCN uses it. So the same code can be correct on
-CUDA and silently wrong on HIP.
+`globalIdX` reads the block size the kernel was launched with on both vendors
+(`%ntid.x`, and on AMD the dispatch packet), so any `block` works. Its
+argument is ignored; it stays because kernels written for 1.4.0 pass one.
 
 For shared memory, barriers, multidimensional indexing, textures, or a custom
 ABI, use a raw kernel and the low-level [runtime](runtime.html) modules under
@@ -164,7 +162,11 @@ Inside a raw kernel, `g.builtins` has the rest of the device intrinsics:
 `barrier()` for a block-wide execution barrier and shared-memory fence. Every
 thread in the block must reach that barrier, or NVIDIA hangs and AMD is
 undefined.
-`gridDimX()` exists on NVPTX only, since AMDGCN has no portable way to read it;
+`shuffleXor(T, v, mask)` swaps a value with the lane `mask` away inside a
+32-lane group, `__shfl_xor_sync` on NVIDIA and DPP / `ds_swizzle` /
+`v_permlanex16` on AMD; every lane of the group must reach it, so launch with
+a block that is a multiple of 32. The generated `reduce` folds with it.
+`gridDimX()` exists on NVPTX only, since Zig cannot read AMD's grid size;
 pass the stride as a kernel argument instead, which is what the generated
 `reduce` kernels do. `spinPause()` backs off inside a spin loop; it compiles to
 nothing on NVPTX targets below sm_70 with PTX 6.3. `g.builtins` is only present

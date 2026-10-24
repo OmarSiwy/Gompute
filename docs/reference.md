@@ -25,7 +25,7 @@ together. Nothing older or newer is supported.
 | Linux         | Yes         | Yes                                                         |
 | Windows       | Yes         | Yes: `nvcuda.dll`, `amdhip64_7.dll` / `_6` / unsuffixed     |
 | macOS         | Yes         | Compiles; only finds NVIDIA's last driver (CUDA 10.2)       |
-| `wasm32-wasi` | Yes         | Compiles; every GPU init returns `error.InitFailed`         |
+| `wasm32-wasi` | Yes         | Every GPU init returns `error.InitFailed`. Link no libc: Zig ships no wasi-libc |
 
 The drivers are loaded at run time: `std.DynLib` on Linux, macOS and the BSDs,
 `LoadLibraryA` on Windows (Zig's std has no Windows `DynLib`), and a stub
@@ -252,11 +252,11 @@ what the untouched slot then holds. For `gather` that slot is unspecified; for
 
 ### Not provided
 
-Scan/prefix-sum, sort, 2-D/3-D launches, dynamic shared memory, and warp
-shuffles are deliberately absent. A correct decoupled-lookback scan needs
-memory-ordering guarantees this API cannot express; `shfl.sync` versus
-`ds_bpermute`/DPP with wave32-vs-wave64 has no portable spelling. Write those
-against [`RawKernel`](advanced.html).
+Scan/prefix-sum, sort, 2-D/3-D launches and dynamic shared memory are
+deliberately absent. A correct decoupled-lookback scan needs memory-ordering
+guarantees this API cannot express. Write those against
+[`RawKernel`](advanced.html), with `g.builtins.shuffleXor` for warp-level
+steps.
 
 ## Generated ABI
 

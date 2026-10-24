@@ -30,7 +30,10 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    exe.root_module.linkSystemLibrary("c", .{});
+    // The CUDA/HIP loaders need libc's dlopen. wasm has no driver to load
+    // (emitKernels compiles both backends out there), and Zig ships no
+    // wasi-libc, so it links none.
+    if (!target.result.cpu.arch.isWasm()) exe.root_module.linkSystemLibrary("c", .{});
 
     // Two roots: separately compiled, separately cached, merged into one name
     // map. `.kernels_root` is implicitly the root named "kernels".

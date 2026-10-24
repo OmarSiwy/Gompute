@@ -133,7 +133,8 @@ var loaded = false;
 var lock: std.atomic.Mutex = .unlocked;
 
 fn acquire() void {
-    while (!lock.tryLock()) std.Thread.yield() catch std.atomic.spinLoopHint();
+    // Single-threaded targets (wasm) have no `Thread.yield`, and no contention.
+    while (!lock.tryLock()) if (builtin.single_threaded) std.atomic.spinLoopHint() else std.Thread.yield() catch std.atomic.spinLoopHint();
 }
 
 const lib_names = switch (builtin.target.os.tag) {
@@ -281,7 +282,8 @@ var fake_devices: ?c_int = null;
 
 fn fakeCount() c_int {
     if (fake_devices) |k| return k;
-    const v = std.c.getenv("GOMPUTE_FAKE_DEVICES") orelse "";
+    // Read through libc, which every target with a driver to load links.
+    const v = if (builtin.link_libc) std.c.getenv("GOMPUTE_FAKE_DEVICES") orelse "" else "";
     const k = std.fmt.parseInt(c_int, std.mem.sliceTo(v, 0), 10) catch 0;
     fake_devices = std.math.clamp(k, 0, max_devices);
     return fake_devices.?;

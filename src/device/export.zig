@@ -137,14 +137,16 @@ fn ZipEntry(comptime Spec: type) type {
     };
 }
 
-/// Grid-stride accumulate into a register, then one shared-memory tree per
-/// block, then one partial per block. The host folds the partials.
+/// Grid-stride accumulate into a register, then fold the block, then one
+/// partial per block. The host folds the partials.
 ///
-/// ponytail: shared memory, not warp shuffles. `shfl.sync` (NVPTX) and
-/// `ds_bpermute`/DPP (AMDGCN) do not have a common spelling, and AMD's wave
-/// width is 32 on RDNA and 64 on GCN/CDNA, so the shuffle version needs a
-/// per-target reduction written three ways. The tree is a few microseconds
-/// per launch next to a bandwidth-bound loop, and identical on both vendors.
+/// A block size that is a multiple of 32 folds through `builtins.shuffleXor`:
+/// five shuffles inside each 32-lane group, one shared slot per group, one
+/// barrier, and the first group folds the slots the same way. That is one
+/// barrier where the shared-memory tree takes log2(block_size), and the
+/// shuffles lower to DPP / `v_permlanex16` / `ds_swizzle` on AMD and
+/// `shfl.sync.bfly` on NVIDIA. Any other block size takes the tree. The order
+/// of combination is fixed by the launch geometry either way.
 fn ReduceEntry(comptime Spec: type) type {
     const T = Spec.Value;
     const bs = Spec.block_size;
@@ -152,9 +154,18 @@ fn ReduceEntry(comptime Spec: type) type {
     // Halving starts at the next power of two so a non-power-of-two block still
     // pairs every live slot; the `tid + s < bs` guard drops the ones past the end.
     const tree: u32 = std.math.ceilPowerOfTwo(u32, bs) catch unreachable;
+    const bits = @bitSizeOf(T);
+    const shuffled = bs % 32 == 0 and (bits <= 32 or bits % 32 == 0);
 
     return struct {
-        var scratch: [bs]T addrspace(.shared) = undefined;
+        var scratch: [if (shuffled) bs / 32 else bs]T addrspace(.shared) = undefined;
+
+        /// `acc` folded across this lane's 32-lane group; every lane gets it.
+        inline fn groupFold(acc: T) T {
+            var v = acc;
+            inline for (.{ 16, 8, 4, 2, 1 }) |m| v = Spec.combine(v, builtins.shuffleXor(T, v, m));
+            return v;
+        }
 
         /// `stride` is the total thread count, handed over by the host rather
         /// than read back off the device. `gridDim.x` has no portable spelling
@@ -191,6 +202,19 @@ fn ReduceEntry(comptime Spec: type) type {
                 }
             } else {
                 while (i < len) : (i += stride) acc = Spec.combine(acc, Spec.pre(data[i], params));
+            }
+
+            if (comptime shuffled) {
+                const folded = groupFold(acc);
+                if (tid % 32 == 0) scratch[tid / 32] = folded;
+                builtins.barrier();
+                // Only the first group reads the slots; it is whole, so every
+                // lane in it reaches the shuffles.
+                if (tid < 32) {
+                    const last = groupFold(if (tid < bs / 32) scratch[tid] else Spec.identity);
+                    if (tid == 0) partials[builtins.blockIdX()] = last;
+                }
+                return;
             }
 
             scratch[tid] = acc;

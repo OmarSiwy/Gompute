@@ -70,6 +70,45 @@ jobs:
         run: zig build -Dcuda-arch=sm_89 -Dhip-arch=gfx1100 --summary failures
         working-directory: examples/exhaustive
 
+  # Every target the README claims, compiled and not run (a foreign binary
+  # cannot run here): the host runtime with both device backends embedded.
+  # The pattern and the pinned Zig are VerA's `cross` workflow's.
+  cross:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-linux-gnu, x86_64-macos, aarch64-macos, x86_64-windows, wasm32-wasi]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: examples/exhaustive for ${{ matrix.target }}
+        run: zig build -Dtarget=${{ matrix.target }} -Dcuda-arch=sm_89 -Dhip-arch=gfx1100 --summary failures
+        working-directory: examples/exhaustive
+
+  # wasm does run: every GPU section skips (no loader) and the CPU paths and
+  # AutoKernel's fallback run under wasmtime.
+  wasm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - name: examples/exhaustive under wasmtime
+        working-directory: examples/exhaustive
+        run: |
+          zig build -Dtarget=wasm32-wasi -Dcuda-arch=sm_89 -Dhip-arch=gfx1100 --summary failures
+          nix shell nixpkgs#wasmtime -c wasmtime zig-out/bin/exhaustive.wasm
+
   nix:
     runs-on: ubuntu-latest
     timeout-minutes: 60

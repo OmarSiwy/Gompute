@@ -393,8 +393,9 @@ pub fn build(b: *std.Build) void {
 
     // The lowerings `src/device/builtins.zig` promises for `t_raw_atomics`.
     // LLVM 21 spells these `atom.global.add.u32`, LLVM 22 `atom.relaxed.sys.global.add.u32`.
-    // The last two are the 16-byte accesses `src/device/export.zig` promises
-    // for every elementwise entry: four f32 per thread in and out.
+    // Then the 16-byte accesses `src/device/export.zig` promises for every
+    // elementwise entry (four f32 per thread in and out), and the warp-shuffle
+    // fold of `t_reduce`.
     const ptx_atomics = b.addCheckFile(device_probe.getEmittedAsm(), .{ .expected_matches = &.{
         ".global.add.u32",
         ".global.min.u32",
@@ -404,14 +405,15 @@ pub fn build(b: *std.Build) void {
         "st.release.gpu.global.u32",
         "ld.global.v4.b32",
         "st.global.v4.b32",
+        "shfl.sync.bfly.b32",
     } });
 
     // AMDGCN is the other half of the same claim, and it is cheaper to check:
     // one `addObject` lowers all the way to ISA with no alias to rewrite and no
     // assembler step. Asm only, never asm and bin together: Zig runs LLVM
     // codegen once per output on the same module, and the second run dies on
-    // the first run's `llvm.amdgcn.if` ("Cannot select") once `globalIdX`'s
-    // trap adds a divergent branch. `buildArtifacts` asks for bin and IR, which
+    // the first run's `llvm.amdgcn.if` ("Cannot select") once a kernel has a
+    // divergent branch. `buildArtifacts` asks for bin and IR, which
     // is fine.
     const device_probe_amd = b.addObject(.{
         .name = "gompute-device-probe-amd",
@@ -427,15 +429,16 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "gompute", .module = device_mod }},
         }),
     });
-    // `globalIdX(256)` in the probe must keep its wide-launch trap; a silent
-    // `s_endpgm` in its place is the bug this pins.
-    // `t_raw_atomics` adds the acquire invalidate, the release wait and the
-    // spin pause. The last two are `barrier()` in `t_reduce`: `s_barrier` alone
-    // orders no memory, so it must sit between `__syncthreads`' fences.
-    // `global_load_b128`/`global_store_b128` are the 16-byte accesses of the
-    // elementwise entries, the AMD half of the PTX `v4` check above.
+    // `t_raw_atomics` pins the acquire invalidate, the release wait and the
+    // spin pause. The last two are `barrier()` in `t_sum` (block 100, the
+    // shared-memory tree): `s_barrier` alone orders no memory, so it must sit
+    // between `__syncthreads`' fences. `global_load_b128`/`global_store_b128`
+    // are the 16-byte accesses of the elementwise entries, the AMD half of the
+    // PTX `v4` check. `v_permlanex16_b32` and `_dpp` are `t_reduce`'s
+    // warp-shuffle fold (block 256), and `s_load_b32 ... 0x4` with
+    // `user_sgpr_dispatch_ptr` is `globalIdX` reading the launched block size
+    // out of the dispatch packet.
     const amd_trap = b.addCheckFile(device_probe_amd.getEmittedAsm(), .{ .expected_matches = &.{
-        "s_trap 2",
         "atomic_add_u32",
         "buffer_gl0_inv",
         "s_waitcnt_vscnt null, 0x0",
@@ -444,6 +447,9 @@ pub fn build(b: *std.Build) void {
         "s_barrier\n\t;;#ASMSTART\n\tbuffer_gl0_inv",
         "global_load_b128",
         "global_store_b128",
+        "v_permlanex16_b32",
+        "row_mask:0xf bank_mask:0xf",
+        "amdhsa_user_sgpr_dispatch_ptr 1",
     } });
 
     const test_step = b.step("test", "Run Gompute unit tests");
@@ -738,9 +744,8 @@ fn buildArtifacts(
             .{ tag, cpu, err, d.expected_cpu },
         );
         // LLVM turns `trap-handler` on for every amdhsa target, but Zig hands it
-        // an explicit feature list that leaves it off, and then `@trap()`
-        // lowers to a silent `s_endpgm` instead of `s_trap 2`. `globalIdX`'s
-        // wide-launch check is only loud with it.
+        // an explicit feature list that leaves it off, and then a kernel's
+        // `@trap()` lowers to a silent `s_endpgm` instead of `s_trap 2`.
         if (d.device == .hip) query.cpu_features_add.addFeature(@backingInt(std.Target.amdgcn.Feature.trap_handler));
         const target = b.resolveTargetQuery(query);
         const mode = if (d.optimize) |m| deviceOptimize(m) else optimize;

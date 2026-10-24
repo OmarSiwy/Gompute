@@ -175,7 +175,8 @@ are the six names whose meaning differs between the roots. On the host
 
 | | |
 | --- | --- |
-| `globalIdX(bs)`, `localIdX()`, `blockIdX()` | thread indices; AMDGCN traps if a launch is wider than `bs` |
+| `globalIdX(bs)`, `localIdX()`, `blockIdX()` | thread indices from the launched geometry on both vendors; `bs` is ignored |
+| `shuffleXor(T, v, mask)` | the value of lane `this ^ mask` in a 32-lane group (`shfl.sync.bfly`; DPP / `ds_swizzle` / `v_permlanex16` on AMD); every lane of the group must reach it |
 | `gridDimX()` | NVPTX only; on AMD, pass the stride as an argument |
 | `barrier()` | `__syncthreads`, with the fences included on AMDGCN; every thread must reach it |
 | `spinPause()` | ~64 ns backoff; a no-op below sm_70/PTX 6.3 |

@@ -248,7 +248,7 @@ barriers, atomics, a spin-wait, or a custom argument list.
 
 ```zig
 fn rawAdd(data: g.GlobalPtr(f32), len: u64) callconv(g.kernel_callconv) void {
-    const i = g.globalIdX(256);      // MUST equal the block.x you launch with
+    const i = g.globalIdX(256);      // reads the launched block size; the 256 is ignored
     if (i < len) data[i] += 1;
 }
 comptime { if (g.is_device) g.exportRaw("raw_add", &rawAdd); }
@@ -256,8 +256,7 @@ comptime { if (g.is_device) g.exportRaw("raw_add", &rawAdd); }
 
 Load it with `g.RawKernel("raw_add", .cuda).init(0)`, then call
 `raw.launch(g.Dim3.linear(n, 256), .{ .x = 256 }, 0, &args)` or `raw.launchOn(&stream, ...)`.
-A `globalIdX(256)` launched with a different block size is correct on CUDA and
-wrong on HIP. Device intrinsics (`localIdX`, `blockIdX`, `barrier`,
+Device intrinsics (`localIdX`, `blockIdX`, `barrier`, `shuffleXor`,
 `spinPause`, `loadAcquireDevice`/`storeReleaseDevice`) live in `g.builtins`,
 which exists only in the device compilation, so guard uses with
 `if (g.is_device)`. On NVPTX, every `@atomicRmw` runs relaxed whatever
