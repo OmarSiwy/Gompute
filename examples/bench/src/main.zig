@@ -1,8 +1,7 @@
-//! Bandwidth and overhead of the generated kernels, on the GPU through
-//! `alloc` + `launch` on a non-blocking stream (events time the device side
-//! only), and on the CPU for the concrete and the generic body. Prints what
-//! OVERHEAD.md quotes; the GPU rows also say what fraction of the card's peak
-//! memory bandwidth (from `Context.info`) each kernel reaches.
+//! Bandwidth of plain raw kernels on the GPU, through `launchOn` on a
+//! non-blocking stream with events timing the device side only, as a fraction
+//! of the card's peak memory bandwidth (from `Context.info`); and `g.math`
+//! throughput with `BENCH=math`.
 //!
 //! Build with `-Doptimize=ReleaseFast`; the Debug numbers measure nothing.
 
@@ -13,126 +12,87 @@ const k = @import("kernels");
 const print = std.debug.print;
 const sizes = [_]usize{ 1 << 10, 1 << 20, 1 << 24 };
 const reps = 20;
+const B = .cuda;
 
 pub fn main(init: std.process.Init) !void {
+    if (init.environ_map.get("BENCH")) |which| if (std.mem.eql(u8, which, "math")) return mathBench(init.io);
     try gpu();
-    try ab();
-    try cpu(init.io);
 }
 
-// ---------------------------------------------------------------------------
-// GPU. One handle per kernel, all on one non-blocking stream; the buffers are
-// the largest size and every case reads a prefix of them.
-// ---------------------------------------------------------------------------
+const Case = enum { map_f32, map_f64, zip_f32 };
 
-const B = .cuda;
-const Case = enum { map_f32, zip_f32, sum_f32, map_f64, map_i16, exp_f32 };
+var map32: g.RawKernel("raw_map_f32", B) = undefined;
+var map64: g.RawKernel("raw_map_f64", B) = undefined;
+var zip32: g.RawKernel("raw_zip_f32", B) = undefined;
+var stream: g.runtime.cuda.Stream = undefined;
+var bufs: [3]g.runtime.cuda.Buffer = undefined;
+var cur_n: usize = 0;
+var cur: Case = .map_f32;
 
-const Gpu = struct {
-    map: g.Kernel(k.map_f32, B),
-    zip: g.Kernel(k.zip_f32, B),
-    sum: g.Kernel(k.sum_f32, B),
-    map64: g.Kernel(k.map_f64, B),
-    map16: g.Kernel(k.map_i16, B),
-    exp: g.Kernel(k.exp_f32, B),
-    a: g.runtime.cuda.Buffer,
-    b: g.runtime.cuda.Buffer,
-    c: g.runtime.cuda.Buffer,
-    partials: g.runtime.cuda.Buffer,
-    n: usize = 0,
-    which: Case = .map_f32,
-
-    /// Bytes a `which` launch over `n` elements must move: every byte read
-    /// once and written once, the speed-of-light count.
-    fn bytes(self: *const Gpu) usize {
-        return switch (self.which) {
-            .map_f32, .exp_f32 => self.n * 4 * 2,
-            .zip_f32 => self.n * 4 * 3,
-            .sum_f32 => self.n * 4,
-            .map_f64 => self.n * 8 * 2,
-            .map_i16 => self.n * 2 * 2,
-        };
-    }
-
-    fn launch(self: *Gpu) !void {
-        const p: k.P = .{ .scale = 1.5 };
-        switch (self.which) {
-            .map_f32 => try self.map.launch(&self.a, self.n, p),
-            .zip_f32 => try self.zip.launch(&self.a, &self.b, &self.c, self.n, p),
-            .sum_f32 => try self.sum.launch(&self.a, self.n, &self.partials, @TypeOf(self.sum).reduceBlocks(self.n), p),
-            .map_f64 => try self.map64.launch(&self.a, self.n, .{ .scale = 1.5 }),
-            .map_i16 => try self.map16.launch(&self.a, self.n, p),
-            .exp_f32 => try self.exp.launch(&self.a, self.n, p),
-        }
-    }
-};
-
-var dev: Gpu = undefined;
+/// Bytes a launch over `cur_n` elements must move: every byte read once and
+/// written once, the speed-of-light count.
+fn bytes() usize {
+    return switch (cur) {
+        .map_f32 => cur_n * 4 * 2,
+        .map_f64 => cur_n * 8 * 2,
+        .zip_f32 => cur_n * 4 * 3,
+    };
+}
 
 fn launchCurrent() !void {
-    return dev.launch();
+    var len: u64 = cur_n;
+    var scale32: f32 = 1.5;
+    var scale64: f64 = 1.5;
+    const grid = g.Dim3.linear(cur_n, 256);
+    switch (cur) {
+        .map_f32 => try map32.launchOn(&stream, grid, .{ .x = 256 }, 0, &.{ bufs[0].argPtr(), g.interface.arg(&len), g.interface.arg(&scale32) }),
+        .map_f64 => try map64.launchOn(&stream, grid, .{ .x = 256 }, 0, &.{ bufs[0].argPtr(), g.interface.arg(&len), g.interface.arg(&scale64) }),
+        .zip_f32 => try zip32.launchOn(&stream, grid, .{ .x = 256 }, 0, &.{ bufs[0].argPtr(), bufs[1].argPtr(), bufs[2].argPtr(), g.interface.arg(&len), g.interface.arg(&scale32) }),
+    }
 }
 
 /// Microseconds per launch of `launch_fn` over `reps` back-to-back launches,
-/// measured with events on `stream`.
-fn timeLaunches(ctx: *g.runtime.cuda.Context, stream: *g.runtime.cuda.Stream, launch_fn: *const fn () anyerror!void) !f64 {
+/// measured with events on `on`.
+fn timeLaunches(ctx: *g.runtime.cuda.Context, on: *g.runtime.cuda.Stream, launch_fn: *const fn () anyerror!void) !f64 {
     var start = try ctx.createEvent(true);
     defer start.deinit();
     var end = try ctx.createEvent(true);
     defer end.deinit();
     try launch_fn(); // warm: JIT, first touch, instruction cache
-    try stream.synchronize();
-    try start.record(stream);
+    try on.synchronize();
+    try start.record(on);
     for (0..reps) |_| try launch_fn();
-    try end.record(stream);
+    try end.record(on);
     try end.synchronize();
     return @as(f64, try g.runtime.cuda.Event.elapsedUs(&start, &end)) / reps;
 }
 
 fn gpu() !void {
-    if (comptime !g.AutoKernel(k.map_f32).Cuda.available) return print("GPU: this build emitted no CUDA artifacts\n", .{});
-    dev.map = g.Kernel(k.map_f32, B).init(0) catch return print("GPU: no CUDA device\n", .{});
-    defer dev.map.deinit();
-    const info = try dev.map.context.info();
+    if (comptime !g.available(B)) return print("GPU: this build emitted no CUDA artifacts\n", .{});
+    map32 = @TypeOf(map32).init(0) catch return print("GPU: no CUDA device\n", .{});
+    defer map32.deinit();
+    map64 = try @TypeOf(map64).init(0);
+    defer map64.deinit();
+    zip32 = try @TypeOf(zip32).init(0);
+    defer zip32.deinit();
+    const info = try map32.context.info();
     const peak = info.bandwidth();
     print("GPU: {s}, {d} SMs, peak {d:.0} GB/s (bus {d} bit at {d} MHz)\n", .{ info.name(), info.sms, @as(f64, @floatFromInt(peak)) / 1e9, info.bus_width_bits, info.mem_clock_khz / 1000 });
-    var stream = try dev.map.context.createStreamNonBlocking();
+    stream = try map32.createStreamNonBlocking();
     defer stream.deinit();
-    dev.zip = try g.Kernel(k.zip_f32, B).init(0);
-    defer dev.zip.deinit();
-    dev.sum = try g.Kernel(k.sum_f32, B).init(0);
-    defer dev.sum.deinit();
-    dev.map64 = try g.Kernel(k.map_f64, B).init(0);
-    defer dev.map64.deinit();
-    dev.map16 = try g.Kernel(k.map_i16, B).init(0);
-    defer dev.map16.deinit();
-    dev.exp = try g.Kernel(k.exp_f32, B).init(0);
-    defer dev.exp.deinit();
-    dev.map.stream = stream;
-    dev.zip.stream = stream;
-    dev.sum.stream = stream;
-    dev.map64.stream = stream;
-    dev.map16.stream = stream;
-    dev.exp.stream = stream;
-
     const max = sizes[sizes.len - 1];
-    dev.a = try dev.map.context.alloc(max * 8);
-    defer dev.a.free();
-    dev.b = try dev.map.context.alloc(max * 8);
-    defer dev.b.free();
-    dev.c = try dev.map.context.alloc(max * 8);
-    defer dev.c.free();
-    dev.partials = try dev.map.context.alloc(1024 * 4);
-    defer dev.partials.free();
-    try dev.a.fillAsync(0, max * 8, &stream);
-    try dev.b.fillAsync(0, max * 8, &stream);
+    for (&bufs) |*b| {
+        b.* = try map32.alloc(max * 8);
+        try b.fillAsync(0, max * 8, &stream);
+    }
+    defer for (&bufs) |*b| b.free();
 
     for (sizes) |n| {
-        dev.n = n;
+        cur_n = n;
         inline for (std.enums.values(Case)) |which| {
-            dev.which = which;
-            const us = try timeLaunches(&dev.map.context, &stream, launchCurrent);
-            const gbs = @as(f64, @floatFromInt(dev.bytes())) / (us * 1e3);
+            cur = which;
+            const us = try timeLaunches(&map32.context, &stream, launchCurrent);
+            const gbs = @as(f64, @floatFromInt(bytes())) / (us * 1e3);
             const pct = if (peak == 0) 0 else gbs * 1e9 / @as(f64, @floatFromInt(peak)) * 100;
             print("  {s:<8} n={d:>9}  {d:>9.2} us  {d:>7.1} GB/s  {d:>5.1}% of peak\n", .{ @tagName(which), n, us, gbs, pct });
         }
@@ -141,164 +101,87 @@ fn gpu() !void {
 }
 
 // ---------------------------------------------------------------------------
-// A/B: the 1.4.0 one-element-per-thread shape (raw kernels in kernels.zig)
-// against the generated 16-byte-lane entries, alternated in one process so
-// clock drift hits both the same. Five rounds; read the minimum of each.
+// g.math throughput: `BENCH=math zig build run -Doptimize=ReleaseFast`. Each
+// element makes 8 calls (see kernels.zig), so these are calls per second, not
+// bytes. GPU: best of 5 event-timed rounds. CPU: the scalar call in a plain
+// loop and the vector form 8 (f32) or 4 (f64) lanes wide, median of 5.
 // ---------------------------------------------------------------------------
 
-const Raw = g.RawKernel("raw_map_f32", B);
-var raw_which: u8 = 0;
-var raw_n: usize = 0;
-var raw_map32: Raw = undefined;
-var raw_map64: g.RawKernel("raw_map_f64", B) = undefined;
-var raw_zip32: g.RawKernel("raw_zip_f32", B) = undefined;
-var raw_stream: g.runtime.cuda.Stream = undefined;
+const math_n_gpu = 1 << 22;
+const math_n_cpu = 1 << 16;
 
-fn launchRaw() !void {
-    var len: u64 = raw_n;
-    var scale32: f32 = 1.5;
-    var scale64: f64 = 1.5;
-    const grid = g.Dim3.linear(raw_n, 256);
-    switch (raw_which) {
-        0 => try raw_map32.launchOn(&raw_stream, grid, .{ .x = 256 }, 0, &.{ dev.a.argPtr(), g.interface.arg(&len), g.interface.arg(&scale32) }),
-        1 => try raw_map64.launchOn(&raw_stream, grid, .{ .x = 256 }, 0, &.{ dev.a.argPtr(), g.interface.arg(&len), g.interface.arg(&scale64) }),
-        else => try raw_zip32.launchOn(&raw_stream, grid, .{ .x = 256 }, 0, &.{ dev.a.argPtr(), dev.b.argPtr(), dev.c.argPtr(), g.interface.arg(&len), g.interface.arg(&scale32) }),
-    }
+fn fillMath(comptime T: type, xs: []T) void {
+    for (xs, 0..) |*x, i| x.* = 0.1 + @as(T, @floatFromInt(i % 3901)) * (3.9 / 3901.0);
 }
 
-fn ab() !void {
-    if (comptime !g.AutoKernel(k.map_f32).Cuda.available) return;
-    dev.map = g.Kernel(k.map_f32, B).init(0) catch return;
-    defer dev.map.deinit();
-    dev.zip = try g.Kernel(k.zip_f32, B).init(0);
-    defer dev.zip.deinit();
-    dev.map64 = try g.Kernel(k.map_f64, B).init(0);
-    defer dev.map64.deinit();
-    raw_map32 = try Raw.init(0);
-    defer raw_map32.deinit();
-    raw_map64 = try @TypeOf(raw_map64).init(0);
-    defer raw_map64.deinit();
-    raw_zip32 = try @TypeOf(raw_zip32).init(0);
-    defer raw_zip32.deinit();
-    raw_stream = try dev.map.context.createStreamNonBlocking();
-    defer raw_stream.deinit();
-    dev.map.stream = raw_stream;
-    dev.zip.stream = raw_stream;
-    dev.map64.stream = raw_stream;
-    const max = sizes[sizes.len - 1];
-    dev.a = try dev.map.context.alloc(max * 8);
-    defer dev.a.free();
-    dev.b = try dev.map.context.alloc(max * 8);
-    defer dev.b.free();
-    dev.c = try dev.map.context.alloc(max * 8);
-    defer dev.c.free();
-    try dev.a.fillAsync(0, max * 8, &raw_stream);
-    try dev.b.fillAsync(0, max * 8, &raw_stream);
-
-    print("A/B, one process, alternating; us per launch, 5 rounds (1 per thread | 16 bytes per thread)\n", .{});
-    for ([_]usize{ 1 << 20, 1 << 24 }) |n| {
-        dev.n = n;
-        raw_n = n;
-        inline for (.{ .{ "map f32", 0, Case.map_f32 }, .{ "map f64", 1, Case.map_f64 }, .{ "zip f32", 2, Case.zip_f32 } }) |c| {
-            raw_which = c[1];
-            dev.which = c[2];
-            var old_min: f64 = 1e30;
-            var new_min: f64 = 1e30;
-            print("  {s:<8} n={d:>9} ", .{ c[0], n });
-            for (0..5) |_| {
-                const old = try timeLaunches(&dev.map.context, &raw_stream, launchRaw);
-                const new = try timeLaunches(&dev.map.context, &raw_stream, launchCurrent);
-                old_min = @min(old_min, old);
-                new_min = @min(new_min, new);
-                print(" {d:.0}|{d:.0}", .{ old, new });
-            }
-            print("   min {d:.1} | {d:.1} us  ({d:.2}x)\n", .{ old_min, new_min, old_min / new_min });
-        }
+fn mathGpuOne(comptime T: type, comptime name: []const u8, on: *g.runtime.cuda.Stream, buf: *g.runtime.cuda.Buffer, host_in: []const T) !f64 {
+    var kk = try g.RawKernel("bm_" ++ name ++ "_" ++ @typeName(T), B).init(0);
+    defer kk.deinit();
+    var len: u64 = host_in.len;
+    var best: f64 = 1e30;
+    for (0..5) |_| {
+        try buf.upload(host_in.ptr, host_in.len * @sizeOf(T));
+        var start = try kk.createEvent(true);
+        defer start.deinit();
+        var end = try kk.createEvent(true);
+        defer end.deinit();
+        try start.record(on);
+        try kk.launchOn(on, g.Dim3.linear(host_in.len, 256), .{ .x = 256 }, 0, &.{ buf.argPtr(), g.interface.arg(&len) });
+        try end.record(on);
+        try end.synchronize();
+        best = @min(best, @as(f64, try g.runtime.cuda.Event.elapsedUs(&start, &end)));
     }
+    return best;
 }
 
-// ---------------------------------------------------------------------------
-// CPU. The concrete body against the generic one, now that 0.18's loop
-// vectorizer sees the concrete loop too.
-// ---------------------------------------------------------------------------
-
-const CpuCase = enum { map_concrete, map_generic, zip_concrete, zip_generic, sum_preset, exp_concrete };
-
-const Cpu = struct {
-    a: []f32,
-    b: []f32,
-    c: []f32,
-    sink: f32 = 0,
-    which: CpuCase = .map_concrete,
-
-    fn run(self: *Cpu) !void {
-        const p: k.P = .{ .scale = 1 };
-        switch (self.which) {
-            .map_concrete => {
-                var kk = try g.Kernel(k.map_f32, .cpu).init(0);
-                try kk.run(self.a, p);
-            },
-            .map_generic => {
-                var kk = try g.Kernel(k.map_f32_v, .cpu).init(0);
-                try kk.run(self.a, p);
-            },
-            .zip_concrete => {
-                var kk = try g.Kernel(k.zip_f32, .cpu).init(0);
-                try kk.run(self.a, self.b, self.c, p);
-            },
-            .zip_generic => {
-                var kk = try g.Kernel(k.zip_f32_v, .cpu).init(0);
-                try kk.run(self.a, self.b, self.c, p);
-            },
-            .sum_preset => {
-                var kk = try g.Kernel(k.sum_f32, .cpu).init(0);
-                self.sink += try kk.run(self.a, p);
-            },
-            .exp_concrete => {
-                var kk = try g.Kernel(k.exp_f32, .cpu).init(0);
-                try kk.run(self.a, p);
-            },
-        }
-    }
-};
-
-var host: Cpu = undefined;
-
-fn runCurrent() !void {
-    return host.run();
-}
-
-/// Median of `runs` monotonic-clock timings of `f`, in nanoseconds per element.
-fn cpuTime(io: std.Io, n: usize, comptime runs: usize, f: *const fn () anyerror!void) !f64 {
-    var t: [runs]i96 = undefined;
+/// `w` lanes at a time (1: the scalar call in a plain loop), median of 5, ns
+/// per call.
+fn mathCpuOne(comptime T: type, comptime name: []const u8, comptime w: usize, io: std.Io, xs: []T, src: []const T) !f64 {
+    var t: [5]i96 = undefined;
     for (&t) |*slot| {
+        @memcpy(xs, src);
         const start = std.Io.Clock.Timestamp.now(io, .awake);
-        try f();
+        if (w == 1) {
+            for (xs) |*x| x.* = k.mathBody(name, x.*);
+        } else {
+            var i: usize = 0;
+            while (i < xs.len) : (i += w) {
+                const v: @Vector(w, T) = xs[i..][0..w].*;
+                xs[i..][0..w].* = k.mathBody(name, v);
+            }
+        }
         slot.* = start.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.nanoseconds;
     }
+    std.mem.doNotOptimizeAway(xs[0]);
     std.mem.sort(i96, &t, {}, std.sort.asc(i96));
-    return @as(f64, @floatFromInt(t[runs / 2])) / @as(f64, @floatFromInt(n));
+    return @as(f64, @floatFromInt(t[2])) / @as(f64, @floatFromInt(xs.len * 8));
 }
 
-fn cpu(io: std.Io) !void {
+fn mathBench(io: std.Io) !void {
     const gpa = std.heap.page_allocator;
-    print("CPU: median of 11, ns per element\n", .{});
-    for ([_]usize{ 1 << 18, 1 << 24 }) |n| {
-        host.a = try gpa.alloc(f32, n);
-        defer gpa.free(host.a);
-        host.b = try gpa.alloc(f32, n);
-        defer gpa.free(host.b);
-        host.c = try gpa.alloc(f32, n);
-        defer gpa.free(host.c);
-        for (host.a, host.b, 0..) |*x, *y, i| {
-            x.* = @as(f32, @floatFromInt(i % 1000)) * 1e-3 - 0.5;
-            y.* = 1;
+    var ctx: ?g.runtime.cuda.Context = if (comptime g.available(B)) g.runtime.cuda.Context.init(0) catch null else null;
+    defer if (ctx) |*c| c.deinit();
+    print("g.math: GPU Gcalls/s (n={d}) | CPU ns/call scalar, vector (n={d})\n", .{ math_n_gpu, math_n_cpu });
+    inline for (.{ f32, f64 }) |T| {
+        const w = if (T == f32) 8 else 4;
+        const host_in = try gpa.alloc(T, math_n_gpu);
+        defer gpa.free(host_in);
+        fillMath(T, host_in);
+        const xs = try gpa.alloc(T, math_n_cpu);
+        defer gpa.free(xs);
+        var buf: ?g.runtime.cuda.Buffer = null;
+        var on: ?g.runtime.cuda.Stream = null;
+        if (ctx) |*c| {
+            buf = try c.alloc(math_n_gpu * @sizeOf(T));
+            on = try c.createStreamNonBlocking();
         }
-        inline for (std.enums.values(CpuCase)) |which| {
-            host.which = which;
-            const ns = try cpuTime(io, n, 11, runCurrent);
-            print("  {s:<13} n={d:>9}  {d:>6.3} ns/elem\n", .{ @tagName(which), n, ns });
+        defer if (buf) |*b| b.free();
+        defer if (on) |*st| st.deinit();
+        inline for (k.math_fns) |name| {
+            const gcalls = if (buf) |*b| @as(f64, math_n_gpu * 8) / (try mathGpuOne(T, name, &on.?, b, host_in)) / 1e3 else 0;
+            const s_ns = try mathCpuOne(T, name, 1, io, xs, host_in[0..math_n_cpu]);
+            const v_ns = try mathCpuOne(T, name, w, io, xs, host_in[0..math_n_cpu]);
+            print("  {s:<6} {s}  {d:>8.2} Gcalls/s  | {d:>6.2} {d:>6.2} ns\n", .{ name, @typeName(T), gcalls, s_ns, v_ns });
         }
     }
-    std.mem.doNotOptimizeAway(host.sink);
 }

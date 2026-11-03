@@ -6,7 +6,7 @@ const hip = @import("hip.zig");
 const iface = @import("../core/interface.zig");
 
 /// Which backend a handle came from. Distinct from `gompute.Backend`
-/// (`host/kernel.zig`), which is a separate enum with the same three tags --
+/// (`host/raw.zig`), which is a separate enum with the same three tags --
 /// they do not coerce to each other.
 pub const Backend = enum { cpu, cuda, hip };
 /// Launch geometry; see `core/interface.zig`.

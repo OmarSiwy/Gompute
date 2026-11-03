@@ -98,16 +98,15 @@ pub fn main(init: std.process.Init) !void {
 
     const input = try std.Io.Dir.cwd().readFileAlloc(io, args[1], arena, .limited(512 * 1024 * 1024));
     const names = emitNames(arena, input) catch |err| switch (err) {
-        // A user who forgot exportKernels gets told what to do, not an error name.
+        // A user who forgot exportRaw gets told what to do, not an error name.
         error.NoKernelsFound => {
             std.debug.print(
                 \\gompute: the device compilation of your kernels file produced no GPU entry points.
                 \\
-                \\Every kernel launched with Kernel(spec, .cuda) or Kernel(spec, .hip) must be
-                \\exported from the kernels file named by `.kernels_root` in your build.zig:
+                \\Every kernel launched with RawKernel(name, .cuda) or RawKernel(name, .hip) must
+                \\be exported from the kernels file named by `.kernels_root` in your build.zig:
                 \\
-                \\    comptime {{ g.exportKernels(@This()); }}          // all kernels in this file
-                \\    comptime {{ g.exportKernels(.{{ my_kernel }}); }}   // or an explicit list
+                \\    comptime {{ if (g.is_device) g.exportRaw("my_kernel", &myKernel); }}
                 \\
                 \\Check that the file exporting them is the same file `.kernels_root` points at.
                 \\

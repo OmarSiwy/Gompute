@@ -337,11 +337,7 @@ pub const exp2_poly = [5]f64{
 /// log(c) (log2(c) for the base-2 tables), rounded so that `768 + logc`
 /// (`1024 + logc` for log2) is exact -- that is what makes `k*ln2hi + logc`
 /// error-free.
-///
-/// The one entry type here that is `pub`: `math.zig`'s `logfSplit` takes a
-/// `*const [16]LogTab` so `logf` and `log2f` can share a prologue. The others
-/// are only ever reached through the arrays below, so they stay private.
-pub const LogTab = extern struct { invc: f64, logc: f64 };
+const LogTab = extern struct { invc: f64, logc: f64 };
 
 /// c split as a double-double, so `(z - chi - clo) * invc` reproduces
 /// `fma(z, invc, -1)` to within 2^-66 without an FMA, which every body here
@@ -802,67 +798,6 @@ pub const log2_tab2 = [64]LogTab2{
     .{ .chi = 0x1.55ffffd87b36fp+0, .clo = -0x1.709e731d02807p-55 },
     .{ .chi = 0x1.59ffff21df7bap+0, .clo = 0x1.7f79f68727b02p-55 },
     .{ .chi = 0x1.5dfffebfc3481p+0, .clo = -0x1.180902e30e93ep-54 },
-};
-
-// --- logf and log10f: math/logf_data.c ---------------------------------
-
-/// ln2 to a full double: `logf` accumulates k*ln2 in binary64, so no
-/// double-double split is needed.
-pub const logf_ln2: f64 = 0x1.62e42fefa39efp-1;
-
-/// log1p(r) = r + r^2*(poly[2] + poly[1]*r + poly[0]*r^2).
-pub const logf_poly = [3]f64{
-    -0x1.00ea348b88334p-2,
-    0x1.5575b0be00b6ap-2,
-    -0x1.ffffef20a4123p-2,
-};
-
-pub const logf_tab = [16]LogTab{
-    .{ .invc = 0x1.661ec79f8f3bep+0, .logc = -0x1.57bf7808caadep-2 },
-    .{ .invc = 0x1.571ed4aaf883dp+0, .logc = -0x1.2bef0a7c06ddbp-2 },
-    .{ .invc = 0x1.49539f0f010bp+0, .logc = -0x1.01eae7f513a67p-2 },
-    .{ .invc = 0x1.3c995b0b80385p+0, .logc = -0x1.b31d8a68224e9p-3 },
-    .{ .invc = 0x1.30d190c8864a5p+0, .logc = -0x1.6574f0ac07758p-3 },
-    .{ .invc = 0x1.25e227b0b8eap+0, .logc = -0x1.1aa2bc79c81p-3 },
-    .{ .invc = 0x1.1bb4a4a1a343fp+0, .logc = -0x1.a4e76ce8c0e5ep-4 },
-    .{ .invc = 0x1.12358f08ae5bap+0, .logc = -0x1.1973c5a611cccp-4 },
-    .{ .invc = 0x1.0953f419900a7p+0, .logc = -0x1.252f438e10c1ep-5 },
-    .{ .invc = 0x1p+0, .logc = 0x0p+0 },
-    .{ .invc = 0x1.e608cfd9a47acp-1, .logc = 0x1.aa5aa5df25984p-5 },
-    .{ .invc = 0x1.ca4b31f026aap-1, .logc = 0x1.c5e53aa362eb4p-4 },
-    .{ .invc = 0x1.b2036576afce6p-1, .logc = 0x1.526e57720db08p-3 },
-    .{ .invc = 0x1.9c2d163a1aa2dp-1, .logc = 0x1.bc2860d22477p-3 },
-    .{ .invc = 0x1.886e6037841edp-1, .logc = 0x1.1058bc8a07ee1p-2 },
-    .{ .invc = 0x1.767dcf5534862p-1, .logc = 0x1.4043057b6ee09p-2 },
-};
-
-// --- log2f: math/log2f_data.c ------------------------------------------
-
-/// log2(1+r) = poly[3]*r + r^2*(poly[2] + poly[1]*r + poly[0]*r^2).
-pub const log2f_poly = [4]f64{
-    -0x1.712b6f70a7e4dp-2,
-    0x1.ecabf496832ep-2,
-    -0x1.715479ffae3dep-1,
-    0x1.715475f35c8b8p+0,
-};
-
-pub const log2f_tab = [16]LogTab{
-    .{ .invc = 0x1.661ec79f8f3bep+0, .logc = -0x1.efec65b963019p-2 },
-    .{ .invc = 0x1.571ed4aaf883dp+0, .logc = -0x1.b0b6832d4fca4p-2 },
-    .{ .invc = 0x1.49539f0f010bp+0, .logc = -0x1.7418b0a1fb77bp-2 },
-    .{ .invc = 0x1.3c995b0b80385p+0, .logc = -0x1.39de91a6dcf7bp-2 },
-    .{ .invc = 0x1.30d190c8864a5p+0, .logc = -0x1.01d9bf3f2b631p-2 },
-    .{ .invc = 0x1.25e227b0b8eap+0, .logc = -0x1.97c1d1b3b7afp-3 },
-    .{ .invc = 0x1.1bb4a4a1a343fp+0, .logc = -0x1.2f9e393af3c9fp-3 },
-    .{ .invc = 0x1.12358f08ae5bap+0, .logc = -0x1.960cbbf788d5cp-4 },
-    .{ .invc = 0x1.0953f419900a7p+0, .logc = -0x1.a6f9db6475fcep-5 },
-    .{ .invc = 0x1p+0, .logc = 0x0p+0 },
-    .{ .invc = 0x1.e608cfd9a47acp-1, .logc = 0x1.338ca9f24f53dp-4 },
-    .{ .invc = 0x1.ca4b31f026aap-1, .logc = 0x1.476a9543891bap-3 },
-    .{ .invc = 0x1.b2036576afce6p-1, .logc = 0x1.e840b4ac4e4d2p-3 },
-    .{ .invc = 0x1.9c2d163a1aa2dp-1, .logc = 0x1.40645f0c6651cp-2 },
-    .{ .invc = 0x1.886e6037841edp-1, .logc = 0x1.88e9c2c1b9ff8p-2 },
-    .{ .invc = 0x1.767dcf5534862p-1, .logc = 0x1.ce0a44eb17bccp-2 },
 };
 
 // --- expf: math/exp2f_data.c -------------------------------------------

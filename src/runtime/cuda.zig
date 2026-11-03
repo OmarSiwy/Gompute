@@ -164,8 +164,8 @@ fn openFirst(names: []const []const u8) ?DynLib {
 /// Caller holds `lock`.
 fn loadApiLocked() Error!void {
     if (loaded) return;
-    // "No NVIDIA driver here" is an ordinary outcome -- AutoKernel probes CUDA
-    // on every machine -- so this is debug, not a print to stderr on the normal
+    // "No NVIDIA driver here" is an ordinary outcome -- `runtime.dynamic`
+    // probes CUDA on every machine -- so this is debug, not a print to stderr on the normal
     // path of a non-NVIDIA box. The caller gets error.InitFailed either way.
     var lib = openFirst(lib_names) orelse {
         std.log.debug("gompute: no CUDA driver; tried " ++ tried_paths, .{});
@@ -651,7 +651,7 @@ pub const Buffer = struct {
     /// `free` zeroes the handle and a default-constructed Buffer never had one.
     /// 0 is never a valid CUdeviceptr, so this is a caller mistake, not a copy
     /// from device address `offset`. Mirrors `hip.Buffer`: a use-after-free has
-    /// to mean the same thing on both backends, because `host/kernel.zig` is
+    /// to mean the same thing on both backends, because `host/raw.zig` is
     /// generic over them.
     fn devicePtr(self: *const Buffer) Error!CUdeviceptr {
         if (self.handle == 0) return error.InvalidArgument;
@@ -957,7 +957,7 @@ test "hand-built handles do not call through an undefined driver" {
 }
 
 test "a handle-less Buffer errors instead of copying from address zero" {
-    // The twin of hip.zig's test, and the reason it exists: `host/kernel.zig` is
+    // The twin of hip.zig's test, and the reason it exists: `host/raw.zig` is
     // generic over both backends, so a use-after-free has to report the same way
     // on each. cuda used to hand the driver `0 + offset` and let it decide.
     var buffer: Buffer = .{};

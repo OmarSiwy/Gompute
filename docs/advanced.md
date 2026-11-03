@@ -1,208 +1,102 @@
 # Advanced
 
-## Allocation-free GPU launch path
-
-`run` is intentionally convenient, not magical: it uploads, launches,
-synchronizes and downloads on every call. Its device buffers are kept on the
-handle and grown on demand, so only the first call (or a bigger one) pays for
-an allocation, and `deinit` frees them. When the data can stay on the device,
-skip the copies too:
-
-```zig
-var data = [_]f32{ -1, 2, -3, 4 };
-const bytes = data.len * @sizeOf(f32);
-
-var kernel = try g.Kernel(kernels.scale_relu, .cuda).init(0);
-defer kernel.deinit();
-
-var buffer = try kernel.alloc(data.len);
-defer buffer.free();
-
-try buffer.upload(&data, bytes);
-try kernel.launch(&buffer, data.len, .{ .scale = 2 });
-try kernel.context.synchronize();
-try buffer.download(&data, bytes);
-```
-
-`launch` creates only three stack-resident argument values: device pointer,
-length, and the generated extern parameter struct.
-
-`kernel.alloc` takes a count of **elements**; `Buffer` methods take **bytes**.
-`kernel.context` is the underlying `runtime.cuda.Context` / `runtime.hip.Context`,
-which is how you wait for a bare `launch`. `launch` does not synchronize, and a
-device-side fault will not surface until you do. For partial transfers,
-device-to-device copies and streams, see [Runtime](runtime.html).
-
 ## Graph replay
 
-`kernel.stream` is the stream `launch` enqueues on; it defaults to the NULL
-stream, which cannot be captured. Point it at a non-blocking stream and the same
-`launch` calls are recorded into a graph instead of run:
+A graph records a sequence of launches once and replays it with one driver
+call. Capture needs a non-blocking stream, since the NULL stream cannot be
+captured; launch onto it with `launchOn`:
 
 ```zig
-kernel.stream = try kernel.context.createStreamNonBlocking();
-defer kernel.stream.deinit();
+var raw = try g.RawKernel("scale_relu", .cuda).init(0);
+defer raw.deinit();
 
-try kernel.stream.beginCapture(.thread_local);
-try kernel.launch(&buffer, data.len, .{ .scale = 2 });
-try kernel.launch(&buffer, data.len, .{ .scale = 2 });
-var graph = try kernel.stream.endCapture();
+var stream = try raw.createStreamNonBlocking();
+defer stream.deinit();
+var len: u64 = count;
+var scale: f32 = 2;
+const args = [_]g.interface.Arg{ buffer.argPtr(), g.interface.arg(&len), g.interface.arg(&scale) };
+
+try stream.beginCapture(.thread_local);
+try raw.launchOn(&stream, g.Dim3.linear(count, 256), .{ .x = 256 }, 0, &args);
+try raw.launchOn(&stream, g.Dim3.linear(count, 256), .{ .x = 256 }, 0, &args);
+var graph = try stream.endCapture();
 defer graph.deinit();
 var exec = try graph.instantiate();
 defer exec.deinit();
 
-for (0..1000) |_| try exec.launch(&kernel.stream); // one driver call per replay
-try kernel.stream.synchronize();
+for (0..1000) |_| try exec.launch(&stream); // one driver call per replay
+try stream.synchronize();
 ```
 
-Arguments, `params` included, are copied at capture time, so a replay always
-runs with the values you captured; `exec.update(&new_graph)` swaps them in place
-when only the parameters changed. Nothing that waits on the host may run
-between `beginCapture` and `endCapture` -- `run`, `synchronize`, or a blocking
-`upload` invalidate the capture. `kernel.context.hasGraphs()` is false on a
-CUDA driver older than 11.4; every graph call then returns `error.Unsupported`.
+Capture records, it does not run: the buffer is untouched until the first
+replay. Arguments are copied at capture time, so a replay always runs with the
+values you captured; `exec.update(&new_graph)` swaps them in place when only
+the arguments changed, and returns `false` when the topology did. Nothing that
+waits on the host may run between `beginCapture` and `endCapture`:
+`synchronize` or a blocking `upload` invalidates the capture.
+`raw.hasGraphs()` is false on a CUDA driver older than 11.4; every graph call
+then returns `error.Unsupported`.
 
-## Compile-time fusion
+## Device builtins
 
-Each operation type exposes `eval`. `Fused` expands an `inline for`, keeping
-intermediate values in the same scalar expression/register chain:
-
-```zig
-const Scale = struct {
-    pub inline fn eval(x: f32, p: Params) f32 {
-        return x * p.scale;
-    }
-};
-
-const Square = struct {
-    pub inline fn eval(x: f32, _: Params) f32 {
-        return x * x;
-    }
-};
-
-const Pipeline = g.Fused(f32, Params, .{ Scale, Square });
-
-fn scaleSquare(x: f32, p: Params) f32 {
-    return Pipeline.eval(x, p);
-}
-```
-
-Putting `scaleSquare` in one `map` spec emits one CPU loop and one GPU kernel,
-not two launches and not an intermediate buffer.
-
-## Vectorized CPU kernels
-
-A concrete `fn (T, Params) T` compiles to a plain loop, and Zig 0.18's LLVM
-auto-vectorizes it where it can prove the loop: the codegen probe's concrete
-`map` is a 4x-unrolled AVX2 loop at `-Dcpu=native`, and concrete `zip`, `mapTo`
-and `mapIndexed` widen the same way. Two things the auto-vectorizer never
-gives you: `g.math` at vector width, because its table-driven bodies have no
-loop to widen, and a width that does not depend on the optimizer. For those,
-write the operation over `anytype`; the CPU backend then instantiates it at
-`std.simd.suggestVectorLength(T)` lanes itself. Use `g.splat` so the same
-source compiles at both scalar and vector width. `x * p.scale` is illegal
-when `x` is a vector and `p.scale` is an `f32`:
-
-```zig
-fn scaleRelu(x: anytype, p: Params) @TypeOf(x) {
-    const V = @TypeOf(x);
-    return @max(x * g.splat(V, p.scale), g.splat(V, @as(f32, 0)));
-}
-
-pub const scale_relu = g.map("scale_relu", f32, Params, scaleRelu, .{});
-```
-
-The GPU path instantiates it at scalar type, once per lane of the 16-byte
-vector each thread loads, so one definition serves both.
-
-## Hand-written raw kernels
-
-The same artifact pipeline can carry manually written CUDA/HIP kernels.
-`GlobalPtr` and `kernel_callconv` deliberately change between host and device
-compilations so the source file remains parseable on both targets:
-
-```zig
-const g = @import("gompute");
-
-fn rawAdd(data: g.GlobalPtr(f32), len: u64) callconv(g.kernel_callconv) void {
-    const i = g.globalIdX(256);
-    if (i < len) data[i] += 1;
-}
-
-comptime {
-    if (g.is_device) g.exportRaw("raw_add", &rawAdd);
-}
-```
-
-Load the embedded entry with a fixed raw handle:
-
-```zig
-var raw = try g.RawKernel("raw_add", .cuda).init(0);
-defer raw.deinit();
-
-var len: u64 = count;
-var args = [_]g.interface.Arg{
-    buffer.argPtr(),
-    g.interface.arg(&len),
-};
-try raw.launch(g.Dim3.linear(count, 256), .{ .x = 256 }, 0, &args);
-try raw.synchronize();
-```
-
-`globalIdX` reads the block size the kernel was launched with on both vendors
-(`%ntid.x`, and on AMD the dispatch packet), so any `block` works. Its
+`g.globalIdX` reads the block size the kernel was launched with on both
+vendors (`%ntid.x`, and on AMD the dispatch packet), so any `block` works. Its
 argument is ignored; it stays because kernels written for 1.4.0 pass one.
 
-For shared memory, barriers, multidimensional indexing, textures, or a custom
-ABI, use a raw kernel and the low-level [runtime](runtime.html) modules under
-`g.runtime`.
+`g.builtins` has the rest of the device intrinsics. It exists only in the
+device compilation, so name it under `if (g.is_device)` or inside a kernel
+only the device compilation analyzes.
 
-Inside a raw kernel, `g.builtins` has the rest of the device intrinsics:
-`localIdX()` for the thread's index within its block, `blockIdX()`, and
-`barrier()` for a block-wide execution barrier and shared-memory fence. Every
-thread in the block must reach that barrier, or NVIDIA hangs and AMD is
-undefined.
-`shuffleXor(T, v, mask)` swaps a value with the lane `mask` away inside a
-32-lane group, `__shfl_xor_sync` on NVIDIA and DPP / `ds_swizzle` /
-`v_permlanex16` on AMD; every lane of the group must reach it, so launch with
-a block that is a multiple of 32. The generated `reduce` folds with it.
-`gridDimX()` exists on NVPTX only, since Zig cannot read AMD's grid size;
-pass the stride as a kernel argument instead, which is what the generated
-`reduce` kernels do. `spinPause()` backs off inside a spin loop; it compiles to
-nothing on NVPTX targets below sm_70 with PTX 6.3. `g.builtins` is only present
-in the device compilation.
+- `localIdX()` is the thread's index within its block, `blockIdX()` the
+  block's index within the grid.
+- `barrier()` is a block-wide execution barrier and memory fence,
+  `__syncthreads`. Every thread in the block must reach it, or NVIDIA hangs
+  and AMD is undefined.
+- `shuffleXor(T, v, mask)` swaps a value with the lane `mask` away inside a
+  32-lane group, `__shfl_xor_sync` on NVIDIA and DPP / `ds_swizzle` /
+  `v_permlanex16` on AMD. Every lane of the group must reach it, so launch
+  with a block that is a multiple of 32. Groups are 32 lanes on both wave
+  sizes, so nothing depends on AMD's wave width.
+- `gridDimX()` exists on NVPTX only, since Zig cannot read AMD's grid size.
+  Pass the stride as a kernel argument instead.
+- `spinPause()` backs off inside a spin loop. It compiles to nothing on NVPTX
+  targets below sm_70 with PTX 6.3.
+
+## Atomics
 
 For atomics, use Zig's `@atomicRmw`, `@atomicLoad` and `@atomicStore` on global
 pointers. One caveat: on NVPTX every `@atomicRmw` runs relaxed, whatever
 ordering you pass. Order through an acquire load or a release store instead.
+`g.builtins.loadAcquireDevice` and `storeReleaseDevice` are those two at
+device scope rather than Zig's system scope, which on NVPTX skips the
+system-scope fence.
+
+## Picking a kernel at run time
 
 If the kernel to launch is named by a config file rather than by your source,
 `g.rawKernelByName(.cuda, name, 0)` resolves it against the same compiled set
-and returns `error.KernelNotFound` for a name that is not there.
+and returns `error.KernelNotFound` for a name that is not there. See
+[Build integration](build.html#picking-a-kernel-at-run-time).
 
-## Custom ABI boundaries
+## Vectorized CPU loops
 
-When a `Params` field has no stable GPU representation, decompose it yourself:
+The CPU path is your own loop over the element function, and LLVM's loop
+vectorizer, on in Zig 0.18, widens a concrete one. It cannot widen a loop
+that calls `g.math`: the table-driven bodies have no loop of their own to
+widen. Every `g.math` function also takes a `@Vector`, each lane the scalar
+call's bits, so widen that loop by hand:
 
 ```zig
-const Handle = struct {
-    id: u64,
-    gain: f64,
-
-    pub const gpu_layout = extern struct { id_lo: u32, id_hi: u32, gain: f32 };
-
-    pub fn toGpu(v: @This()) gpu_layout {
-        return .{
-            .id_lo = @truncate(v.id),
-            .id_hi = @truncate(v.id >> 32),
-            .gain = @floatCast(v.gain),
-        };
-    }
-    pub fn fromGpu(w: gpu_layout) @This() {
-        return .{ .id = @as(u64, w.id_hi) << 32 | w.id_lo, .gain = w.gain };
-    }
-};
+const w = std.simd.suggestVectorLength(f32) orelse 1;
+var i: usize = 0;
+while (i + w <= xs.len) : (i += w) {
+    const v: @Vector(w, f32) = xs[i..][0..w].*;
+    xs[i..][0..w].* = g.math.exp(v);
+}
+for (xs[i..]) |*x| x.* = g.math.exp(x.*);
 ```
 
-All three declarations are required together, and `gpu_layout` must be `extern`
-or `packed`.
+On an i9-14900HX (Zig 0.18.0-dev.349, `examples/bench` with `BENCH=math`, 8
+lanes for f32), f32 `log` went from 5.43 to 2.10 ns per call and `sin` from
+7.40 to 2.64. Which functions have a real SIMD body is in
+[Device math](reference.html#device-math).

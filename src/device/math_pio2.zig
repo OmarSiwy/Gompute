@@ -210,7 +210,7 @@ const init_jk = [_]i32{ 3, 4, 4, 6 }; // initial value for jk
 ///
 /// NB: This table must have at least (e0-3)/24 + jk terms.
 ///     For quad precision (e0 <= 16360, jk = 6), this is 686.
-const ipio2 = [_]i32{
+pub const ipio2 = [_]i32{
     0xA2F983, 0x6E4E44, 0x1529FC, 0x2757D1, 0xF534DD, 0xC0DB62,
     0x95993C, 0x439041, 0xFE5163, 0xABDEBB, 0xC561B7, 0x246E3A,
     0x424DD2, 0xE00649, 0x2EEA09, 0xD1921C, 0xFE1DEB, 0x1CB129,

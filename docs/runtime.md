@@ -1,11 +1,10 @@
 # Runtime
 
-`Kernel` and `AutoKernel` are one policy over a smaller layer: `g.runtime`.
-Reach for the runtime directly when you want something the map API does not
-express: streams, buffer-to-buffer copies, partial transfers, or launching a
-[raw kernel](advanced.html) whose ABI is your own.
-
-Nothing here is required for ordinary use. If `run` fits, use `run`.
+`RawKernel` is a thin handle over a smaller layer: `g.runtime`. Its `Buffer`,
+`Stream`, `Graph` and `Event` types are this layer's, and its `context` field
+is a `runtime.cuda.Context` or `runtime.hip.Context`. Reach for the runtime
+directly when you want something the handle does not wrap: partial and async
+transfers, device queries, peer access, or loading an image yourself.
 
 - `g.runtime.dynamic` is one tagged-union facade over both vendors, plus a `.cpu`
   arm that fails politely. Pick this unless you have a reason not to.
@@ -43,7 +42,7 @@ std.debug.print("running on {t}\n", .{gpu.backend});
 ## Getting at the compiled kernels
 
 `emitKernels` generates a module named `gompute_kernels` and wires it into your
-`gompute` import. It is what `Kernel.init` reads, and you can read it too:
+`gompute` import. It is what `RawKernel.init` reads, and you can read it too:
 
 ```zig
 pub const emitted: bool;                        // was emitKernels called at all
@@ -73,9 +72,10 @@ var kernel = try module.getKernel(entry.symbol);
 
 ## A launch, by hand
 
-The generated entry point for a `map` takes `(data, len, params)`. Arguments
-are passed the way both drivers want them: an array of pointers to the storage
-holding each value, so every argument needs a variable with an address.
+The `scale_relu` kernel from the [guide](guide.html) takes `(data, len, scale)`.
+Arguments are passed the way both drivers want them: an array of pointers to
+the storage holding each value, so every argument needs a variable with an
+address.
 
 ```zig
 const N: usize = 1024;
@@ -84,22 +84,17 @@ defer buffer.free();
 try buffer.upload(@ptrCast(&host_data), N * @sizeOf(f32));
 
 var len: u64 = N;
-var params = g.abi.pack(kernels.Params, .{ .scale = 2 });
+var scale: f32 = 2;
 var args = [_]g.interface.Arg{
     buffer.argPtr(),
     g.interface.arg(&len),
-    g.interface.arg(&params),
+    g.interface.arg(&scale),
 };
 
 try kernel.launch(g.Dim3.linear(N, 256), .{ .x = 256 }, 0, &args);
 try gpu.synchronize();
 try buffer.download(@ptrCast(&host_data), N * @sizeOf(f32));
 ```
-
-The block size in the launch must match the spec's `block_size`. For generated
-kernels that is `.{ .block_size = 256 }` in the spec, 256 here. For raw
-kernels, see the warning in [Advanced](advanced.html): the two backends disagree
-about which one wins.
 
 `launch` does not synchronize. Nothing tells you a kernel faulted until the
 next `synchronize`, which is where you will see `error.SyncFailed` for a fault
@@ -150,29 +145,33 @@ and nothing else changes:
   `GOMPUTE_FAKE_DEVICES=k` makes ordinals up to `k-1` extra contexts on device
   0, so a two-device program runs on one card; `Context.info` tells a real
   second card (its own `uuid`) from a fake one (`fake`, the same `uuid`).
-- `Compute.initDevice(backend, ordinal)` or `Kernel(spec, .cuda).init(ordinal)`
+- `Compute.initDevice(backend, ordinal)` or `RawKernel(name, .cuda).init(ordinal)`
   opens one handle per device.
-- `run` synchronizes, so launching through it on N devices serializes them.
+- A blocking `upload`, `launch` and `synchronize` per device serializes them.
   To overlap, give each device a non-blocking stream and pinned host memory,
   queue the upload, the launch and the download on each stream, then wait for
   every stream:
 
 ```zig
+const K = g.RawKernel("scale_relu", .cuda);
 const n = try rt.deviceCount(.cuda);
-var handle: [16]g.Kernel(kernels.scale_relu, .cuda) = undefined;
-var stream: [16]g.runtime.cuda.Stream = undefined;
-var dev: [16]g.runtime.cuda.Buffer = undefined;
+var handle: [16]K = undefined;
+var stream: [16]K.Stream = undefined;
+var dev: [16]K.Buffer = undefined;
 var pinned: [16][]u8 = undefined;
 const part = data.len / n;
+var len: u64 = part;
+var scale: f32 = 2;
 for (0..n) |d| {
-    handle[d] = try g.Kernel(kernels.scale_relu, .cuda).init(@intCast(d));
-    stream[d] = try handle[d].context.createStreamNonBlocking();
-    handle[d].stream = stream[d];
-    dev[d] = try handle[d].alloc(part);
-    pinned[d] = try handle[d].context.allocPinned(part * @sizeOf(f32));
+    handle[d] = try K.init(@intCast(d));
+    stream[d] = try handle[d].createStreamNonBlocking();
+    dev[d] = try handle[d].alloc(part * @sizeOf(f32));
+    pinned[d] = try handle[d].allocPinned(part * @sizeOf(f32));
     @memcpy(pinned[d], std.mem.sliceAsBytes(data[d * part ..][0..part]));
     try dev[d].uploadAtAsync(pinned[d].ptr, 0, pinned[d].len, &stream[d]);
-    try handle[d].launch(&dev[d], part, .{ .scale = 2 });
+    try handle[d].launchOn(&stream[d], g.Dim3.linear(part, 256), .{ .x = 256 }, 0, &.{
+        dev[d].argPtr(), g.interface.arg(&len), g.interface.arg(&scale),
+    });
     try dev[d].downloadAtAsync(pinned[d].ptr, 0, pinned[d].len, &stream[d]);
 }
 for (0..n) |d| try stream[d].synchronize();
@@ -221,4 +220,4 @@ The set of kernels is still closed at build time, since everything was compiled
 from your kernel roots. Only the *choice* is deferred, and an unknown name is
 `error.KernelNotFound` rather than a panic. The returned handle is
 `g.RawByName(.cuda)`, which has the same `alloc` / `launch` / `synchronize` as
-[`RawKernel`](advanced.html) but no `init`, since it is already initialized.
+[`RawKernel`](reference.html#rawkernel) but no `init`, since it is already initialized.

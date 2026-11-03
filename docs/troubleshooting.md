@@ -21,8 +21,8 @@ is not one. CPU-only builds do not need this.
 No driver on this machine. The library `dlopen`s `libcuda.so` /
 `libamdhip64.so` and neither is present, or `cuInit` itself failed.
 
-This is the *normal* answer on a machine with no GPU. It is what `AutoKernel`
-silently falls back to the CPU on, and it is what you should expect in CI.
+This is the *normal* answer on a machine with no GPU. It is the error to catch
+on `init` to take your CPU path, and it is what you should expect in CI.
 
 If you believe a GPU is there, check that the driver library is on the loader
 path. Gompute also looks in `/run/opengl-driver/lib`, which is where NixOS puts
@@ -50,9 +50,8 @@ gompute_build.emitKernels(b, dep, exe, .{
 The image loaded, but holds no symbol by that name. Two things to check, and
 the log line names both:
 
-1. Is the spec exported? A kernel root needs
-   `comptime { g.exportKernels(@This()); }`, or an explicit
-   `g.exportKernels(.{ scale_relu })`.
+1. Is the kernel exported? A kernel root needs
+   `comptime { if (g.is_device) g.exportRaw("scale_relu", &scaleReluKernel); }`.
 2. Does the `kernels_root` you passed to `emitKernels` point at the same file
    your host code imports as `kernels`? Two files, one exporting and one
    imported, is the quiet version of this bug.
@@ -60,40 +59,39 @@ the log line names both:
 From `rawKernelByName`, it just means the runtime name matched nothing in the
 compiled set.
 
-## `error.BackendUnavailable`
+## Compile error: `RawKernel(name, .cuda) was asked for, but this build emitted no cuda artifacts`
 
-`Kernel(spec, .cuda).init` in a build that emitted no CUDA artifact. Either
-`.auto` found no NVIDIA GPU on the build machine, or you passed
-`.cuda = .{ .enabled = false }`.
+Either `.auto` found no NVIDIA GPU on the build machine, or you passed
+`.cuda = .{ .enabled = false }`. Pin the arch you deploy to, as above, or
+guard the GPU branch with `if (comptime g.available(.cuda))` so a build
+without the backend compiles it out.
 
-`Kernel(spec, .cuda)` itself is a *compile* error in that case, with the fix in
-the message. You only reach the runtime error through `AutoKernel`, which
-compiles all three backends by design.
+If the message says the build never emitted any artifacts, `emitKernels` (or
+`addKernels`) is missing from your `build.zig`.
 
-## It silently ran on the CPU and took 100× longer
+## It silently ran on the CPU
 
-`AutoKernel.init()` distinguishes two things that look alike:
+`catch break :gpu` on `init` takes the CPU path on every error, and two of
+them look alike from there:
 
-- No driver at all. Falls back to the CPU without a word, which is correct:
-  there is no GPU.
-- Artifact present but it failed to load. Logs a warning, because that is a
-  build mistake and the cost of not noticing is enormous.
+- No driver, or no device at that ordinal: `error.InitFailed` or
+  `error.NoDevice`. Falling back is correct; there is no GPU.
+- The artifact is in the binary and failed to load: `error.ModuleLoadFailed`
+  or `error.KernelNotFound`. That is a build mistake, and the library logs it
+  at `std.log.err` with what to check.
 
-If you want the second case to be fatal:
-
-```zig
-var kernel = try g.AutoKernel(kernels.scale_relu).initStrict();
-```
-
-To assert what you actually got:
+To make the second case fatal, fall back on the first two only:
 
 ```zig
-std.debug.assert(kernel.selected() == .cuda);
+var kernel = g.RawKernel("scale_relu", .cuda).init(0) catch |err| switch (err) {
+    error.InitFailed, error.NoDevice => break :gpu,
+    else => return err,
+};
 ```
 
 ## `error.LaunchFailed`
 
-The driver refused the launch. In order of likelihood: a `block_size` past the
+The driver refused the launch. In order of likelihood: a block past the
 device's limit (both vendors cap at 1024), a grid past `gridDim.x = 2^31-1`, or
 argument storage that went out of scope before the launch. Kernel arguments are
 passed as *pointers to* your variables, so every one of them needs to outlive
@@ -105,37 +103,6 @@ Almost always a fault from an *earlier* launch. `launch` is asynchronous and
 does not report device-side faults; the next `synchronize` does. If a
 synchronize fails and the launch before it looked fine, the launch before it is
 the suspect. `lastDriverError().code` has the vendor's own code.
-
-## Compile error naming a `Params` field
-
-```
-gompute: `Params.inner.w` has type `usize`, which cannot cross the GPU boundary.
-```
-
-Some field cannot cross the host/device boundary. `usize` and `isize` are the
-common ones: pointer width may differ between host and device, so they are
-rejected rather than guessed at. Use a fixed-width integer, or give the type a
-[custom boundary](advanced.html).
-
-The path is the full field path, not just the type it happened to reach.
-
-## The GPU and the CPU disagree in the last few bits of a reduce
-
-Expected. `reduce` reassociates freely across threads and blocks, and float
-addition is not associative. A GPU sum and a strict left-to-right CPU sum
-differ in the low bits, and the GPU answer changes with the launch geometry.
-
-Compare with a tolerance, or reduce in `f64`.
-
-If the disagreement is *large*, `combine` is probably not associative, or
-`identity` is not its neutral element. Both are your side of the contract.
-
-## `scatter` gives different results every run
-
-Also expected, if two indices are equal. Two threads writing one slot race, and
-which one lands is unspecified on both vendors. There is no `scatterAdd`;
-combining duplicates needs a device float atomic, which is gfx9+ and
-`--unsafe-fp-atomics` on AMD.
 
 ## `error.Unsupported` from `enablePeerAccess`
 

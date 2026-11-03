@@ -89,8 +89,8 @@ inline fn shfl32(v: u32, comptime mask: u5) u32 {
 ///
 /// NVPTX ONLY. Zig has `@workGroupSize` but no grid-size builtin, and the
 /// AMDGCN answer is the dispatch packet's `grid_size_x`, whose pointer lives
-/// in the constant address space Zig rejects on amdgcn. The generated
-/// `reduce` takes its grid stride as a kernel argument instead: the host
+/// in the constant address space Zig rejects on amdgcn. A portable
+/// kernel takes its grid stride as a kernel argument instead: the host
 /// computed the grid, so it can just say what it is.
 ///
 /// ponytail: declaring `llvm.amdgcn.grid.size.x` does not work around it: it

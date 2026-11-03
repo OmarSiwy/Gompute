@@ -1,22 +1,184 @@
-//! Thin loader for hand-written GPU kernels emitted by the same build pipeline.
+//! Hand-written GPU kernels: loading the artifact `build.zig` emitted, and
+//! launching an entry point out of it by name.
 
 const std = @import("std");
 const iface = @import("../core/interface.zig");
-const host = @import("kernel.zig");
+const cuda = @import("../runtime/cuda.zig");
+const hip = @import("../runtime/hip.zig");
+
+/// Where a kernel runs. `.cpu` always exists; the GPU tags need the matching
+/// backend to have been emitted by build.zig.
+pub const Backend = enum { cpu, cuda, hip };
+
+/// The two GPU backends differ only in which runtime module they call and how
+/// a kernel's entry name is spelled in the emitted artifact.
+pub const Gpu = struct {
+    backend: Backend,
+    rt: type,
+    /// Field names in the generated `gompute_kernels` module.
+    has: []const u8,
+    /// One device image per kernel root, in blob order.
+    images: []const u8,
+    /// Kernel name -> `.{ .blob, .symbol }`, merged from every root at comptime.
+    /// Both backends consult it: it says which blob to load, and the lookup
+    /// itself is what turns a missing kernel into a compile error rather than a
+    /// runtime KernelNotFound. See `openModule`.
+    index: []const u8,
+    /// A device arch to name in diagnostics, so the fix is copy-pasteable.
+    example_cpu: []const u8,
+};
+
+/// The two descriptors that exist. Every generic here is instantiated with one
+/// of them, and `gpuOf` is how a `Backend` tag picks.
+pub const gpu_cuda: Gpu = .{ .backend = .cuda, .rt = cuda, .has = "has_cuda", .images = "cuda_images", .index = "cuda_index", .example_cpu = "sm_89" };
+pub const gpu_hip: Gpu = .{ .backend = .hip, .rt = hip, .has = "has_hip", .images = "hip_images", .index = "hip_index", .example_cpu = "gfx1100" };
+
+/// The descriptor for a backend tag, for the device-only entry points below.
+/// `what` names the caller so the `.cpu` diagnostic can say which one
+/// was device-only, rather than just that the tag was wrong.
+pub fn gpuOf(comptime backend: Backend, comptime what: []const u8) Gpu {
+    return switch (backend) {
+        .cuda => gpu_cuda,
+        .hip => gpu_hip,
+        .cpu => @compileError(what ++ " is device-only; use a normal Zig function on CPU"),
+    };
+}
+
+/// Whether this build actually carries a device artifact for `gpu`: the
+/// question to ask before naming `RawKernel(name, .cuda)`, which is a compile
+/// error when the answer is false. Public as `gompute.available(.cuda)`.
+///
+/// The import stays inside the function on purpose: the library's own test
+/// build has no `gompute_kernels` module at all, and a file-scope import would
+/// be analyzed there.
+pub fn available(comptime gpu: Gpu) bool {
+    return @field(@import("gompute_kernels"), gpu.has);
+}
+
+/// Whether `emitKernels`/`addKernels` was ever called. The generated module says
+/// `emitted = true`, build.zig's default stub says `false`; a build.zig old
+/// enough to declare neither can only have resolved the real generated module.
+fn emitted() bool {
+    const artifacts = @import("gompute_kernels");
+    return !@hasDecl(artifacts, "emitted") or artifacts.emitted;
+}
+
+/// Passes `T` through, or explains at compile time why `gpu` has no artifact.
+pub fn requireArtifacts(comptime gpu: Gpu, comptime T: type) type {
+    if (comptime available(gpu)) return T;
+    const tag = @tagName(gpu.backend);
+    if (comptime !emitted()) @compileError(
+        "gompute: RawKernel(name, ." ++ tag ++ ") needs device artifacts, but this build never " ++
+            "emitted any. Add to build.zig:\n" ++
+            "    const gompute_build = @import(\"gompute\");\n" ++
+            "    gompute_build.emitKernels(b, dep, exe, .{ .kernels_root = b.path(\"src/kernels.zig\") });\n" ++
+            "(or gompute_build.addKernels for more than one executable).",
+    );
+    @compileError(
+        "gompute: RawKernel(name, ." ++ tag ++ ") was asked for, but this build emitted no " ++ tag ++
+            " artifacts. Either .auto detected no " ++ tag ++ " GPU on the BUILD machine, or you " ++
+            "passed ." ++ tag ++ " = .{ .enabled = false }. Fix it by pinning the arch you deploy " ++
+            "to -- ." ++ tag ++ " = .{ .gpu = .{ .name = \"" ++ gpu.example_cpu ++ "\" } } in " ++
+            "emitKernels -- or guard the call with `if (comptime gompute.available(." ++ tag ++ "))`.",
+    );
+}
+
+/// A device, the loaded blob it came from, and one kernel inside it.
+pub fn Opened(comptime gpu: Gpu) type {
+    return struct {
+        context: gpu.rt.Context,
+        module: gpu.rt.Module,
+        kernel: gpu.rt.Kernel,
+    };
+}
+
+/// Open the artifact for `gpu` and resolve `entry_name` in it.
+///
+/// The name is resolved at compile time: a kernel that is not in any emitted
+/// root is a `@compileError` naming it, rather than a runtime `KernelNotFound`
+/// discovered on a customer's machine. Nothing else in the pipeline verifies
+/// that a requested kernel was actually emitted.
+pub fn openModule(
+    comptime gpu: Gpu,
+    comptime entry_name: [:0]const u8,
+    ordinal: c_int,
+) iface.Error!Opened(gpu) {
+    const artifacts = @import("gompute_kernels");
+    if (comptime !@field(artifacts, gpu.has)) return error.BackendUnavailable;
+    const entry = comptime @field(artifacts, gpu.index).get(entry_name) orelse @compileError(
+        "gompute: " ++ @tagName(gpu.backend) ++ " kernel \"" ++ entry_name ++ "\" is not in " ++
+            "any emitted kernel root; export it from the root file with " ++
+            "`comptime { if (g.is_device) g.exportRaw(\"" ++ entry_name ++ "\", &fn); }`, and check " ++
+            "that the root is listed in " ++
+            "your emitKernels call.",
+    );
+    // Only this kernel's blob is loaded: one root out of N is JIT'd, not all N.
+    return open(gpu, entry_name, entry, ordinal);
+}
+
+/// `openModule` for a kernel name that is only known at run time -- a name read
+/// out of a config file or a netlist. The set of kernels is still closed at
+/// build time, so an unknown name is `error.KernelNotFound`, not a panic.
+pub fn openModuleByName(
+    comptime gpu: Gpu,
+    name: []const u8,
+    ordinal: c_int,
+) iface.Error!Opened(gpu) {
+    const artifacts = @import("gompute_kernels");
+    if (comptime !@field(artifacts, gpu.has)) return error.BackendUnavailable;
+    const entry = @field(artifacts, gpu.index).get(name) orelse return error.KernelNotFound;
+    return open(gpu, name, entry, ordinal);
+}
+
+/// `entry` is `gompute_kernels.Entry`, duck-typed so the generated module owns
+/// the definition.
+fn open(comptime gpu: Gpu, name: []const u8, entry: anytype, ordinal: c_int) iface.Error!Opened(gpu) {
+    const artifacts = @import("gompute_kernels");
+    const tag = @tagName(gpu.backend);
+
+    var context = try gpu.rt.Context.init(ordinal);
+    errdefer context.deinit();
+    // Past this point the artifact is in the binary and the device is up, so
+    // every remaining failure is a build bug. Callers are allowed to swallow the
+    // error; they are not allowed to swallow the reason.
+    var module = context.loadModuleFromMemory(@field(artifacts, gpu.images)[entry.blob]) catch |err| {
+        std.log.err(
+            "gompute: this binary's " ++ tag ++ " artifact for kernel root \"{s}\" will not " ++
+                "load on this device ({t}, driver code {d}). The usual cause is a device arch " ++
+                "mismatch -- the build compiled for one GPU and this machine has another. Pin " ++
+                "the arch you deploy to with ." ++ tag ++ " = .{{ .gpu = .{{ .name = \"" ++
+                gpu.example_cpu ++ "\" }} }} in emitKernels.",
+            .{ artifacts.root_names[entry.blob], err, iface.last_driver_error.code },
+        );
+        return err;
+    };
+    errdefer module.deinit();
+    const kernel = module.getKernel(entry.symbol.ptr) catch |err| {
+        std.log.err(
+            "gompute: " ++ tag ++ " kernel \"{s}\" is in the name table but not in the emitted " ++
+                "artifact ({t}, driver code {d}). Two things to check: does your kernels root " ++
+                "export it with gompute.exportRaw, and does the " ++
+                "root you passed to emitKernels point at that same file?",
+            .{ name, err, iface.last_driver_error.code },
+        );
+        return err;
+    };
+    return .{ .context = context, .module = module, .kernel = kernel };
+}
 
 /// A hand-written device entry point, loaded by the name it was exported under.
 /// Device-only: naming `.cpu` is a compile error, because there is nothing for
 /// this to load and a plain Zig function is what you want instead.
-pub fn RawKernel(comptime entry_name: [:0]const u8, comptime backend: host.Backend) type {
-    const gpu = host.gpuOf(backend, "RawKernel");
-    return host.requireArtifacts(gpu, GpuRaw(entry_name, gpu));
+pub fn RawKernel(comptime entry_name: [:0]const u8, comptime backend: Backend) type {
+    const gpu = gpuOf(backend, "RawKernel");
+    return requireArtifacts(gpu, GpuRaw(entry_name, gpu));
 }
 
 /// The handle `rawKernelByName` returns: a `RawKernel` whose kernel was picked
 /// at run time, so it has no comptime `init` of its own.
-pub fn RawByName(comptime backend: host.Backend) type {
-    const gpu = host.gpuOf(backend, "kernel-by-name");
-    return host.requireArtifacts(gpu, GpuRaw(null, gpu));
+pub fn RawByName(comptime backend: Backend) type {
+    const gpu = gpuOf(backend, "kernel-by-name");
+    return requireArtifacts(gpu, GpuRaw(null, gpu));
 }
 
 /// Load the kernel called `name`, decided at run time -- from a parsed netlist,
@@ -24,17 +186,17 @@ pub fn RawByName(comptime backend: host.Backend) type {
 /// unknown name is `error.KernelNotFound` rather than a panic, and only the one
 /// root that exports it is JIT'd.
 pub fn rawKernelByName(
-    comptime backend: host.Backend,
+    comptime backend: Backend,
     name: []const u8,
     ordinal: c_int,
 ) iface.Error!RawByName(backend) {
-    const gpu = comptime host.gpuOf(backend, "kernel-by-name");
-    const opened = try host.openModuleByName(gpu, name, ordinal);
+    const gpu = comptime gpuOf(backend, "kernel-by-name");
+    const opened = try openModuleByName(gpu, name, ordinal);
     return .{ .context = opened.context, .module = opened.module, .kernel = opened.kernel };
 }
 
 /// `entry_name` is null for a handle whose kernel is chosen at run time.
-fn GpuRaw(comptime entry_name: ?[:0]const u8, comptime gpu: host.Gpu) type {
+fn GpuRaw(comptime entry_name: ?[:0]const u8, comptime gpu: Gpu) type {
     return struct {
         const Self = @This();
         /// Device memory, valid on every handle for the same device.
@@ -61,7 +223,7 @@ fn GpuRaw(comptime entry_name: ?[:0]const u8, comptime gpu: host.Gpu) type {
             const name = entry_name orelse
                 @compileError("gompute: this handle came from rawKernelByName, which already " ++
                     "loaded its kernel; there is nothing for init() to name.");
-            const opened = try host.openModule(gpu, name, ordinal);
+            const opened = try openModule(gpu, name, ordinal);
             return .{ .context = opened.context, .module = opened.module, .kernel = opened.kernel };
         }
 
@@ -76,8 +238,7 @@ fn GpuRaw(comptime entry_name: ?[:0]const u8, comptime gpu: host.Gpu) type {
             self.* = .{};
         }
 
-        /// `bytes`, not elements -- there is no spec here to size against, which
-        /// is the one place this handle disagrees with `Kernel.alloc`.
+        /// `bytes`, not elements: nothing here knows the kernel's element type.
         ///
         /// Caller owns the returned buffer and must `free` it.
         pub fn alloc(self: *Self, bytes: usize) iface.Error!Buffer {
@@ -132,8 +293,8 @@ fn GpuRaw(comptime entry_name: ?[:0]const u8, comptime gpu: host.Gpu) type {
         }
 
         /// Launch on the NULL stream and return once the launch is queued. The
-        /// grid and block are yours to pick: unlike `Kernel`, nothing here knows
-        /// the kernel's shape.
+        /// grid and block are yours to pick: nothing here knows the kernel's
+        /// shape. Pass `globalIdX` the same block size.
         pub fn launch(
             self: *Self,
             grid: iface.Dim3,
@@ -141,7 +302,7 @@ fn GpuRaw(comptime entry_name: ?[:0]const u8, comptime gpu: host.Gpu) type {
             shared_bytes: u32,
             args: []const iface.Arg,
         ) iface.Error!void {
-            // Worker threads start with no current context; see GpuKernel.launch.
+            // A worker thread starts with no current context; make this device current.
             try self.context.makeCurrent();
             return self.kernel.launch(grid, block, shared_bytes, args);
         }
@@ -174,12 +335,12 @@ fn GpuRaw(comptime entry_name: ?[:0]const u8, comptime gpu: host.Gpu) type {
 // the library's own test build emits no artifacts, so `requireArtifacts` makes
 // every public entry point here a compile error. `GpuRaw` is reachable, and
 // naming it is most of the point -- these tests are what pulls this file's
-// bodies through semantic analysis at all (see the `test` at the end of
-// kernel.zig for why that needs help).
+// bodies through semantic analysis at all: `root.zig` reaches this file only
+// through lazily analyzed decls.
 // ---------------------------------------------------------------------------
 
 test GpuRaw {
-    inline for (.{ host.gpu_cuda, host.gpu_hip }) |gpu| {
+    inline for (.{ gpu_cuda, gpu_hip }) |gpu| {
         const Raw = GpuRaw("gompute_seam_probe", gpu);
         std.testing.refAllDecls(Raw);
         try std.testing.expect(Raw.Buffer == gpu.rt.Buffer);
@@ -198,7 +359,7 @@ test "the async surface still lines up with the blocking one" {
     // landed in one commit and nothing calls them yet. Until something does,
     // this is the oracle: the pairs have to keep matching, or whoever finishes
     // the overlap path inherits three mismatches at once.
-    inline for (.{ host.gpu_cuda, host.gpu_hip }) |gpu| {
+    inline for (.{ gpu_cuda, gpu_hip }) |gpu| {
         const Raw = GpuRaw("gompute_seam_probe", gpu);
 
         const stream = @typeInfo(@TypeOf(Raw.createStream)).@"fn".return_type.?;
