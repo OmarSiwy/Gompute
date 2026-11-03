@@ -142,7 +142,8 @@ exp2 log log2 log10 log1p pow sin cos tan tanh sinh cosh expm1 atan sqrt
 rsqrt`, for `f32`/`f64`/vectors; `pow(x, y: @TypeOf(x))`. Each gives the
 same bits on host, NVPTX, AMDGCN and at comptime: f32 exp, log, log2, log10,
 sin and cos by being correctly rounded (checked on all 2³² inputs), the rest
-by being one body with no FMA or intrinsic. `math.max_ulp` holds the f64
+by being one body with no FMA or intrinsic (no optional contraction in the IR,
+checked on four targets). `atan(-0)` is -0 from 2.0.1 on; 2.0.0 returned +0. `math.max_ulp` holds the f64
 bounds: exp 0.52, log 0.52, pow 0.55 (measured 0.505 / 0.502 / 0.502 against
 f128). The vector forms are lane-exact with the scalar call; a CPU loop
 reaches them only by stepping `@Vector`s by hand.
