@@ -117,6 +117,9 @@ pub fn main() !void {
     // ── g.math: the same bits on the GPU as on the CPU ──────────────────
     section("math bit-identity", 2, testMathBits);
 
+    // ── g.math f32: every input, on the GPU, for the correctly rounded ones ─
+    section("math f32 sweep", k2.math_cr32.len, testMathSweep);
+
     // ── Comptime CPU reference (sanity baseline) ────────────────────────
     testCpuReference();
 
@@ -261,6 +264,40 @@ fn testMathBits() void {
         check("math_bits_" ++ @typeName(T), mismatches == 0);
     }
     print("  done\n", .{});
+}
+
+/// Every one of the 2^32 f32 inputs through each correctly rounded `g.math`
+/// function, CUDA against the CPU. The CPU bodies are proven correctly rounded
+/// on every input by math.zig's tests; the device bodies differ from them, so
+/// this is what proves the GPU codegen (no FTZ, no contraction) is too.
+fn testMathSweep() void {
+    print("\n[math f32 sweep]\n", .{});
+    if (!g.AutoKernel(k2.math_f32).Cuda.available) return skip("this build emitted no CUDA artifacts");
+    var gpu = g.Kernel(k2.math_f32, .cuda).init(0) catch return skip("no CUDA device");
+    defer gpu.deinit();
+    var cpu = g.Kernel(k2.math_f32, .cpu).init(0) catch unreachable;
+    const chunk = 1 << 24;
+    const a = std.heap.page_allocator.alloc(f32, chunk) catch return;
+    defer std.heap.page_allocator.free(a);
+    const b = std.heap.page_allocator.alloc(f32, chunk) catch return;
+    defer std.heap.page_allocator.free(b);
+    for (k2.math_cr32) |f| {
+        var bad: usize = 0;
+        var base: u64 = 0;
+        while (base < 1 << 32) : (base += chunk) {
+            for (a, 0..) |*x, i| x.* = @bitCast(@as(u32, @intCast(base + i)));
+            @memcpy(b, a);
+            gpu.run(a, .{ .f = f }) catch return;
+            cpu.run(b, .{ .f = f }) catch unreachable;
+            for (a, b, 0..) |x, y, i| {
+                if (@as(u32, @bitCast(x)) == @as(u32, @bitCast(y)) or (x != x and y != y)) continue;
+                if (bad < 4) print("    f{d} x={x} gpu={x} cpu={x}\n", .{ f, base + i, @as(u32, @bitCast(x)), @as(u32, @bitCast(y)) });
+                bad += 1;
+            }
+        }
+        print("  f{d}: {d} of 2^32 differ\n", .{ f, bad });
+        check("math_sweep_f32", bad == 0);
+    }
 }
 
 // ── Every kind on the GPU, the CPU path as the oracle ───────────────────

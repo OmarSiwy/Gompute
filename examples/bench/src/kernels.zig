@@ -1,6 +1,7 @@
 //! The kernels OVERHEAD.md is measured on. Every elementwise body is the
 //! cheapest thing that still touches its bytes, so the numbers are bandwidth
 //! and overhead, not arithmetic.
+const std = @import("std");
 const g = @import("gompute");
 
 pub const P = struct { scale: f32 };
@@ -71,4 +72,51 @@ comptime {
         g.exportRaw("raw_map_f64", &rawMapF64);
         g.exportRaw("raw_zip_f32", &rawZipF32);
     }
+}
+
+// ── g.math throughput: 8 calls per element, so the arithmetic, not the
+// bytes, is what a launch measures. Inputs live in [0.1, 4) and each call
+// adds 0.25*i, so every function stays on its ordinary path.
+
+pub const math_fns = .{ "exp", "exp2", "expm1", "log", "log2", "log10", "log1p", "sin", "cos", "tan", "tanh", "sinh", "cosh", "atan", "pow" };
+
+fn mathCall(comptime name: []const u8, x: anytype) @TypeOf(x) {
+    if (comptime std.mem.eql(u8, name, "pow")) return g.math.pow(x, g.splat(@TypeOf(x), 1.4552480184709202));
+    return @field(g.math, name)(x);
+}
+
+fn MathBody(comptime T: type, comptime name: []const u8) type {
+    return struct {
+        fn scalar(x: T, _: P) T {
+            var acc: T = 0;
+            inline for (0..8) |i| acc += mathCall(name, x + @as(T, 0.25 * @as(comptime_float, i)));
+            return acc;
+        }
+        fn vector(x: anytype, _: P) @TypeOf(x) {
+            const V = @TypeOf(x);
+            var acc = g.splat(V, @as(T, 0));
+            inline for (0..8) |i| acc += mathCall(name, x + g.splat(V, @as(T, 0.25 * @as(comptime_float, i))));
+            return acc;
+        }
+    };
+}
+
+fn mathKernels(comptime T: type, comptime vector: bool) [math_fns.len]type {
+    var out: [math_fns.len]type = undefined;
+    for (math_fns, 0..) |name, i| {
+        const B = MathBody(T, name);
+        const kname = "bm_" ++ name ++ "_" ++ @typeName(T) ++ (if (vector) "_v" else "");
+        out[i] = if (vector) g.map(kname, T, P, B.vector, .{}) else g.map(kname, T, P, B.scalar, .{});
+    }
+    return out;
+}
+
+pub const math_f32 = mathKernels(f32, false);
+pub const math_f64 = mathKernels(f64, false);
+pub const math_f32_v = mathKernels(f32, true);
+pub const math_f64_v = mathKernels(f64, true);
+
+comptime {
+    g.exportKernels(math_f32);
+    g.exportKernels(math_f64);
 }

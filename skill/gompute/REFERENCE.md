@@ -184,10 +184,12 @@ are the six names whose meaning differs between the roots. On the host
 
 Device math (`g.math`, also the std-only module `dep.module("math")`): `exp
 exp2 log log2 log10 log1p pow sin cos tan tanh sinh cosh expm1 atan sqrt
-rsqrt`, for `f32`/`f64`/vectors; `pow(x, y: @TypeOf(x))`. Each is one body,
-with no FMA or intrinsic, so it gives the same bits on host, NVPTX, AMDGCN and
-at comptime. `math.max_ulp` holds the promised bounds: exp 0.52, log 0.52,
-pow 0.55 (measured 0.505 / 0.502 / 0.502 against f128).
+rsqrt`, for `f32`/`f64`/vectors; `pow(x, y: @TypeOf(x))`. Each gives the
+same bits on host, NVPTX, AMDGCN and at comptime: f32 exp, log, log2, log10,
+sin and cos by being correctly rounded (checked on all 2³² inputs), the rest
+by being one body with no FMA or intrinsic. `math.max_ulp` holds the f64
+bounds: exp 0.52, log 0.52, pow 0.55 (measured 0.505 / 0.502 / 0.502 against
+f128).
 
 ## ABI (`g.abi`)
 

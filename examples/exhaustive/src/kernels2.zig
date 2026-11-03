@@ -53,6 +53,9 @@ fn mathOf(comptime T: type) fn (T, MathParams) T {
     }.call;
 }
 pub const math_function_count = 16;
+/// The `mathOf` indices whose f32 result is correctly rounded, so the GPU
+/// body may differ from the CPU one and must still match it on all 2^32 inputs.
+pub const math_cr32 = [_]u32{ 0, 1, 3, 4, 5, 6 };
 pub const math_f64 = g.map("math_f64", f64, MathParams, mathOf(f64), .{});
 pub const math_f32 = g.map("math_f32", f32, MathParams, mathOf(f32), .{});
 

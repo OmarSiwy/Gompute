@@ -322,14 +322,25 @@ from what an f32 kernel computes. The set:
 `exp exp2 log log2 log10 log1p pow sin cos tan tanh sinh cosh expm1 atan sqrt
 rsqrt`.
 
-**One body per function, the same bits everywhere.** No function uses FMA, a
-hardware approximation, inline asm or a target intrinsic, so a given input
-gives the same bits on the host (with or without FMA hardware), on NVPTX, on
-AMDGCN, and when evaluated at comptime. `examples/exhaustive` checks the CUDA
-result against the CPU result bit for bit for every function over 64K inputs.
-f32 is one rounding of the f64 body wherever there is no f32 port. On a GPU
-that costs f64 throughput (1/64 rate on consumer NVIDIA), and it is the price
-of the bits agreeing.
+**The same bits everywhere.** No function uses a hardware approximation,
+inline asm or a target intrinsic, so a given input gives the same bits on the
+host (with or without FMA hardware), on NVPTX, on AMDGCN, and when evaluated
+at comptime. Most functions get there by being one body with no FMA.
+`examples/exhaustive` checks the CUDA result against the CPU result bit for
+bit for every function over 64K inputs.
+
+f32 `exp`, `log`, `log2`, `log10`, `sin` and `cos` get there differently:
+they are **correctly rounded**, so any two bodies agree. The GPU runs an f32
+body (with `@mulAdd`, exact in software too) and falls back to binary64 on
+the rare input it cannot settle; the CPU runs a body shaped for its SIMD
+units. Both are
+checked against an f128 oracle on all 2³² inputs, and `examples/exhaustive`
+checks the CUDA result against the CPU on all 2³² as well. On an RTX 4060
+Laptop that is 80–160 Gcalls/s (40 for sin/cos) where binary64 gave 3–7.
+
+Every other f32 function is one rounding of the f64 body. On a GPU that
+costs f64 throughput (1/64 rate on consumer NVIDIA), and it is the price of
+the bits agreeing.
 
 The math is also its own std-only module, `b.dependency("gompute", .{}).module("math")`,
 for code that wants it without the GPU layer, such as a compiler folding
@@ -354,7 +365,8 @@ for each lane. f64 `sin`/`cos`/`tanh`/`sinh`/`cosh`/`expm1`, `log1p` and
 | f64 `sin`, `cos` | bit-identical to `@sin`/`@cos` | compiler_rt | musl, including Payne-Hanek for huge arguments. |
 | f64 `cosh` | 0.998 ulp | f128 oracle | std's is 1.131. |
 | f64 `tanh`, `sinh` | 2.05 / 1.75 ulp | f128 oracle | Bit-identical to std's musl bodies; not faithful. |
-| every f32 function | ≤ 0.82 ulp | f64, **all 2³² inputs** | exp/exp2/tanh/cosh 0.50, sin/cos/sinh 0.501, log/log2/log10 ≤ 0.82. |
+| f32 `exp`, `log`, `log2`, `log10`, `sin`, `cos` | correctly rounded | f128 oracle, **all 2³² inputs** | Host and device bodies both, scalar and vector. |
+| f32 `exp2`, `tanh`, `sinh`, `cosh` | ≤ 0.501 ulp | f64, **all 2³² inputs** | exp2/tanh/cosh 0.50, sinh 0.501. f32 `tan` is the ratio of two roundings, not checked exhaustively. |
 | `expm1`, `log1p` | std's bits | std | `expm1` minus one line that does not compile for AMDGCN. |
 | `atan` | within 1 ulp of std | std | std's vector body on every target. |
 

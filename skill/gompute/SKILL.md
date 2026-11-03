@@ -127,8 +127,9 @@ The rules you can't see from the signatures:
   `exp2`, `log`, `log2`, `log10`, `log1p`, `pow`, `sin`, `cos`, `tan`, `tanh`,
   `sinh`, `cosh`, `expm1`, `atan`, `sqrt` and `rsqrt`, for `f32`, `f64` and
   `@Vector`s of either. **Each is one body on every target**, so CPU and GPU
-  give the same bits, and comptime folds to them as well. `exp`/`log`/`pow`
-  are faithful (≤0.505 ulp) and monotone. To use the math without the GPU
+  give the same bits, and comptime folds to them as well. f32 `exp`, `log`,
+  `log2`, `log10`, `sin`, `cos` are correctly rounded (all 2³² inputs); f64
+  `exp`/`log`/`pow` are faithful (≤0.505 ulp) and monotone. To use the math without the GPU
   layer, import `dep.module("math")`.
 
 Compose ops without an intermediate buffer using `g.Fused(T, P, .{ OpA, OpB })`
@@ -160,8 +161,9 @@ loop and one kernel.
    and f64, plus f32 sin/cos/tanh/sinh/cosh, each lane-exact with the scalar.
    Against glibc's scalar libm that's 2–4× faster at vector width, and the
    scalar forms are on par. f64 sin/cos/tanh run one lane at a time. On the
-   GPU, f32 math computes in f64 to keep the bits identical, so expect f64
-   throughput (1/64 rate on consumer NVIDIA).
+   GPU, f32 exp/log/log2/log10/sin/cos run in f32 (40–160 Gcalls/s on an RTX
+   4060 Laptop); every other f32 function computes in f64 to keep the bits
+   identical, so expect f64 throughput (1/64 rate on consumer NVIDIA).
 
 ## GPU: keep data on the device
 

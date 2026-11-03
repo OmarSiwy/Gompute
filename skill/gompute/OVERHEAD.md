@@ -111,13 +111,15 @@ What to take from it:
   at 16M both run at the bus limit (~270 µs, 96% of peak).
 - `gather`/`scatter` `run` uploads `out` as well (unselected slots keep their
   value), so expect one more copy than `mapTo`.
-- Device math is one software body per function so CPU and GPU agree on
-  every bit. On the GPU, f32 functions without an f32 port (sin, cos, tan,
-  tanh, sinh, cosh, exp2, expm1, log1p, pow) compute in f64, and f64 runs at
-  1/64 rate on consumer NVIDIA (`context.fp64Ratio()` tells you). A
-  throughput-bound f32 kernel that can live with hardware approximations and
-  target-dependent bits can call `@sin`/`@exp2` directly. Accuracy is ≤0.505
-  ulp for exp/log/pow against an f128 oracle.
+- Device math gives CPU and GPU the same bits. f32 exp, log, log2, log10,
+  sin and cos are correctly rounded and run in f32 on the GPU (RTX 4060
+  Laptop, Zig 0.18.0-dev.349, `BENCH=math`: exp 155, log 85–96, log2/log10
+  ~80, sin/cos ~40 Gcalls/s; 1.5.0 computed them in f64 at 3–7). Every other
+  f32 function (tan, tanh, sinh, cosh, exp2, expm1, log1p, pow) computes in
+  f64, and f64 runs at 1/64 rate on consumer NVIDIA (`context.fp64Ratio()`
+  tells you). A throughput-bound kernel that can live with hardware
+  approximations and target-dependent bits can call `@exp2` directly.
+  Accuracy is ≤0.505 ulp for f64 exp/log/pow against an f128 oracle.
 - `pow` with an integer exponent takes the full table route, like any other
   exponent (a square-and-multiply shortcut broke monotonicity). In a hot
   kernel, write `x * x` yourself for `pow(x, 2)`.
@@ -148,6 +150,10 @@ element, lower is better.
 | cos | 14.55 | 13.74 | 11.58 | 13.09 | |
 | tanh | 11.97 | 11.85 | 15.64 | 11.95 | |
 
+1.5.0 numbers for f32. 1.6.0's correctly rounded exp, log, log2, log10, sin
+and cos cost about 1.5× these on the CPU (`BENCH=math`, scalar and vector);
+the glibc and zig@ columns have not been re-measured.
+
 | f32 | gompute | g.vector | glibc | zig@ | std |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | exp | 2.38 | **1.09** | 2.38 | 8.29 | |
@@ -171,8 +177,9 @@ What it says:
   also slower on f32 `pow` scalar (11.8 vs 5.2, where glibc has a dedicated
   f32 algorithm) and f32 `tanh` scalar (7.1 vs 4.4).
 - **Accuracy is the same class or better.** f64 exp/log/pow are 0.505 /
-  0.502 / 0.502 ulp against an f128 oracle. Every f32 function is
-  exhaustively faithful over all 2³² inputs (max 0.82 ulp, most ~0.50).
+  0.502 / 0.502 ulp against an f128 oracle. f32 exp, log, log2, log10, sin
+  and cos are correctly rounded over all 2³² inputs, and f32 exp2, tanh,
+  sinh and cosh are ≤0.501 ulp there.
   glibc promises < 1 ulp for these and doesn't give identical bits across
   CPU/GPU.
 - **What the others can't do:** the same bits on the CPU, on NVIDIA, on AMD

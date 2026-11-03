@@ -15,6 +15,7 @@ const sizes = [_]usize{ 1 << 10, 1 << 20, 1 << 24 };
 const reps = 20;
 
 pub fn main(init: std.process.Init) !void {
+    if (init.environ_map.get("BENCH")) |which| if (std.mem.eql(u8, which, "math")) return mathBench(init.io);
     try gpu();
     try ab();
     try cpu(init.io);
@@ -301,4 +302,82 @@ fn cpu(io: std.Io) !void {
         }
     }
     std.mem.doNotOptimizeAway(host.sink);
+}
+
+// ---------------------------------------------------------------------------
+// g.math throughput: `BENCH=math zig build run -Doptimize=ReleaseFast`. Each
+// element makes 8 calls (see kernels.zig), so these are calls per second, not
+// bytes. GPU: best of 5 event-timed rounds. CPU: the scalar body and the
+// generic (vector) body, median of 5.
+// ---------------------------------------------------------------------------
+
+const math_n_gpu = 1 << 22;
+const math_n_cpu = 1 << 16;
+
+fn fillMath(comptime T: type, xs: []T) void {
+    for (xs, 0..) |*x, i| x.* = 0.1 + @as(T, @floatFromInt(i % 3901)) * (3.9 / 3901.0);
+}
+
+fn mathGpuOne(comptime Spec: type, comptime T: type, ctx_stream: *g.runtime.cuda.Stream, buf: *g.runtime.cuda.Buffer, host_in: []const T) !f64 {
+    var kk = try g.Kernel(Spec, B).init(0);
+    defer kk.deinit();
+    kk.stream = ctx_stream.*;
+    var best: f64 = 1e30;
+    for (0..5) |_| {
+        try buf.upload(host_in.ptr, host_in.len * @sizeOf(T));
+        var start = try kk.context.createEvent(true);
+        defer start.deinit();
+        var end = try kk.context.createEvent(true);
+        defer end.deinit();
+        try start.record(ctx_stream);
+        try kk.launch(buf, host_in.len, .{ .scale = 1 });
+        try end.record(ctx_stream);
+        try end.synchronize();
+        best = @min(best, @as(f64, try g.runtime.cuda.Event.elapsedUs(&start, &end)));
+    }
+    return best;
+}
+
+fn mathCpuOne(comptime Spec: type, comptime T: type, io: std.Io, xs: []T, src: []const T) !f64 {
+    var kk = try g.Kernel(Spec, .cpu).init(0);
+    var t: [5]i96 = undefined;
+    for (&t) |*slot| {
+        @memcpy(xs, src);
+        const start = std.Io.Clock.Timestamp.now(io, .awake);
+        try kk.run(xs, .{ .scale = 1 });
+        slot.* = start.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.nanoseconds;
+    }
+    std.mem.sort(i96, &t, {}, std.sort.asc(i96));
+    return @as(f64, @floatFromInt(t[2])) / @as(f64, @floatFromInt(xs.len * 8));
+}
+
+fn mathBench(io: std.Io) !void {
+    const gpa = std.heap.page_allocator;
+    const have_gpu = comptime g.AutoKernel(k.map_f32).Cuda.available;
+    var ctx_kernel: ?g.Kernel(k.map_f32, B) = if (have_gpu) g.Kernel(k.map_f32, B).init(0) catch null else null;
+    defer if (ctx_kernel) |*c| c.deinit();
+    print("g.math: GPU Gcalls/s (n={d}) | CPU ns/call scalar, vector (n={d})\n", .{ math_n_gpu, math_n_cpu });
+    inline for (.{ f32, f64 }) |T| {
+        const host_in = try gpa.alloc(T, math_n_gpu);
+        defer gpa.free(host_in);
+        fillMath(T, host_in);
+        const xs = try gpa.alloc(T, math_n_cpu);
+        defer gpa.free(xs);
+        var buf: ?g.runtime.cuda.Buffer = null;
+        var stream: ?g.runtime.cuda.Stream = null;
+        if (ctx_kernel) |*c| {
+            buf = try c.context.alloc(math_n_gpu * @sizeOf(T));
+            stream = try c.context.createStreamNonBlocking();
+        }
+        defer if (buf) |*b| b.free();
+        defer if (stream) |*st| st.deinit();
+        const scal = if (T == f32) k.math_f32 else k.math_f64;
+        const vect = if (T == f32) k.math_f32_v else k.math_f64_v;
+        inline for (k.math_fns, 0..) |name, i| {
+            const gcalls = if (buf) |*b| @as(f64, math_n_gpu * 8) / (try mathGpuOne(scal[i], T, &stream.?, b, host_in)) / 1e3 else 0;
+            const s_ns = try mathCpuOne(scal[i], T, io, xs, host_in[0..math_n_cpu]);
+            const v_ns = try mathCpuOne(vect[i], T, io, xs, host_in[0..math_n_cpu]);
+            print("  {s:<6} {s}  {d:>8.2} Gcalls/s  | {d:>6.2} {d:>6.2} ns\n", .{ name, @typeName(T), gcalls, s_ns, v_ns });
+        }
+    }
 }
