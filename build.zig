@@ -412,7 +412,60 @@ pub fn build(b: *std.Build) void {
         "amdhsa_user_sgpr_dispatch_ptr 1",
     } });
 
+    // `g.math`'s same-bits promise survives an explicit `@mulAdd` (one
+    // rounding on every target and at comptime) but not optional contraction,
+    // where each backend decides whether `a * b + c` fuses. So
+    // `tests/no_contract.zig` goes to IR on the host targets and both GPU ones,
+    // and must hold no `llvm.fmuladd` and no `contract`/`fast` flag; built as
+    // `canary` it compiles one optimized-mode `a * b + c`, which must trip the
+    // same patterns, or the check is blind on that target. IR, not asm: AMDGCN
+    // expands a plain IEEE f64 divide into `v_fma_f64` Newton steps.
+    const absent = b.addExecutable(.{
+        .name = "gompute-absent",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/absent.zig"),
+            .target = b.graph.host,
+            .optimize = .debug,
+        }),
+    });
+    const math_only = b.createModule(.{ .root_source_file = b.path("src/device/math.zig") });
+    const contraction: []const []const u8 = &.{ "@llvm.fmuladd.", " contract ", " fast " };
+    const contract_targets = [_][2][]const u8{
+        .{ "x86_64-freestanding", "x86_64_v3" },
+        .{ "aarch64-freestanding", "generic" },
+        .{ "nvptx64-cuda", "sm_80" },
+        .{ "amdgcn-amdhsa", "gfx1100" },
+    };
+    var contract_checks: [contract_targets.len * 2]*std.Build.Step = undefined;
+    for (contract_targets, 0..) |t, i| for ([_]bool{ false, true }, 0..) |canary, j| {
+        const opts = b.addOptions();
+        opts.addOption(bool, "canary", canary);
+        const obj = b.addObject(.{
+            .name = if (canary) "gompute-contract-canary" else "gompute-no-contract",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tests/no_contract.zig"),
+                .target = b.resolveTargetQuery(std.Target.Query.parse(.{
+                    .arch_os_abi = t[0],
+                    .cpu_features = t[1],
+                }) catch unreachable),
+                .optimize = .fast,
+                .strip = true,
+                .imports = &.{
+                    .{ .name = "math", .module = math_only },
+                    .{ .name = "options", .module = opts.createModule() },
+                },
+            }),
+        });
+        const run = b.addRunArtifact(absent);
+        if (canary) run.addArg("--present");
+        run.addFileArg(obj.getEmittedLlvmIr());
+        run.addArgs(contraction);
+        run.expectExitCode(0);
+        contract_checks[i * 2 + j] = &run.step;
+    };
+
     const test_step = b.step("test", "Run Gompute unit tests");
+    for (contract_checks) |step| test_step.dependOn(step);
     test_step.dependOn(&run_unit_tests.step);
     test_step.dependOn(&run_tool_tests.step);
     test_step.dependOn(&run_build_tests.step);

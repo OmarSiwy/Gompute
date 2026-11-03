@@ -14,7 +14,7 @@
 //! `std.mem.doNotOptimizeAway`, which for a float is `asm volatile ("" :: "rm"
 //! (v))`, and the AMDGPU backend cannot match the `m` alternative. That flag is
 //! a register no GPU exposes, so the idiom is dead weight on device and a hard
-//! error there. See `expm1` and `log1p` for the ports and `atan` for the cheaper dodge.
+//! error there. `expm1`, `log1p` and `atan` are std's ports with that line dropped.
 //!
 //! `exp exp2 log log2 log10 pow` are ports of ARM optimized-routines (what
 //! glibc >= 2.28 ships), f32 sin/cos follow musl's `sinf` in binary64, f32
@@ -22,7 +22,7 @@
 //! once, and f64 sin/cos/tanh/sinh/cosh/expm1 are musl's. Table-driven, no
 //! libm and no float builtin beyond `+ - * /`, `@sqrt` and bit casts.
 //!
-//! ONE body per function on every target: no FMA, no hardware approximation,
+//! ONE body per function on every target: no contraction, no hardware approximation,
 //! no inline asm, no intrinsic. The same input gives the same bits on the
 //! host (with or without FMA hardware), NVPTX, AMDGCN and at comptime, which
 //! is what VerA's constant folding and ESPice's CPU/GPU comparison rely on;
@@ -47,19 +47,21 @@
 //! at f32 and f64, f32 sin/cos/tanh/sinh/cosh, sqrt and rsqrt. The vector form
 //! is the scalar's own width-generic main path (`expMain`, `logMain`, ...);
 //! a vector holding any special lane takes the scalar body lane by lane. f64
-//! sin/cos/tanh/sinh/cosh/expm1, log1p and atan still run lane by lane.
+//! sin/cos/tanh/sinh/cosh, expm1, log1p and atan still run lane by lane.
 //!
 //! Already safe everywhere and deliberately absent here: `@abs @trunc @round
 //! @floor @ceil @copysign @min @max`, `std.math.scalbn/frexp/modf`. `sqrt` and
 //! `rsqrt` ARE here despite being safe, so that a kernel need not keep two
 //! lists in its head — they are `@sqrt` with the argument checked.
 //!
-//! `@mulAdd` is NOT in that list, and nothing here uses it. Every body is the
-//! reference's no-FMA variant, so the bits are the same on every target: host
-//! with or without FMA hardware, NVPTX and AMDGCN. That bit-identity is the
-//! contract VerA's constant folding and ESPice's CPU/GPU comparison rely on.
-//! `@mulAdd` would also lower to a `fma()` libm CALL where there is no FMA,
-//! which is a link error on device.
+//! What breaks the same bits is OPTIONAL contraction (`llvm.fmuladd`, a
+//! `contract` or `fast` flag), where each backend decides whether `a * b + c`
+//! rounds once or twice; `tests/no_contract.zig` holds every entry point's IR
+//! to none on four targets. An explicit `@mulAdd` is one rounding everywhere
+//! (hardware, compiler_rt, comptime), so it is deterministic; only the
+//! correctly rounded f32 bodies use it, because where there is no FMA
+//! hardware it is a compiler_rt `fma` call. The one-body functions are the
+//! references' no-FMA variants.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -318,16 +320,124 @@ fn softLog1p(x: f64) f64 {
     return s * (hfsq + R) + (dk * ln2_lo + c) - hfsq + f + dk * ln2_hi;
 }
 
-/// arctangent: `std.math.atan`'s VECTOR body on every target, scalars as a
-/// two-lane splat. std's scalar body raises the underflow flag through
-/// `doNotOptimizeAway`, which does not compile for AMDGCN; the vector body
-/// never reaches it. Two lanes because `@Vector(1, f64)` crashes the AMDGPU
-/// backend. Within an ulp of std's scalar atan.
+/// arctangent: musl's `atan.c` and `atanf.c`, by way of std's scalar
+/// `atanBinary64`/`atanBinary32`, minus the subnormal underflow-flag line that
+/// does not compile for AMDGCN (see `expm1`). Every return is bit-identical to
+/// std's scalar atan, `atan(+-0) = +-0` included. Not std's vector body: its
+/// polynomial is `@mulAdd`, so it rounded differently with and without FMA
+/// hardware, returned +0 for -0, and was 1.235 ulp against musl's 0.678.
 pub inline fn atan(x: anytype) @TypeOf(x) {
-    _ = Elem(@TypeOf(x));
-    if (comptime isVec(@TypeOf(x))) return std.math.atan(x);
-    const v: @Vector(2, @TypeOf(x)) = @splat(x);
-    return std.math.atan(v)[0];
+    if (Elem(@TypeOf(x)) == f32) return apply(softAtanf, x);
+    return apply(softAtan, x);
+}
+
+fn softAtan(x: f64) f64 {
+    const atanhi = [_]f64{
+        4.63647609000806093515e-01, // atan(0.5)hi
+        7.85398163397448278999e-01, // atan(1.0)hi
+        9.82793723247329054082e-01, // atan(1.5)hi
+        1.57079632679489655800e+00, // atan(inf)hi
+    };
+    const atanlo = [_]f64{
+        2.26987774529616870924e-17,
+        3.06161699786838301793e-17,
+        1.39033110312309984516e-17,
+        6.12323399573676603587e-17,
+    };
+    const aT = [_]f64{
+        3.33333333333329318027e-01, -1.99999999998764832476e-01,
+        1.42857142725034663711e-01, -1.11111104054623557880e-01,
+        9.09088713343650656196e-02, -7.69187620504482999495e-02,
+        6.66107313738753120669e-02, -5.83357013379057348645e-02,
+        4.97687799461593236017e-02, -3.65315727442169155270e-02,
+        1.62858201153657823623e-02,
+    };
+
+    const hx: u64 = @bitCast(x);
+    const ix: u32 = @truncate((hx >> 32) & 0x7fffffff);
+    const sign = (hx >> 63) != 0;
+    if (ix >= 0x44100000) { // |x| >= 2^66
+        if (std.math.isNan(x)) return x;
+        const z = atanhi[3] + 0x1p-120;
+        return if (sign) -z else z;
+    }
+    var x_ = x;
+    var id: ?usize = null;
+    if (ix < 0x3fdc_0000) { // |x| < 0.4375
+        // |x| < 2^-27, where atan(x) == x (and -0 stays -0). std raises the
+        // underflow flag for a subnormal here; that is the line this port drops.
+        if (ix < 0x3e40_0000) return x;
+    } else {
+        x_ = @abs(x);
+        if (ix < 0x3ff3_0000) { // |x| < 1.1875
+            if (ix < 0x3fe6_0000) { // 7/16 <= |x| < 11/16
+                id = 0;
+                x_ = (2.0 * x_ - 1.0) / (2.0 + x_);
+            } else { // 11/16 <= |x| < 19/16
+                id = 1;
+                x_ = (x_ - 1.0) / (x_ + 1.0);
+            }
+        } else if (ix < 0x4003_8000) { // |x| < 2.4375
+            id = 2;
+            x_ = (x_ - 1.5) / (1.0 + 1.5 * x_);
+        } else { // 2.4375 <= |x| < 2^66
+            id = 3;
+            x_ = -1.0 / x_;
+        }
+    }
+    const z = x_ * x_;
+    const w = z * z;
+    const s1 = z * (aT[0] + w * (aT[2] + w * (aT[4] + w * (aT[6] + w * (aT[8] + w * aT[10])))));
+    const s2 = w * (aT[1] + w * (aT[3] + w * (aT[5] + w * (aT[7] + w * aT[9]))));
+    const i = id orelse return x_ - x_ * (s1 + s2);
+    const z_ = atanhi[i] - (x_ * (s1 + s2) - atanlo[i] - x_);
+    return if (sign) -z_ else z_;
+}
+
+/// musl `atanf.c`, the same port as `softAtan`. In f32, so f32 atan stays at
+/// f32 rate on the GPU.
+fn softAtanf(x: f32) f32 {
+    const atanhi = [_]f32{ 4.6364760399e-01, 7.8539812565e-01, 9.8279368877e-01, 1.5707962513e+00 };
+    const atanlo = [_]f32{ 5.0121582440e-09, 3.7748947079e-08, 3.4473217170e-08, 7.5497894159e-08 };
+    const aT = [_]f32{ 3.3333328366e-01, -1.9999158382e-01, 1.4253635705e-01, -1.0648017377e-01, 6.1687607318e-02 };
+
+    const hx: u32 = @bitCast(x);
+    const ix = hx & 0x7fff_ffff;
+    const sign = (hx >> 31) != 0;
+    if (ix >= 0x4c80_0000) { // |x| >= 2^26
+        if (std.math.isNan(x)) return x;
+        const z = atanhi[3] + 0x1p-120;
+        return if (sign) -z else z;
+    }
+    var x_ = x;
+    var id: ?usize = null;
+    if (ix < 0x3ee0_0000) { // |x| < 0.4375
+        if (ix < 0x3980_0000) return x; // |x| < 2^-12; the flag line dropped
+    } else {
+        x_ = @abs(x);
+        if (ix < 0x3f98_0000) { // |x| < 1.1875
+            if (ix < 0x3f30_0000) {
+                id = 0;
+                x_ = (2.0 * x_ - 1.0) / (2.0 + x_);
+            } else {
+                id = 1;
+                x_ = (x_ - 1.0) / (x_ + 1.0);
+            }
+        } else if (ix < 0x401c_0000) { // |x| < 2.4375
+            id = 2;
+            x_ = (x_ - 1.5) / (1.0 + 1.5 * x_);
+        } else {
+            id = 3;
+            x_ = -1.0 / x_;
+        }
+    }
+    const z = x_ * x_;
+    const w = z * z;
+    const s1 = z * (aT[0] + w * (aT[2] + w * aT[4]));
+    const s2 = w * (aT[1] + w * aT[3]);
+    const i = id orelse return x_ - x_ * (s1 + s2);
+    const z_ = atanhi[i] - ((x_ * (s1 + s2) - atanlo[i]) - x_);
+    return if (sign) -z_ else z_;
 }
 
 /// f32 tanh, sinh and cosh: binary64 arithmetic on one f64 `exp`, rounded
@@ -2178,7 +2288,7 @@ test "log1p is bit-identical to std" {
     try std.testing.expect(std.math.isNan(log1p(@as(f64, -2))));
 }
 
-test "expm1 is bit-identical to std, and atan is within an ulp" {
+test "expm1 is bit-identical to std" {
     // The whole claim of the port: it drops a line that touched only the FP
     // flag register, so every VALUE must match std exactly. Bit equality, over
     // the branch boundaries the algorithm actually switches on -- 2^-54, the
@@ -2214,11 +2324,53 @@ test "expm1 is bit-identical to std, and atan is within an ulp" {
     for ([_]f32{ 0, 1e-10, -1e-10, 0.5, -0.5, 3, -3, 88, -88 }) |x| {
         try std.testing.expect(ulpErr(f32, expm1(x), @floatCast(std.math.expm1(@as(f64, x)))) <= 1);
     }
+}
 
-    // atan on the host is std's scalar body, so it is std exactly.
-    for ([_]f64{ 0, 1e-20, 0.3, -0.4375, 1, -1, 1.5, 1e6, -1e6 }) |x| {
-        try std.testing.expectEqual(std.math.atan(x), atan(x));
+test "atan is bit-identical to std's scalar body, and keeps the sign of zero" {
+    // The port drops only the flag line, so every value is std's scalar
+    // atan's: the edges are its branch splits (2^-27/2^-12, 7/16, 11/16,
+    // 19/16, 39/16, 2^66/2^26), then a sweep across all of them.
+    const edges = [_]f64{
+        0x1p-1074, 0x1p-28, 0x1p-27, 0.4374999, 0.4375, 0.6875,            1.1875,
+        2.4375,    1e6,     0x1p66,  0x1p67,    1e300,  std.math.inf(f64),
+    };
+    for (edges) |e| for ([_]f64{ e, -e }) |x| {
+        try std.testing.expectEqual(@as(u64, @bitCast(std.math.atan(x))), @as(u64, @bitCast(atan(x))));
+        const xf: f32 = @floatCast(x);
+        try std.testing.expectEqual(@as(u32, @bitCast(std.math.atan(xf))), @as(u32, @bitCast(atan(xf))));
+    };
+    var i: i32 = -200_000;
+    while (i < 200_000) : (i += 1) {
+        const x = @as(f64, @floatFromInt(i)) * 1.7e-4;
+        try std.testing.expectEqual(@as(u64, @bitCast(std.math.atan(x))), @as(u64, @bitCast(atan(x))));
+        const xf: f32 = @floatCast(x);
+        try std.testing.expectEqual(@as(u32, @bitCast(std.math.atan(xf))), @as(u32, @bitCast(atan(xf))));
     }
+    try std.testing.expect(std.math.isNan(atan(std.math.nan(f64))));
+    try std.testing.expect(std.math.isNan(atan(std.math.nan(f32))));
+
+    // atan(-0) = -0 (C11 F.10.1.3), compared as bits: `==` cannot tell the
+    // zeros apart, which is how 2.0.0 shipped +0 here. Scalar and vector.
+    try std.testing.expectEqual(@as(u64, 0x8000000000000000), @as(u64, @bitCast(atan(@as(f64, -0.0)))));
+    try std.testing.expectEqual(@as(u32, 0x80000000), @as(u32, @bitCast(atan(@as(f32, -0.0)))));
+    try std.testing.expectEqual(@as(u64, 0), @as(u64, @bitCast(atan(@as(f64, 0.0)))));
+    const v = atan(@Vector(4, f64){ -0.0, 0.0, -0.0, 1 });
+    try std.testing.expectEqual(@Vector(4, u64){ 0x8000000000000000, 0, 0x8000000000000000, @bitCast(std.math.atan(@as(f64, 1))) }, @as(@Vector(4, u64), @bitCast(v)));
+    const vf = atan(@Vector(8, f32){ -0.0, 0.0, -0.0, 1, -0.0, -0.0, -0.0, -0.0 });
+    try std.testing.expectEqual(@as(u32, 0x80000000), @as(u32, @bitCast(vf[0])));
+    try std.testing.expectEqual(@as(u32, 0), @as(u32, @bitCast(vf[1])));
+
+    // Faithful against std's f128 atan (musl atanl, 113 bits) as the oracle:
+    // 0.741 measured; 2.0.0's vector body was 1.235 ulp on VerA's sample.
+    var prng = std.Random.DefaultPrng.init(0xa7a2);
+    const r = prng.random();
+    var worst: f64 = 0;
+    for (0..100_000) |_| {
+        const x = std.math.pow(f64, 2, r.float(f64) * 80 - 40) * @as(f64, if (r.boolean()) -1 else 1);
+        worst = @max(worst, oracle.ulp(atan(x), std.math.atan(@as(f128, x))));
+    }
+    std.debug.print("\n  f128 oracle: atan {d:.3} ulp\n", .{worst});
+    try std.testing.expect(worst < 0.75);
 }
 
 test "every entry point takes a vector, lane for lane" {
@@ -3295,4 +3447,3 @@ test "f32 exp, log, log2, log10, sin and cos are correctly rounded, host and dev
         try std.testing.expectEqual(@as(u64, 0), t.unsure);
     }
 }
-

@@ -14,6 +14,7 @@ release in their name); the package version is separate.
 | `0.17.0-v1.4.0` | 1.4.0   | 0.17.0                   |
 | `v1.5.0`        | 1.5.0   | 0.18.0-dev.349+d924f83bf |
 | `v2.0.0`        | 2.0.0   | 0.18.0-dev.349+d924f83bf |
+| `v2.0.1`        | 2.0.1   | 0.18.0-dev.349+d924f83bf |
 
 `minimum_zig_version` in `build.zig.zon`, the overlay revision in `flake.lock`
 and the version in `.github/workflows/*` name the same build and move
@@ -184,7 +185,10 @@ rsqrt`.
 **The same bits everywhere.** No function uses a hardware approximation,
 inline asm or a target intrinsic, so a given input gives the same bits on the
 host (with or without FMA hardware), on NVPTX, on AMDGCN, and when evaluated
-at comptime. Most functions get there by being one body with no FMA.
+at comptime. Most functions get there by being one body with no FMA, and
+`zig build test` checks that no entry point's IR on x86_64, aarch64, NVPTX or
+AMDGCN lets the compiler fuse a multiply and add on its own (`llvm.fmuladd`,
+`contract`).
 `examples/exhaustive` checks the CUDA result against the CPU result bit for
 bit for every function over 64K inputs.
 
@@ -229,7 +233,7 @@ for each lane. f64 `sin`/`cos`/`tanh`/`sinh`/`cosh`/`expm1`, `log1p` and
 | f32 `exp`, `log`, `log2`, `log10`, `sin`, `cos` | correctly rounded | f128 oracle, **all 2³² inputs** | Host and device bodies both, scalar and vector. |
 | f32 `exp2`, `tanh`, `sinh`, `cosh` | ≤ 0.501 ulp | f64, **all 2³² inputs** | exp2/tanh/cosh 0.50, sinh 0.501. f32 `tan` is the ratio of two roundings, not checked exhaustively. |
 | `expm1`, `log1p` | std's bits | std | `expm1` minus one line that does not compile for AMDGCN. |
-| `atan` | within 1 ulp of std | std | std's vector body on every target. |
+| `atan` | 0.741 ulp | f128 oracle | musl's, bit-identical to std's scalar atan; `atan(-0)` is -0. Before 2.0.1 it was std's vector body, +0 for -0. |
 
 `exp`, `log`, `pow` (in both arguments), `expm1`, `log1p` and `sinh` are
 **monotone**. That is tested at every table seam and branch edge, so a prover
