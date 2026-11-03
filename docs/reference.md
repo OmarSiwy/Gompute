@@ -20,18 +20,18 @@ together. Nothing older or newer is supported.
 
 ## Platform support
 
-| Platform      | CPU backend | CUDA / HIP backends                                         |
-| ------------- | ----------- | ----------------------------------------------------------- |
-| Linux         | Yes         | Yes                                                         |
-| Windows       | Yes         | Yes: `nvcuda.dll`, `amdhip64_7.dll` / `_6` / unsuffixed     |
-| macOS         | Yes         | Compiles; only finds NVIDIA's last driver (CUDA 10.2)       |
-| `wasm32-wasi` | Yes         | Every GPU init returns `error.InitFailed`. Link no libc: Zig ships no wasi-libc |
+| Platform      | Host code | CUDA / HIP backends                                         |
+| ------------- | --------- | ----------------------------------------------------------- |
+| Linux         | Yes       | Yes                                                         |
+| Windows       | Yes       | Yes: `nvcuda.dll`, `amdhip64_7.dll` / `_6` / unsuffixed     |
+| macOS         | Yes       | Compiles; only finds NVIDIA's last driver (CUDA 10.2)       |
+| `wasm32-wasi` | Yes       | Every GPU init returns `error.InitFailed`. Link no libc: Zig ships no wasi-libc |
 
 The drivers are loaded at run time: `std.DynLib` on Linux, macOS and the BSDs,
 `LoadLibraryA` on Windows (Zig's std has no Windows `DynLib`), and a stub
 that never opens anything on wasm (`src/runtime/dynlib.zig`). A missing
-driver is the same `error.InitFailed` on every platform, so `AutoKernel`
-falls back to `.cpu` everywhere.
+driver is the same `error.InitFailed` on every platform, so one `catch` on
+`init` sends every platform to your CPU path.
 
 `emitKernels` skips the GPU sub-compilations on wasm, so there is nothing
 to launch there anyway.
@@ -42,16 +42,16 @@ Things that are easy to get wrong because nothing in the API says them out loud.
 
 | | |
 | --- | --- |
-| `init(0)` | The CUDA/HIP **device ordinal**. Ignored by `.cpu`. |
-| `run` | Uploads, launches, **synchronizes** and downloads on every call. Device buffers are kept on the handle and grown on demand, so one handle must not `run` from two threads at once; give each thread its own (a warm `init` is ~0.3 µs). See [Advanced](advanced.html) to skip the copies. |
-| `deinit` | Always safe, and safe to call twice. On `.cpu` it is a no-op. It releases *your handle*, not the shared device state. |
-| Contexts and modules | Shared process-wide, per device. Two `Kernel`s on one GPU share one CUDA primary context and JIT the artifact once, so buffers allocated through one are usable by the other. `runtime.cuda.shutdown()` is the only real teardown. |
-| Several devices | One handle per ordinal, each with its own stream. A `copyFrom` between buffers on two ordinals is a peer copy. See [Several devices](runtime.html#several-devices). |
-| Threads | Safe. A context is made current per thread on first use. |
+| `init(0)` | The CUDA/HIP **device ordinal**. |
+| `launch` | Returns once the launch is queued, on the NULL stream. It does not synchronize, and a fault inside the kernel surfaces at the next `synchronize`. The arguments are pointers to your variables, so each must outlive the call. |
+| `deinit` | Always safe, and safe to call twice. It releases *your handle*, not the shared device state. |
+| Contexts and modules | Shared process-wide, per device. Two `RawKernel`s on one GPU share one CUDA primary context and JIT the artifact once, so buffers allocated through one are usable by the other. `runtime.cuda.shutdown()` is the only real teardown. |
+| Several devices | One handle per ordinal. A `copyFrom` between buffers on two ordinals is a peer copy. See [Several devices](runtime.html#several-devices). |
+| Threads | Safe. A context is made current per thread on every `launch`. Buffers are not: two threads writing one race. |
 | `Buffer` | `free()` is idempotent. Use-after-free is not checked. `upload`/`download` do not bounds-check against `Buffer.bytes`; the driver catches the overrun and you get `error.CopyFailed`. |
 | Errors | One flat set of 15, listed [below](#errors). `lastDriverError()` returns the raw CUDA/HIP code behind the last failure, which is the only way to tell "no driver" from "out of memory". It is cleared on success. |
-| `block_size` | Must be 1…1024. Not required to be a multiple of the warp/wave size, but anything else wastes part of every warp. |
-| Empty input | `run` on a zero-length slice returns without launching. |
+| Block size | Must be 1…1024. Not required to be a multiple of the warp/wave size, but anything else wastes part of every warp. `globalIdX` reads the size you launched with, so its argument is ignored. |
+| Empty input | `Dim3.linear(0, b)` is a zero grid, which the driver refuses. Return before the launch. |
 
 ## Errors
 
@@ -68,11 +68,11 @@ union.
 | `error.SyncFailed` | `synchronize` on a context or stream failed, or a stream could not be created. Usually the *previous* launch faulted. |
 | `error.AllocFailed` | Device allocation failed: out of memory, or a zero-byte request. Also returned by `runtime.dynamic` `alloc` on the `.cpu` backend, which has no device memory. |
 | `error.ModuleLoadFailed` | The PTX/HSACO image was rejected by the driver. Almost always an arch mismatch: `sm_89` code on an `sm_75` card. |
-| `error.KernelNotFound` | The image loaded but holds no symbol by that name: a kernel missing from `exportKernels`, or a bad name passed to `rawKernelByName`. |
+| `error.KernelNotFound` | The image loaded but holds no symbol by that name: a kernel not exported with `exportRaw`, or a bad name passed to `rawKernelByName`. |
 | `error.LaunchFailed` | The driver refused the launch: block size over the device limit, a grid past `gridDim.x`, or bad arguments. |
 | `error.CopyFailed` | A host↔device or device↔device copy failed. An overrun past `Buffer.bytes` lands here, since the copy is not bounds-checked in-process. |
 | `error.InvalidArgument` | Caller-side validation: a null or freed `Buffer`, or a launch geometry `Dim3.linearChecked` will not express. |
-| `error.BackendUnavailable` | `Kernel(spec, .cuda)` was instantiated in a build that emitted no CUDA artifact. The type still compiles; `init` refuses. |
+| `error.BackendUnavailable` | A backend this build emitted no artifact for. `RawKernel` and `rawKernelByName` make that a compile error first, so no call in 2.0 returns it; ask `g.available` instead. |
 | `error.CaptureFailed` | A stream capture failed to begin or end, or was invalidated in between (a host-blocking call ran during it). |
 | `error.GraphFailed` | A graph failed to instantiate, launch or update for a reason other than a topology change, which `GraphExec.update` reports as `false`. |
 | `error.EventFailed` | Creating, recording, waiting on or timing an event failed; timing an event created with `timing = false` lands here. |
@@ -81,7 +81,7 @@ union.
 The error tells you *which step* failed; `lastDriverError()` tells you *why*.
 
 ```zig
-var kernel = g.Kernel(kernels.scale_relu, .cuda).init(0) catch |err| {
+var kernel = g.RawKernel("scale_relu", .cuda).init(0) catch |err| {
     const drv = g.lastDriverError();
     std.debug.print("{t}: {t} code {d}\n", .{ err, drv.backend, drv.code });
     return err;
@@ -98,8 +98,8 @@ See [Troubleshooting](troubleshooting.html) for what to do about each.
 ## Launch geometry
 
 `Dim3` is the `extern struct { x: u32 = 1, y: u32 = 1, z: u32 = 1 }` both
-drivers expect. Generated kernels compute their own grid; you need this only
-for [`RawKernel`](advanced.html).
+drivers expect: `launch` takes one for the grid, measured in blocks, and one
+for the block, measured in threads.
 
 | | |
 | --- | --- |
@@ -115,197 +115,55 @@ program: a file header, a socket, argv.
 
 ## Naming
 
-Two pairs are easy to confuse:
+**`exportRaw`** goes in your *kernels* file and names an entry point.
+**`emitKernels`** goes in your *build.zig* and wires up the compilation. They
+are different files, and `@import("gompute")` means a different thing in each:
+gompute's build API in `build.zig`; in `kernels.zig`, the host root or the
+device root, depending on which compilation is reading it. Forgetting either
+produces a different error.
 
-- **`exportKernels`** goes in your *kernels* file and names the entry points to
-  emit. **`emitKernels`** goes in your *build.zig* and wires up the
-  compilation. One word apart, different files, and `@import("gompute")` means
-  a different module in each: the host module in `build.zig`, the device
-  module inside `kernels.zig`. Forgetting either produces a different error.
-- **`map` returns a comptime *type***, not a value, despite the lowercase name.
-  `pub const scale_relu = g.map(...)` binds a type, which is why
-  `Kernel(kernels.scale_relu, .cpu)` takes it as a parameter. `mapFn` is the
-  same thing with `T` and `Params` inferred from the function.
+## RawKernel
 
-`Unary` is `Fused` with a single operation; it exists so a bare `fn (T, Params) T`
-can be dropped into a `Fused` pipeline alongside op structs.
-
-## Kernel handles
-
-Three ways to hold a compiled spec. All of them expose the same `run`; they
-differ in when the backend is decided.
-
-| | Backend decided | |
-| --- | --- | --- |
-| `g.Kernel(spec, .cpu)` | Compile time | A direct inlined loop. `init` cannot fail; `deinit` is a no-op. |
-| `g.Kernel(spec, .cuda)` / `(spec, .hip)` | Compile time | `init(ordinal)` retains the device's primary context and loads the artifact. |
-| `g.AutoKernel(spec)` | First `init` call | Probes CUDA, then HIP, then falls back to the CPU. |
-
-`Kernel(spec, backend)` gives you:
+`g.RawKernel(name, backend)` is a handle on one exported kernel. `backend` is
+`.cuda` or `.hip`; `.cpu` is a compile error, because the CPU path is your own
+loop. Naming a backend this build emitted no artifacts for is a compile error
+too, so guard it with `if (comptime g.available(.cuda))`. A `name` that no
+kernel root exports is a compile error naming it.
 
 | | |
 | --- | --- |
-| `init(ordinal: c_int) Error!Self` | `ordinal` is the device index; `.cpu` ignores it. |
+| `init(ordinal: c_int) Error!Self` | Retains the device's primary context and loads the root that exports `name`. Cheap after the first handle on a device. |
 | `deinit(self) void` | Releases your handle. Safe twice. Not device teardown; see `shutdown()`. |
-| `run(...) Error!...` | The whole operation, buffers included. Arguments per the [operation table](#operations). |
-| `backend: Backend` | Comptime constant. |
-| `available: bool` | Comptime constant: false if this build emitted no artifact for the backend, in which case `init` returns `error.BackendUnavailable`. |
+| `alloc(bytes: usize) Error!Buffer` | **Bytes**. Caller frees the buffer. |
+| `allocPinned(bytes) Error![]u8` / `freePinned(block)` | Page-locked host memory, which the async copies need. Release it with `freePinned` only. |
+| `launch(grid, block, shared_bytes, args) Error!void` | On the NULL stream. Returns once queued. |
+| `launchOn(&stream, grid, block, shared_bytes, args) Error!void` | The same, ordered on `stream`. |
+| `synchronize() Error!void` | Wait for every launch and copy queued on this device. |
+| `createStream()` / `createStreamNonBlocking()` | A stream; the non-blocking kind is what a graph capture needs. Caller `deinit`s it. |
+| `createEvent(timing: bool)` | An event; `false` orders but cannot be timed. |
+| `hasGraphs()` / `hasEvents()` | False on a driver too old for them. |
+| `context` | The underlying `runtime.cuda.Context` / `runtime.hip.Context`, for what the handle does not wrap: `info`, peer access. |
+| `Buffer`, `Stream`, `Graph`, `GraphExec`, `Event`, `CaptureMode` | The backend's own types. See [Runtime](runtime.html). |
 
-GPU instantiations add the pieces `run` is built out of, for when you want to
-hoist the allocation and the copies. See [Advanced](advanced.html):
+`g.rawKernelByName(backend, name, ordinal)` is the same handle for a name
+decided at run time; it returns `g.RawByName(backend)`, which has no `init`,
+and an unknown name is `error.KernelNotFound`. See
+[Picking a kernel at run time](build.html#picking-a-kernel-at-run-time).
 
-| | |
-| --- | --- |
-| `alloc(count: usize) Error!Buffer` | `count` **elements**, not bytes. (`RawKernel.alloc` takes bytes.) |
-| `launch(...) Error!void` | Launch only: no allocation, no copy, no synchronize. |
-| `context` | The underlying `runtime.cuda.Context` / `runtime.hip.Context`. `context.synchronize()` is how you wait for a bare `launch`. |
-| `Buffer` | The backend's buffer type. `void` on `.cpu`. |
-| `reduceBlocks(count: usize) u32` | Blocks a `reduce` launch of `count` elements gets, at most 1024, so you can size the partials buffer. |
-| `stream: Stream` | Where `launch` enqueues; the NULL stream by default. Set it to capture launches into a graph; see [Advanced](advanced.html#graph-replay). |
+`g.available(backend)` is the comptime guard: true when this build emitted
+artifacts for `backend`, always false for `.cpu`.
 
-`AutoKernel(spec)` adds:
+## Kernel arguments
 
-| | |
-| --- | --- |
-| `init() Self` | Infallible. Cannot fail because the CPU path always exists. |
-| `initStrict() Error!Self` | Same probe, but a *broken* GPU artifact is fatal instead of a warning. |
-| `selected() Backend` | Which backend the probe actually chose. |
-| `Cpu` / `Cuda` / `Hip` | The three underlying handle types. |
+`args` is CUDA's and HIP's `void **kernelParams`: one `g.interface.Arg` per
+kernel parameter, in order, each a pointer to the storage holding that value.
+`g.interface.arg(&x)` wraps a variable; `buffer.argPtr()` is a buffer's device
+pointer. Nothing is copied, so every variable must stay alive and unmoved
+until `launch` returns, and a pointer to a temporary hands the kernel garbage.
 
-The distinction `initStrict` exists for: a missing driver means *no GPU on this
-machine*, and falling back to the CPU is correct. An artifact that is present
-and still fails to load means *this build is wrong* (wrong device arch, or a
-kernel left out of `exportKernels`), and quietly running 100× slower hides that
-mistake. `init` warns in that case; `initStrict` returns the error.
-
-```zig
-var kernel = g.AutoKernel(kernels.scale_relu).init();
-defer kernel.deinit();
-std.debug.assert(kernel.selected() == .cuda);
-```
-
-## Operations
-
-Every constructor below returns a spec; `g.Kernel(spec, backend)` /
-`g.AutoKernel(spec)` give it a `run` whose arguments are the operation's
-buffers, positionally. All of them take `.{ .block_size = 256 }`-style options.
-
-| Constructor | `run` | Body |
-| --- | --- | --- |
-| `g.map(name, T, P, fn (T, P) T, o)` | `run(data: []T, p)` | in place |
-| `g.mapTo(name, In, Out, P, fn (In, P) Out, o)` | `run(in: []const In, out: []Out, p)` | out of place, type may change |
-| `g.zip(name, A, B, Out, P, fn (A, B, P) Out, o)` | `run(a: []const A, b: []const B, out: []Out, p)` | two inputs, separate buffers |
-| `g.mapIndexed(name, T, P, fn (T, u64, P) T, o)` | `run(data: []T, p)` | value plus linear index |
-| `g.reduce(name, T, P, combine, identity, o)` | `run(data: []const T, p) !T` | whole-buffer fold |
-| `g.sum` / `g.min` / `g.max` / `g.any` / `g.all` `(name, T, P, o)` | `run(data: []const T, p) !T` | `reduce` presets |
-| `g.gather(name, T, Idx, o)` | `run(src, idx, out)` | `out[i] = src[idx[i]]` |
-| `g.scatter(name, T, Idx, o)` | `run(src, idx, out)` | `out[idx[i]] = src[i]` |
-
-`zip` exists so `c = a + b` does not force you to pack the operands into one
-`[]struct { a: f32, b: f32 }`. That is array-of-structs, and it interleaves two
-streams that each want to be coalesced on their own.
-
-On the GPU every generated kernel gives each thread `16 / @sizeOf(T)`
-consecutive elements (4 for `f32`, 2 for `f64`, 8 for `f16` and `i16`, 16 for
-`u8`, 1 for a 16-byte vector element): one 16-byte load and store per buffer,
-a scalar `eval` per lane, and a scalar tail for the last partial group. The
-reduce kernel's grid-stride loop loads the same way and folds the lanes before
-its shared-memory tree. The grid is `ceil(count / (block_size * lanes))`
-blocks. The vector access relies on buffers from `alloc`, which both drivers
-align to 256 bytes; `launch` takes base pointers only, so there is no offset to
-misalign.
-
-### Reduce
-
-`combine` must be associative and `identity` must be its neutral element: the
-device reassociates across threads and blocks, so the answer to a
-non-associative op changes with the launch geometry. Float addition is only
-approximately associative, so expect the last bits to differ from a strict
-left-to-right CPU sum.
-
-`.pre` turns a reduce into Thrust's `transform_reduce`: sum of squares, L2
-norm, "how many match", "does any exceed k", each in one launch:
-
-```zig
-fn square(x: f64, _: Params) f64 { return x * x; }
-pub const l2sq = g.sum("l2sq", f64, Params, .{ .pre = &square });
-```
-
-The presets also set the `@reduce` op their CPU path uses. A custom `combine`
-stays scalar on the CPU: a generic `fn (T, T) T` cannot be lane-widened.
-
-### Gather and scatter
-
-Fixed bodies, no user function. Reading `src` at an arbitrary offset needs a
-raw device pointer, and handing one to user code breaks the pure-scalar-function
-model that lets the same source run on the CPU.
-
-**Scatter with duplicate indices is nondeterministic.** Two threads writing one
-slot race, and which lands is unspecified on both vendors. There is no
-`scatterAdd`: combining duplicates needs a device float atomic, and
-`global_atomic_add_f32` is gfx9+/`--unsafe-fp-atomics` on AMD.
-
-An index at or past the end of the buffer it subscripts is skipped rather than
-written, so it can never corrupt memory, but the two backends do not agree on
-what the untouched slot then holds. For `gather` that slot is unspecified; for
-`scatter`, elements no index selects keep their prior value.
-
-### Not provided
-
-Scan/prefix-sum, sort, 2-D/3-D launches and dynamic shared memory are
-deliberately absent. A correct decoupled-lookback scan needs memory-ordering
-guarantees this API cannot express. Write those against
-[`RawKernel`](advanced.html), with `g.builtins.shuffleXor` for warp-level
-steps.
-
-## Generated ABI
-
-`Params` may be a normal Zig struct. At compile time, Gompute derives a matching
-`extern struct`, recursively packs it on the host, and unpacks it in device
-code.
-
-Supported generated fields:
-
-- fixed-width integers: 8, 16, 32, or 64 bits;
-- `f16`, `f32`, and `f64`;
-- booleans, represented as `u8` across the boundary;
-- enums with a supported fixed-width tag;
-- arrays, vectors, and nested structs composed from those types.
-
-Rejected by default:
-
-- `usize` and `isize`, because target pointer widths may differ;
-- pointers, slices, optionals, error unions, allocators, and opaque handles;
-- non-byte-sized integers and extended host-only floats.
-
-A rejection names the offending field by its full path, `Params.inner.w`, not
-just the type it happened to reach.
-
-A type can declare `gpu_layout`, `toGpu`, and `fromGpu` for an explicit custom
-boundary. This is the escape hatch for manually decomposing a higher-level
-host value into a stable wire representation. All three must be declared
-together, and `gpu_layout` must be an `extern` or `packed` struct, because a
-default-layout struct guarantees nothing about field order or padding across
-two separate compilations. [Advanced](advanced.html) has a worked example.
-
-Generated `map` kernels do all of this for you. `g.abi` is exposed for the
-cases where you are building the launch yourself: a [`RawKernel`](advanced.html)
-that wants the same parameter struct, or a
-[low-level launch](runtime.html):
-
-| | |
-| --- | --- |
-| `g.abi.Boundary(T)` | The wire type derived from `T`. A compile error if `T` cannot cross, naming the offending field by its full path. |
-| `g.abi.pack(T, value)` | Host value → `Boundary(T)`. |
-| `g.abi.unpack(T, wire)` | `Boundary(T)` → host value. |
-| `g.abi.assertStable(T)` | Comptime-only check. Put it in a `comptime` block to fail the build the moment a field is added that cannot cross. |
-
-```zig
-comptime { g.abi.assertStable(Params); }
-
-var wire = g.abi.pack(Params, .{ .scale = 2 });
-var args = [_]g.interface.Arg{ buffer.argPtr(), g.interface.arg(&wire) };
-```
+Pass each parameter as its own scalar argument; there is no struct
+marshalling. Use fixed-width types for scalars, as the examples do with
+`len: u64`: `usize` is the host's width, which need not be the device's.
 
 ## Device math
 
@@ -336,11 +194,13 @@ the rare input it cannot settle; the CPU runs a body shaped for its SIMD
 units. Both are
 checked against an f128 oracle on all 2³² inputs, and `examples/exhaustive`
 checks the CUDA result against the CPU on all 2³² as well. On an RTX 4060
-Laptop that is 80–160 Gcalls/s (40 for sin/cos) where binary64 gave 3–7.
+Laptop (Zig 0.18.0-dev.349, `examples/bench` with `BENCH=math`) that is
+89–111 Gcalls/s for `exp` and the logs and 67 for `sin`/`cos`.
 
 Every other f32 function is one rounding of the f64 body. On a GPU that
-costs f64 throughput (1/64 rate on consumer NVIDIA), and it is the price of
-the bits agreeing.
+costs f64 throughput (1/64 rate on consumer NVIDIA): on the same card f32
+`exp2`, `expm1`, `log1p`, `tan`, `tanh`, `sinh`, `cosh` and `pow` run 1.5–4
+Gcalls/s. That is the price of the bits agreeing.
 
 The math is also its own std-only module, `b.dependency("gompute", .{}).module("math")`,
 for code that wants it without the GPU layer, such as a compiler folding
@@ -383,25 +243,10 @@ AMDGPU backend cannot match. **An NVIDIA-only test matrix will not see this.**
 
 ## Backend status
 
-| Backend | Generated `map` path |              Host runtime | Validation in this package                     |
-| ------- | -------------------: | ------------------------: | ---------------------------------------------- |
-| CPU     |                  Yes |                Native Zig | Executed, and codegen-compared                 |
-| CUDA    |             Yes, PTX | Runtime-loaded driver API | Cross-compiled and executed; PTX entries inspected |
-| HIP     |           Yes, HSACO |    Runtime-loaded HIP API | Cross-compiled; ELF symbols/metadata inspected |
-
-"Codegen-compared" means `zig build test` compiles `tests/codegen.zig` at
-`ReleaseFast`, emits its assembly, and asserts that the generated
-`Kernel(Spec, .cpu)` and the hand-written loop beside it end up as the *same
-machine code*. In practice LLVM folds them into one symbol, along with the
-`mapFn` variant, which is the strongest form that assertion can take. If they
-ever diverge the build fails with an instruction-level diff. Zig 0.18 turned
-LLVM's loop vectorizer back on, and the fold still holds: on an x86-64 host
-with `-Dcpu=native` the shared body is a 4x-unrolled AVX2 loop, and
-`manual_scale_relu`, `gompute_scale_relu` and the `mapFn` variant are still one
-symbol, as are `manual_zip` and `gompute_zip`.
-
-That is the library's central claim, that the abstraction is resolved at compile
-time and leaves no runtime residue, so it is checked rather than asserted.
+| Backend | Device code |              Host runtime | Validation in this package                     |
+| ------- | ----------: | ------------------------: | ---------------------------------------------- |
+| CUDA    |         PTX | Runtime-loaded driver API | Cross-compiled and executed; PTX entries inspected |
+| HIP     |       HSACO |    Runtime-loaded HIP API | Cross-compiled; ELF symbols/metadata inspected |
 
 HIP is cross-compiled and its symbols inspected, but **nothing in this package
 has been executed on AMD hardware**; no such device was available. Its device

@@ -70,10 +70,9 @@ const dev = arch == .nvptx64 or arch == .amdgcn;
 /// The element type a body computes in: `T` itself for a scalar, the child for
 /// a vector.
 ///
-/// Vectors are accepted because the CPU backend instantiates a generic map body
-/// at `@Vector` width -- see `Spec.is_generic` and `lanes` in
-/// `src/host/kernel.zig`. Rejecting them made `g.math` a compile error in
-/// exactly the kernel shape the guide recommends for CPU speed.
+/// Vectors are accepted because a generic body written once for both runs at
+/// `@Vector` width on the CPU, and the vector forms are lane-exact with the
+/// scalar call -- which LLVM's loop vectorizer cannot find on its own.
 fn Elem(comptime T: type) type {
     const E = switch (@typeInfo(T)) {
         .vector => |v| v.child,

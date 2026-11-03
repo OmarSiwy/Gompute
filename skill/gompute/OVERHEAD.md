@@ -1,128 +1,133 @@
 # What each feature costs
 
-Two measurement sets. The 1.4.0 rows (first `init`, `run()`, launches, graphs,
-the math library tables) were measured on Zig 0.17.0 on an RTX 4060 Laptop
-(sm_89) with an i9-14900HX host, `ReleaseFast -Dcpu=native`, median of 200
-runs, kernel `add_offset` (`x + p.offset`, f32). The 1.5.0 rows (the 16-byte
-device lanes, the CPU bodies on Zig 0.18) come from `examples/bench` on the
-same machine with Zig 0.18.0-dev.349: 20 back-to-back launches timed with
-events after a warm-up, and for the A/B the minimum of five alternating rounds
-in one process, because this laptop's clocks drift more between runs than the
-differences being measured. Expect the same shape on other hardware, though
-the exact numbers will move.
+Three measurement sets, all on one machine: an RTX 4060 Laptop GPU (sm_89,
+24 SMs, peak 256 GB/s from `Context.info`) with an i9-14900HX host.
+
+- **2.0.0** (bandwidth, `BENCH=math`): `examples/bench`,
+  `zig build run -Doptimize=ReleaseFast`, Zig 0.18.0-dev.349+d924f83bf,
+  measured 2026-11-03. Bandwidth is 20 back-to-back `launchOn`s on a
+  non-blocking stream, timed with events after a warm-up.
+- **1.4.0** (first `init`, launch, graphs, startup): Zig 0.17.0,
+  `ReleaseFast -Dcpu=native`, median of 200 runs, kernel `add_offset`
+  (`x + offset`, f32, one element per thread). Measured through the removed
+  `Kernel` handle, whose `init` and `launch` took the same path `RawKernel`
+  takes now (the same `openModule`, then `makeCurrent` + `cuLaunchKernel`).
+  Not re-measured on 2.0.0.
+- **libm comparison** ("Device math against the libraries it replaces"):
+  the f64 table from 1.4.0 on Zig 0.17.0, the f32 table from 1.5.0; the
+  glibc and zig@ columns have not been re-measured since.
+
+Expect the same shape on other hardware, though the exact numbers will move.
+Nothing has executed on AMD hardware, so every number here is NVIDIA's.
 
 ## Compile time: free at run time
 
 | Feature | Run-time cost | Paid at |
 | --- | --- | --- |
-| Spec constructors (`map`, `zip`, `sum`, ...) | 0, zero-sized types | comptime |
-| Kind dispatch (`run`/`launch` picks a body per kind) | 0, `switch` on a comptime enum | comptime |
-| `Params` -> extern wire struct (`abi.pack`) | a by-value copy of the struct, folded away on the CPU | comptime layout |
-| `Fused` / `Unary` | 0, `inline for` into one expression | comptime |
-| Kernel-name lookup (`Kernel.init` -> which blob, which symbol) | 0, a comptime `StaticStringMap`; a missing kernel is a compile error | comptime |
+| Kernel-name lookup (`RawKernel.init` -> which blob, which symbol) | 0, a comptime `StaticStringMap`; a missing kernel is a compile error | comptime |
+| `g.available(backend)` | 0, a comptime bool | comptime |
 | Math table exactness checks | 0, a `comptime` block that fails the build on a bad digit | every build, device included |
-| `Kernel(spec, .cpu)` | 0. `zig build test` asserts it is the same machine code as the hand loop | checked by codegen test |
 
-## CPU backend
+`rawKernelByName` does the same lookup at run time: one `StaticStringMap`
+probe per call.
 
-| Path | Cost |
-| --- | --- |
-| `init`/`deinit` | nothing, both inline to no code |
-| concrete `map`, `mapTo`, `zip`, `mapIndexed` | a plain loop, which Zig 0.18's LLVM loop vectorizer widens where it can prove the loop: the codegen probe's concrete `map` is a 4x-unrolled AVX2 loop at `-Dcpu=native` |
-| generic (`anytype`) `map`, `mapTo`, `zip`, `mapIndexed` | `suggestVectorLength(T)` lanes per step by hand, scalar tail of < lanes elements. What it buys on 0.18 is `g.math`'s lane-exact vector forms, which no vectorizer finds; for plain arithmetic the concrete body is as fast or faster (below) |
-| concrete `gather`, `scatter` | a plain scalar loop; random access, nothing to widen |
-| `sum`/`min`/`max`/`any`/`all` | 4 vector registers of accumulators, a single `@reduce` at the end; tail < 4×lanes scalar. A strict float sum never auto-vectorizes, so this stays explicit |
-| custom `reduce` | scalar fold, one dependent `combine` per element |
-| `.pre` on a reduce | one scalar call per element, inlined |
-| `g.math` at vector width | see "Device math against the libraries it replaces" below |
+## CPU
 
-Zig 0.18, ns per element, median of 11 (`examples/bench`):
-
-| Body | n = 256K (L2) | n = 16M (DRAM) |
-| --- | ---: | ---: |
-| `map` scale-relu, concrete | 0.044 | 0.19 |
-| `map` scale-relu, generic | 0.066 | 0.24 |
-| `zip` a·s+b, concrete | 0.27 | 0.49 |
-| `zip` a·s+b, generic | 0.27 | 0.49 |
-| `sum` preset | 0.027 | 0.18 |
-| `map` of `g.math.exp`, concrete (scalar `exp`) | 1.27 | 1.24 |
-
-On 0.17.0, with the vectorizer off, the generic bodies were the fast ones
-(`zip` 0.40 → 0.15 ns/elem, `mapTo` of `exp` 2.93 → 1.20); on 0.18 the
-concrete arithmetic bodies match or beat them, and a generic body is for
-`g.math`.
+There is no CPU backend: the CPU path is your loop. A plain loop over a
+concrete arithmetic body is left to Zig 0.18's LLVM loop vectorizer, which
+widens and unrolls it. It does not widen calls into `g.math`; step the loop
+in `@Vector`s by hand for those (the `BENCH=math` table below shows what that
+buys per function). A strict float sum never auto-vectorizes: keep several
+vector accumulators yourself and `@reduce` once at the end. Read a
+vectorization claim off the assembly, never off a timing.
 
 ## GPU backend
 
+Bandwidth of one-element-per-thread raw kernels (`examples/bench/src/kernels.zig`),
+GB/s from the event-timed µs per launch, counting each byte read once and
+written once:
+
+| Kernel | n = 16M | |
+| --- | ---: | --- |
+| `raw_map_f32` (`max(x * s, 0)` in place) | 195 GB/s | 76% of peak |
+| `raw_map_f64` (`x * s` in place) | 197 GB/s | 77% |
+| `raw_zip_f32` (`out = a * s + b`) | 198 GB/s | 77% |
+
+At n = 1M the buffers sit in the 24 MB L2 and read over 100% of DRAM peak,
+so that size measures the cache, not the bus. At n = 1024 a launch is
+~2.2–2.4 µs device-side whatever the kernel: overhead-bound.
+
+Driver and launch costs (1.4.0, see the top):
+
 | Operation | n = 1024 | n = 1M f32 | What it does |
 | --- | ---: | ---: | --- |
-| first `Kernel.init` in the process | 220–255 ms | | `cuInit` 55–145 ms + primary context 75–90 ms (NVIDIA driver) + PTX JIT 9 ms cold / 0.1 ms from the driver's cache |
-| first `Kernel.init` after a background warm-up | 0.29 ms | | see "Startup" below |
-| later `Kernel.init`, same device/root | 0.4 µs | | table lookup: context and module are process-wide and cached |
-| `AutoKernel.init` (warm) | 0.3 µs | | probe, CUDA first, then HIP, then CPU |
-| `run()` | **12.3 µs** | **834 µs** | upload + launch + sync + download; buffers reused from the handle (was 82 / 983 µs when it allocated per call) |
-| `launch` + `context.synchronize()` | 4.8 µs | 11.8 µs | the launch itself |
+| first `init` in the process | 220–255 ms | | `cuInit` 55–145 ms + primary context 75–90 ms (NVIDIA driver) + PTX JIT 9 ms cold / 0.1 ms from the driver's cache |
+| first `init` after a background warm-up | 0.29 ms | | see "Startup" below |
+| later `init`, same device/root | 0.4 µs | | table lookup: context and module are process-wide and cached |
+| upload + launch + sync + download, pageable memory | 12.3 µs | 834 µs | 1.4.0's removed `run()`; the copies, not the launch |
+| `launch` + `synchronize()` | 4.8 µs | 11.8 µs | the launch itself |
 | 10 × `launch` + sync | 19.9 µs | 90.5 µs | ~1.5 µs CPU-side per extra launch |
 | graph of 10 launches, replay + sync | 13.0 µs | 85.2 µs | one driver call for all ten |
 
-Device kernels with 16-byte lanes (1.5.0: 4 f32, 2 f64 or 8 i16 per thread,
-one vector load and store each) against the 1.4.0 shape of one element per
-thread, the same process alternating both, minimum of five rounds, µs per
-launch:
-
-| Kernel | n | 1 per thread | 16 B per thread | |
-| --- | ---: | ---: | ---: | --- |
-| `map` f32 | 1M | 11.9 | 8.3 | 1.44× |
-| `zip` f32 | 1M | 9.4 | 6.6 | 1.42× |
-| `map` f64 | 1M | 11.4 | 11.3 | same |
-| `map` f32 | 16M | 600 | 596 | same: 200 GB/s, 78% of the card's 256 GB/s |
-| `map` f64 | 16M | 1293 | 1288 | same |
-| `zip` f32 | 16M | 908 | 978 | within the run-to-run drift |
-
-Once the working set leaves the 24 MB L2 the bus is saturated either way;
-inside it, four times fewer load and store instructions is a third off. The
-AMD side is the same code (`global_load_b128`), unmeasured. Fraction of peak
-at 16M for the rest, from the same bench: `sum` f32 84% (214 GB/s), `map`
-i16 160 µs for 64 MB (L2-assisted), `map` of `g.math.exp` 50% (the f64 math
-path, compute-bound on a 1/64-rate FP64 part).
-
 What to take from it:
 
-- **`run()` is a convenience, not a hot-path API.** At n=1024 it costs 2.5× a
-  bare launch, and at 1M it is 4× slower than the CPU doing the same `map`,
-  because both copies go through pageable memory. The GPU only wins once the
-  data *stays* there: hoist with `alloc`/`launch`.
+- **Keep data on the device.** A round trip through pageable memory cost 70×
+  the launch at 1M f32. The GPU only wins once the data *stays* there:
+  allocate and upload once, `launch` many times, download once. For copies
+  that overlap work, use pinned memory and the `*Async` copies on a stream.
 - **The first `init` is driver start-up, not Gompute.** `cuInit` and the
   primary context are ~99% of it, and no library can make them 0. Take them
   off the critical path instead (next section). Every later handle on that
   device and root costs ~0.5 µs. Roots load lazily, so only the root holding
   the kernel is JIT'd, and the driver caches the JIT on disk
-  (`~/.nv/ComputeCache`) after the first run on a machine.
+  (`~/.nv/ComputeCache`) after the first run on a machine. `sass = true`
+  embeds SASS for the build's arch so a card of that arch skips the JIT.
 - **Graphs pay off when launches are small.** For 10 small launches, a replay
   saves about 35% (19.9 → 13.0 µs). When each kernel is bandwidth-bound, the
   saving shrinks to ~6%, because the GPU time dominates. Graphs remove
   CPU-side submission cost, not kernel time.
-- `reduce` on the GPU: a grid-stride kernel capped at 1024 blocks, then per
-  block five xor shuffles inside each 32-lane group, one barrier, and one
-  group folding the group results (a shared-memory tree when the block size is
-  not a multiple of 32). The host downloads ≤1024 partials and folds them,
-  which costs microseconds next to the download that carries them. Against
-  the shared-memory tree it replaced: `sum` f32 at 1M elements 9.9 → 5.7 µs;
-  at 16M both run at the bus limit (~270 µs, 96% of peak).
-- `gather`/`scatter` `run` uploads `out` as well (unselected slots keep their
-  value), so expect one more copy than `mapTo`.
 - Device math gives CPU and GPU the same bits. f32 exp, log, log2, log10,
-  sin and cos are correctly rounded and run in f32 on the GPU (RTX 4060
-  Laptop, Zig 0.18.0-dev.349, `BENCH=math`: exp 155, log 85–96, log2/log10
-  ~80, sin/cos ~40 Gcalls/s; 1.5.0 computed them in f64 at 3–7). Every other
-  f32 function (tan, tanh, sinh, cosh, exp2, expm1, log1p, pow) computes in
-  f64, and f64 runs at 1/64 rate on consumer NVIDIA (`context.fp64Ratio()`
-  tells you). A throughput-bound kernel that can live with hardware
-  approximations and target-dependent bits can call `@exp2` directly.
-  Accuracy is ≤0.505 ulp for f64 exp/log/pow against an f128 oracle.
+  sin, cos and atan run in f32 on the GPU (2.0.0 `BENCH=math`: exp 111, log
+  99, log2/log10 89, sin/cos 67, atan 181 Gcalls/s). Every other f32 function
+  (exp2, expm1, log1p, tan, tanh, sinh, cosh, pow) computes in f64, 1.5–4
+  Gcalls/s, because f64 runs at 1/64 rate on consumer NVIDIA
+  (`context.fp64Ratio()` tells you). A throughput-bound kernel that can live
+  with hardware approximations and target-dependent bits can call `@exp2`
+  directly. Accuracy is ≤0.505 ulp for f64 exp/log/pow against an f128
+  oracle.
 - `pow` with an integer exponent takes the full table route, like any other
   exponent (a square-and-multiply shortcut broke monotonicity). In a hot
   kernel, write `x * x` yourself for `pow(x, 2)`.
+
+## Device math throughput (`BENCH=math`)
+
+2.0.0, Zig 0.18.0-dev.349, RTX 4060 Laptop and i9-14900HX (not pinned to a
+core). Each element makes 8 calls. GPU: Gcalls/s over 4M elements, best of 5
+event-timed rounds. CPU: ns per call over 64K elements, median of 5, the
+scalar call in a plain loop and the vector form 8 (f32) or 4 (f64) lanes wide.
+
+| fn | f32 GPU | f32 scalar | f32 vector | f64 GPU | f64 scalar | f64 vector |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| exp | 111.36 | 1.82 | 1.47 | 4.87 | 5.13 | 1.80 |
+| exp2 | 4.05 | 4.46 | 1.72 | 5.64 | 4.16 | 1.66 |
+| expm1 | 1.48 | 12.07 | 13.44 | 2.00 | 12.74 | 12.94 |
+| log | 98.70 | 5.43 | 2.10 | 4.05 | 6.75 | 2.86 |
+| log2 | 89.04 | 5.67 | 2.30 | 3.42 | 7.44 | 3.05 |
+| log10 | 88.97 | 5.68 | 2.28 | 2.71 | 9.50 | 3.53 |
+| log1p | 1.72 | 8.83 | 9.15 | 1.72 | 9.53 | 8.22 |
+| sin | 67.70 | 7.40 | 2.64 | 3.11 | 8.26 | 8.00 |
+| cos | 67.01 | 7.48 | 2.57 | 3.12 | 7.96 | 7.96 |
+| tan | 1.75 | 8.20 | 2.42 | 1.48 | 15.93 | 15.64 |
+| tanh | 2.46 | 27.40 | 3.02 | 1.59 | 10.37 | 10.17 |
+| sinh | 2.52 | 21.15 | 2.81 | 1.63 | 10.73 | 9.75 |
+| cosh | 3.39 | 21.06 | 2.28 | 3.24 | 5.03 | 4.91 |
+| atan | 181.04 | 4.10 | 0.57 | 3.23 | 4.69 | 1.20 |
+| pow | 2.18 | 18.95 | 5.53 | 1.51 | 12.28 | 4.42 |
+
+The vector form buys nothing for expm1 and log1p at either width, or for f64
+sin, cos, tan, tanh, sinh and cosh. This harness differs from the libm
+comparison below (8 calls per element, no core pinning), so
+compare within a table, not across.
 
 ## Device math against the libraries it replaces
 
@@ -209,19 +214,18 @@ const warm = try std.Thread.spawn(.{}, struct {
 }.f, .{});
 // ... parse config, load files, build the model ...
 warm.join();
-var kernel = try g.Kernel(spec, .cuda).init(0); // 0.29 ms: makeCurrent + cached module load
+var kernel = try g.RawKernel("scale_relu", .cuda).init(0); // makeCurrent + cached module load
 ```
 
-Measured: 255 ms becomes 0.29 ms on the critical path, as long as the app has
-~250 ms of its own work to overlap. On a headless Linux box, `nvidia-smi -pm 1`
-(persistence mode) keeps the driver initialized between processes and cuts
-`cuInit` itself.
+Measured on 1.4.0: 255 ms became 0.29 ms on the critical path, as long as the
+app has ~250 ms of its own work to overlap. On a headless Linux box,
+`nvidia-smi -pm 1` (persistence mode) keeps the driver initialized between
+processes and cuts `cuInit` itself.
 
 ## Memory and threads
 
-- Nothing in the library allocates on the host. `run` keeps up to three device
-  buffers on the handle (grown on demand, freed by `deinit`); `launch`
-  allocates nothing. One handle must not `run` from two threads at once.
+- `launch` and `launchOn` allocate nothing, on the host or the device. A
+  handle holds no buffers; every `Buffer` is yours to `free`.
 - Contexts and modules are shared process-wide per device (16 devices; the
   module list grows, and a failed growth loads that module uncached, which is
   slower but still correct). `deinit` releases your handle only.

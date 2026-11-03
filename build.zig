@@ -3,7 +3,7 @@
 //! Consumers use `emitKernels` (one artifact-consuming executable) or
 //! `addKernels` (several), plus the option structs above them. Everything
 //! below `pub fn build`'s `b.pkg_hash.len != 0` early return is gompute's own
-//! dev tooling -- tests, the codegen probe, the docs site -- and never runs for
+//! dev tooling -- tests, the device probes, the docs site -- and never runs for
 //! a dependency.
 //!
 //! Note that almost nothing here is reachable from `zig build test`: the
@@ -145,9 +145,9 @@ fn resolveGpu(
             if (detect(b)) |n| return n;
             std.log.warn(
                 "gompute: .auto found no " ++ backend ++ " GPU on this BUILD machine, so the " ++
-                    backend ++ " backend is compiled out. Kernel(spec, ." ++ backend ++
-                    ") is now a compile error, and AutoKernel will fall back to the CPU on " ++
-                    "every deploy machine no matter what hardware it has. " ++
+                    backend ++ " backend is compiled out. RawKernel(name, ." ++ backend ++
+                    ") is now a compile error, and gompute.available(." ++ backend ++ ") is false " ++
+                    "on every deploy machine no matter what hardware it has. " ++
                     "Pin it with ." ++ backend ++ " = .{{ .gpu = .{{ .name = \"" ++ example ++
                     "\" }} }}, or silence this with ." ++ backend ++ " = .{{ .enabled = false }}.",
                 .{},
@@ -258,16 +258,15 @@ pub fn build(b: *std.Build) void {
     _ = b.addModule("math", .{ .root_source_file = b.path("src/device/math.zig") });
 
     // A stub so `gompute` always resolves `gompute_kernels`. Without it, merely
-    // naming Kernel(spec, .cuda) in a build that never called emitKernels failed
+    // naming RawKernel(name, .cuda) in a build that never called emitKernels failed
     // with "no module named 'gompute_kernels' available within module 'gompute'"
     // -- an internal module the user never wrote. `emitted = false` lets the
     // host layer say what to do instead. emitKernels/addKernels replace this
     // import with the real artifacts; addImport with a duplicate name overwrites.
     //
     // It also makes the GPU backends reachable from `zig build test`: the test
-    // module previously had no gompute_kernels at all, so CudaKernel, HipKernel,
-    // AutoKernel and RawKernel were never semantically analyzed and a type error
-    // in any of them shipped undetected.
+    // module previously had no gompute_kernels at all, so RawKernel was never
+    // semantically analyzed and a type error in it shipped undetected.
     host_mod.addImport("gompute_kernels", b.createModule(.{
         .root_source_file = b.addWriteFiles().add("gompute_kernels.zig",
             \\//! Placeholder: gompute.emitKernels was never called in this build.
@@ -324,38 +323,9 @@ pub fn build(b: *std.Build) void {
     });
     const run_build_tests = b.addRunArtifact(build_tests);
 
-    const codegen_probe = b.addObject(.{
-        .name = "gompute-codegen-probe",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/codegen.zig"),
-            .target = target,
-            .optimize = .fast,
-            .imports = &.{.{ .name = "gompute", .module = host_mod }},
-        }),
-    });
-
-    // The probe used to be compiled and then never read, so the README's claim
-    // that the generated CPU kernel matches the hand-written loop was enforced
-    // by nobody. Compare the emitted assembly instead.
-    const codegen_check = b.addExecutable(.{
-        .name = "gompute-codegen-check",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/codegen_check.zig"),
-            .target = b.graph.host,
-            .optimize = .debug,
-        }),
-    });
-    const run_codegen_check = b.addRunArtifact(codegen_check);
-    run_codegen_check.addFileArg2(codegen_probe.getEmittedAsm(), .{});
-
-    const check_tests = b.addTest(.{ .root_module = codegen_check.root_module });
-    const run_check_tests = b.addRunArtifact(check_tests);
-
     // `src/device.zig` is reachable from no other test artifact -- they all root
-    // at `src/root.zig` or `tools/`. Worse, every kernels root in the repo and in
-    // both examples uses `g.map` and nothing else, so five of the six entry
-    // generators in `src/device/export.zig` had never been through the frontend
-    // for a GPU target at all. This compiles one spec of every `Kind`.
+    // at `src/root.zig` or `tools/`. This compiles raw kernels over the device
+    // root, the builtins and every `g.math` entry point.
     //
     // It runs the whole way to PTX, not just to IR. The frontend is not where
     // device code fails: `src/device/math.zig` exists because `@exp` and `@sin`
@@ -384,18 +354,15 @@ pub fn build(b: *std.Build) void {
         }),
     }));
     probe_names.addFileArg2(device_probe.getEmittedLlvmIr(), .{});
-    // Every entry shape must come out under its exported name, which is what
-    // the host's `getKernel` looks up.
+    // Every entry must come out under its exported name, which is what the
+    // host's `getKernel` looks up.
     const names_check = b.addCheckFile(probe_names.addOutputFileArg2("gompute_probe_names.zig", .{}), .{ .expected_matches = &.{
-        "\"t_map\"",    "\"t_map_to\"",  "\"t_zip\"",         "\"t_reduce\"",
-        "\"t_gather\"", "\"t_scatter\"", "\"t_map_indexed\"",
+        "\"t_raw_double\"", "\"t_raw_atomics\"", "\"t_raw_block_sum\"", "\"t_math_trig_f64\"",
     } });
 
     // The lowerings `src/device/builtins.zig` promises for `t_raw_atomics`.
     // LLVM 21 spells these `atom.global.add.u32`, LLVM 22 `atom.relaxed.sys.global.add.u32`.
-    // Then the 16-byte accesses `src/device/export.zig` promises for every
-    // elementwise entry (four f32 per thread in and out), and the warp-shuffle
-    // fold of `t_reduce`.
+    // Then the warp-shuffle fold of `t_raw_block_sum`.
     const ptx_atomics = b.addCheckFile(device_probe.getEmittedAsm(), .{ .expected_matches = &.{
         ".global.add.u32",
         ".global.min.u32",
@@ -403,8 +370,6 @@ pub fn build(b: *std.Build) void {
         "st.release.sys.global.b32",
         "ld.acquire.gpu.global.u32",
         "st.release.gpu.global.u32",
-        "ld.global.v4.b32",
-        "st.global.v4.b32",
         "shfl.sync.bfly.b32",
     } });
 
@@ -430,14 +395,11 @@ pub fn build(b: *std.Build) void {
         }),
     });
     // `t_raw_atomics` pins the acquire invalidate, the release wait and the
-    // spin pause. The last two are `barrier()` in `t_sum` (block 100, the
-    // shared-memory tree): `s_barrier` alone orders no memory, so it must sit
-    // between `__syncthreads`' fences. `global_load_b128`/`global_store_b128`
-    // are the 16-byte accesses of the elementwise entries, the AMD half of the
-    // PTX `v4` check. `v_permlanex16_b32` and `_dpp` are `t_reduce`'s
-    // warp-shuffle fold (block 256), and `s_load_b32 ... 0x4` with
-    // `user_sgpr_dispatch_ptr` is `globalIdX` reading the launched block size
-    // out of the dispatch packet.
+    // spin pause. The last two are `barrier()` in `t_raw_block_sum`:
+    // `s_barrier` alone orders no memory, so it must sit between
+    // `__syncthreads`' fences. `v_permlanex16_b32` and `_dpp` are its
+    // warp-shuffle fold, and `user_sgpr_dispatch_ptr` is `globalIdX` reading
+    // the launched block size out of the dispatch packet.
     const amd_trap = b.addCheckFile(device_probe_amd.getEmittedAsm(), .{ .expected_matches = &.{
         "atomic_add_u32",
         "buffer_gl0_inv",
@@ -445,8 +407,6 @@ pub fn build(b: *std.Build) void {
         "s_sleep 1",
         "s_waitcnt_vscnt null, 0x0\n\t;;#ASMEND",
         "s_barrier\n\t;;#ASMSTART\n\tbuffer_gl0_inv",
-        "global_load_b128",
-        "global_store_b128",
         "v_permlanex16_b32",
         "row_mask:0xf bank_mask:0xf",
         "amdhsa_user_sgpr_dispatch_ptr 1",
@@ -456,8 +416,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_unit_tests.step);
     test_step.dependOn(&run_tool_tests.step);
     test_step.dependOn(&run_build_tests.step);
-    test_step.dependOn(&run_check_tests.step);
-    test_step.dependOn(&run_codegen_check.step);
     test_step.dependOn(&names_check.step);
     test_step.dependOn(&ptx_atomics.step);
     test_step.dependOn(&device_probe_amd.step);
@@ -806,7 +764,7 @@ fn buildArtifacts(
 
 /// The generated `gompute_kernels` module: the blobs, plus one comptime
 /// name -> (blob, symbol) map per backend merged from the per-root tables the
-/// IR tool emitted. `src/host/kernel.zig` reads both.
+/// IR tool emitted. `src/host/raw.zig` reads both.
 fn artifactsSource(
     b: *std.Build,
     roots: []const KernelRoot,

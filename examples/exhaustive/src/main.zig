@@ -7,7 +7,6 @@
 
 const std = @import("std");
 const g = @import("gompute");
-const k = @import("kernels");
 const k2 = @import("kernels2");
 
 const print = std.debug.print;
@@ -77,41 +76,16 @@ fn allSame(comptime T: type, actual: []const T, expected: []const T) bool {
 pub fn main() !void {
     print("=== Gompute exhaustive GPU test ===\n\n", .{});
 
-    // ── AutoKernel tests (CUDA → HIP → CPU) ────────────────────────────
-    // Spec, label, input, params, expected. The axes worth covering are the
-    // element type (f32/f64/u32/i16), the param shape (scalar/multi/array/
-    // nested), fusion depth, and the length edges 0 and 1.
-    autoCase(k.scale_relu, "scale_relu", &.{ -3, -1, 0, 1, 3 }, .{ .scale = 2 }, &.{ 0, 0, 0, 2, 6 });
-    autoCase(k.affine_transform, "affine", &.{ 0, 1, -1, 10 }, .{ .scale = 3, .bias = 1, .enabled = true }, &.{ 1, 4, -2, 31 });
-    autoCase(k.clamp, "clamp", &.{ -5, 0, 0.5, 1, 2 }, .{ .scale = 0 }, &.{ 0, 0, 0.5, 1, 1 });
-    // -0.0, not 0: negating a zero keeps the sign, and the printed output says so.
-    autoCase(k.neg, "negate", &.{ -3, 0, 7 }, .{ .scale = 0 }, &.{ 3, -0.0, -7 });
-    autoCase(k.sq, "square", &.{ -2, 0, 3, 0.5 }, .{ .scale = 0 }, &.{ 4, 0, 9, 0.25 });
-    autoCase(k.weighted, "weighted", &.{ 5, 0 }, .{ .weights = .{ 2, 3, 4, 1 } }, &.{ 23, 13 });
-    autoCase(k.nested, "nested", &.{ 2, -1 }, .{ .inner = .{ .scale = 3 }, .offset = 10 }, &.{ 16, 7 });
-    autoCase(k.scale_square, "fused_scale_sq", &.{ 3, -2 }, .{ .scale = 2 }, &.{ 36, 16 });
-    autoCase(k.triple_fused, "triple_fused", &.{ -3, 2 }, .{ .scale = -2 }, &.{ 36, 16 });
-    autoCase(k.abs_then_scale, "abs_then_scale", &.{ -5, 3 }, .{ .scale = 10 }, &.{ 50, 30 });
-    autoCase(k.double_f64, "f64", &.{ 1.5, -2.25, 0 }, .{ .scale = 0 }, &.{ 3, -4.5, 0 });
-    autoCase(k.shift_mask, "u32_shift_mask", &.{ 0xFF00, 0xABCD, 0 }, .{ .shift = 8, .mask = 0xFF }, &.{ 0xFF, 0xAB, 0 });
-    autoCase(k.saturate_i16, "i16_saturate", &.{ -200, -50, 0, 50, 200 }, .{ .scale = 0 }, &.{ -100, -50, 0, 50, 100 });
-    autoCase(k.scale_relu, "empty", &.{}, .{ .scale = 2 }, &.{});
-    autoCase(k.sq, "single", &.{42}, .{ .scale = 0 }, &.{1764});
-    testAutoLarge();
-
     // ── Runtime dynamic backend ─────────────────────────────────────────
     section("runtime.dynamic", 11, testRuntimeDynamic);
 
     // ── Second kernel root + run-time kernel selection ──────────────────
     section("second root", 5, testSecondRoot);
 
-    // ── Every kind, GPU against CPU, at every length that has a tail ────
-    section("kinds", 14, testKinds);
-
     // ── Every device at once, and copies between them ───────────────────
     section("devices", 3, testDevices);
 
-    // ── A generated kernel captured into a graph and replayed ───────────
+    // ── A kernel captured into a graph and replayed ─────────────────────
     section("graph replay", 3, testGraphReplay);
 
     // ── g.math: the same bits on the GPU as on the CPU ──────────────────
@@ -120,92 +94,56 @@ pub fn main() !void {
     // ── g.math f32: every input, on the GPU, for the correctly rounded ones ─
     section("math f32 sweep", k2.math_cr32.len, testMathSweep);
 
-    // ── Comptime CPU reference (sanity baseline) ────────────────────────
-    testCpuReference();
-
-    // ── Hand-written raw kernel through the same artifact pipeline ──────
+    // ── Hand-written raw kernel through the artifact pipeline ───────────
     section("raw kernel", 1, testRawKernel);
 
-    // ── Pure comptime: ABI, fusion, Dim3 ────────────────────────────────
-    testAbiPack();
-    testFusionDirect();
+    // ── Pure comptime: Dim3 ─────────────────────────────────────────────
     testDim3Linear();
 
     print("\n=== Results: {} passed, {} failed ===\n", .{ pass_count, fail_count });
     if (fail_count > 0) std.process.exit(1);
 }
 
-// ── AutoKernel: runs on GPU when available ──────────────────────────────
-
-/// Every auto test is the same seven lines: pick a backend, run the spec over a
-/// literal input, compare against a literal expectation. Only `testAutoLarge`
-/// differs, because it generates its input rather than listing it.
-///
-/// `input` is copied into scratch storage so the caller can pass a literal.
-/// Asserts `input.len <= 8` -- these are shape probes, not workloads.
-fn autoCase(
-    comptime Spec: type,
-    label: []const u8,
-    input: []const Spec.Value,
-    params: Spec.Parameters,
-    expected: []const Spec.Value,
-) void {
-    std.debug.assert(input.len <= 8);
-    print("[auto {s}] ", .{label});
-    var kern = g.AutoKernel(Spec).init();
-    defer kern.deinit();
-    print("({s}) ", .{@tagName(kern.selected())});
-
-    var storage: [8]Spec.Value = undefined;
-    const data = storage[0..input.len];
-    @memcpy(data, input);
-    kern.run(data, params) catch unreachable;
-
-    check(label, allSame(Spec.Value, data, expected));
-    print("{any}\n", .{data});
+/// One elementwise launch: `data` up, the kernel over it with `extra` (or
+/// nothing, for `{}`) after the buffer and length, `data` down. Blocks until
+/// done.
+fn runOn(raw: anytype, buf: anytype, data: anytype, extra: anytype) !void {
+    const bytes = data.len * @sizeOf(@TypeOf(data[0]));
+    try buf.upload(data.ptr, bytes);
+    var len: u64 = data.len;
+    var e = extra;
+    const args = if (@TypeOf(extra) == void)
+        &[_]g.interface.Arg{ buf.argPtr(), g.interface.arg(&len) }
+    else
+        &[_]g.interface.Arg{ buf.argPtr(), g.interface.arg(&len), g.interface.arg(&e) };
+    try raw.launch(g.Dim3.linear(data.len, 256), .{ .x = 256 }, 0, args);
+    try raw.synchronize();
+    try buf.download(data.ptr, bytes);
 }
 
-fn testAutoLarge() void {
-    print("[auto large 10k] ", .{});
-    var kern = g.AutoKernel(k.scale_relu).init();
-    defer kern.deinit();
-    print("({s}) ", .{@tagName(kern.selected())});
-    var buf: [10000]f32 = undefined;
-    for (&buf, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i)) - 5000;
-    kern.run(&buf, .{ .scale = 1 }) catch unreachable;
-    var ok = true;
-    for (buf, 0..) |v, i| {
-        const orig: f32 = @as(f32, @floatFromInt(i)) - 5000;
-        const expected: f32 = if (orig > 0) orig else 0;
-        if (!same(f32, v, expected)) {
-            ok = false;
-            break;
-        }
-    }
-    check("large_10k", ok);
-    print("ok\n", .{});
-}
-
-/// `Kernel.stream` is what makes a generated kernel capturable: two launches
-/// recorded once, replayed twice, add the offset four times.
+/// Two launches recorded once on a non-blocking stream, replayed twice, add
+/// the offset four times.
 fn testGraphReplay() void {
     print("\n[graph replay]\n", .{});
-    if (!g.AutoKernel(k2.add_offset).Cuda.available) return skip("this build emitted no CUDA artifacts");
-    var kernel = g.Kernel(k2.add_offset, .cuda).init(0) catch return skip("no CUDA device");
-    defer kernel.deinit();
-    if (!kernel.context.hasGraphs()) return skip("driver has no graphs");
+    if (comptime !g.available(.cuda)) return skip("this build emitted no CUDA artifacts");
+    var raw = g.RawKernel("raw_add_offset", .cuda).init(0) catch return skip("no CUDA device");
+    defer raw.deinit();
+    if (!raw.hasGraphs()) return skip("driver has no graphs");
 
     var data = [_]f32{ 1, 2, 3 };
-    var buf = kernel.alloc(data.len) catch return;
+    var buf = raw.alloc(@sizeOf(@TypeOf(data))) catch return;
     defer buf.free();
     buf.upload(&data, @sizeOf(@TypeOf(data))) catch return;
 
-    kernel.stream = kernel.context.createStreamNonBlocking() catch return;
-    defer kernel.stream.deinit();
-    kernel.stream.beginCapture(.thread_local) catch return;
-    kernel.launch(&buf, data.len, .{ .offset = 1 }) catch return;
-    kernel.launch(&buf, data.len, .{ .offset = 1 }) catch return;
-    var graph = kernel.stream.endCapture() catch return;
+    var stream = raw.createStreamNonBlocking() catch return;
+    defer stream.deinit();
+    var len: u64 = data.len;
+    var offset: f32 = 1;
+    const args = [_]g.interface.Arg{ buf.argPtr(), g.interface.arg(&len), g.interface.arg(&offset) };
+    stream.beginCapture(.thread_local) catch return;
+    raw.launchOn(&stream, .{ .x = 1 }, .{ .x = 256 }, 0, &args) catch return;
+    raw.launchOn(&stream, .{ .x = 1 }, .{ .x = 256 }, 0, &args) catch return;
+    var graph = stream.endCapture() catch return;
     defer graph.deinit();
     // Capture records, it does not run.
     var probe: [3]f32 = undefined;
@@ -214,27 +152,27 @@ fn testGraphReplay() void {
 
     var exec = graph.instantiate() catch return;
     defer exec.deinit();
-    for (0..2) |_| exec.launch(&kernel.stream) catch return;
-    kernel.stream.synchronize() catch return;
+    for (0..2) |_| exec.launch(&stream) catch return;
+    stream.synchronize() catch return;
     buf.download(&data, @sizeOf(@TypeOf(data))) catch return;
     check("replayed_twice", allSame(f32, &data, &[_]f32{ 5, 6, 7 }));
-    check("stream_idle", kernel.stream.query() catch false);
+    check("stream_idle", stream.query() catch false);
     print("  {any}\n", .{data});
 }
 
 /// Every `g.math` function, f64 and f32, over random bit patterns plus each
 /// function's interesting ranges: the CUDA result must be the CPU's, bit for
-/// bit. One body per function on every target is the contract.
+/// bit.
 fn testMathBits() void {
     print("\n[math bit-identity]\n", .{});
-    if (!g.AutoKernel(k2.math_f64).Cuda.available) return skip("this build emitted no CUDA artifacts");
+    if (comptime !g.available(.cuda)) return skip("this build emitted no CUDA artifacts");
     inline for (.{ f64, f32 }) |T| {
-        const Spec = if (T == f64) k2.math_f64 else k2.math_f32;
         const U = @Int(.unsigned, @bitSizeOf(T));
-        var gpu = g.Kernel(Spec, .cuda).init(0) catch return skip("no CUDA device");
+        var gpu = g.RawKernel(if (T == f64) "math_f64" else "math_f32", .cuda).init(0) catch return skip("no CUDA device");
         defer gpu.deinit();
-        var cpu = g.Kernel(Spec, .cpu).init(0) catch unreachable;
         const n = 1 << 16;
+        var buf = gpu.alloc(n * @sizeOf(T)) catch return;
+        defer buf.free();
         var a: [n]T = undefined;
         var b: [n]T = undefined;
         var prng = std.Random.DefaultPrng.init(0xB17_1D);
@@ -248,16 +186,14 @@ fn testMathBits() void {
                 else => 1 + (r.float(T) - 0.5) * 0.25, // around 1
             };
             const input = a;
-            b = a;
-            gpu.run(&a, .{ .f = @intCast(f) }) catch return;
-            cpu.run(&b, .{ .f = @intCast(f) }) catch unreachable;
+            runOn(&gpu, &buf, @as([]T, &a), @as(u32, @intCast(f))) catch return;
+            for (&b, input) |*y, x| y.* = k2.mathOf(T)(x, @intCast(f));
             var bad: usize = 0;
-            for (a, b) |x, y| {
-                if (@as(U, @bitCast(x)) != @as(U, @bitCast(y)) and !(std.math.isNan(x) and std.math.isNan(y))) bad += 1;
+            for (a, b, input) |x, y, in| {
+                if (@as(U, @bitCast(x)) == @as(U, @bitCast(y)) or (std.math.isNan(x) and std.math.isNan(y))) continue;
+                if (bad < 4) print("    x={x} gpu={x} cpu={x}\n", .{ @as(U, @bitCast(in)), @as(U, @bitCast(x)), @as(U, @bitCast(y)) });
+                bad += 1;
             }
-            if (bad != 0) for (a, b, input) |x, y, in| {
-                if (@as(U, @bitCast(x)) != @as(U, @bitCast(y)) and !(std.math.isNan(x) and std.math.isNan(y))) print("    x={x} gpu={x} cpu={x}\n", .{ @as(U, @bitCast(in)), @as(U, @bitCast(x)), @as(U, @bitCast(y)) });
-            };
             if (bad != 0) print("  {s} f{d}: {d} of {d} differ\n", .{ @typeName(T), f, bad, n });
             mismatches += bad;
         }
@@ -272,24 +208,23 @@ fn testMathBits() void {
 /// this is what proves the GPU codegen (no FTZ, no contraction) is too.
 fn testMathSweep() void {
     print("\n[math f32 sweep]\n", .{});
-    if (!g.AutoKernel(k2.math_f32).Cuda.available) return skip("this build emitted no CUDA artifacts");
-    var gpu = g.Kernel(k2.math_f32, .cuda).init(0) catch return skip("no CUDA device");
+    if (comptime !g.available(.cuda)) return skip("this build emitted no CUDA artifacts");
+    var gpu = g.RawKernel("math_f32", .cuda).init(0) catch return skip("no CUDA device");
     defer gpu.deinit();
-    var cpu = g.Kernel(k2.math_f32, .cpu).init(0) catch unreachable;
     const chunk = 1 << 24;
+    var buf = gpu.alloc(chunk * @sizeOf(f32)) catch return;
+    defer buf.free();
     const a = std.heap.page_allocator.alloc(f32, chunk) catch return;
     defer std.heap.page_allocator.free(a);
-    const b = std.heap.page_allocator.alloc(f32, chunk) catch return;
-    defer std.heap.page_allocator.free(b);
     for (k2.math_cr32) |f| {
         var bad: usize = 0;
         var base: u64 = 0;
         while (base < 1 << 32) : (base += chunk) {
             for (a, 0..) |*x, i| x.* = @bitCast(@as(u32, @intCast(base + i)));
-            @memcpy(b, a);
-            gpu.run(a, .{ .f = f }) catch return;
-            cpu.run(b, .{ .f = f }) catch unreachable;
-            for (a, b, 0..) |x, y, i| {
+            runOn(&gpu, &buf, a, f) catch return;
+            for (a, 0..) |x, i| {
+                const in: f32 = @bitCast(@as(u32, @intCast(base + i)));
+                const y = k2.mathOf(f32)(in, f);
                 if (@as(u32, @bitCast(x)) == @as(u32, @bitCast(y)) or (x != x and y != y)) continue;
                 if (bad < 4) print("    f{d} x={x} gpu={x} cpu={x}\n", .{ f, base + i, @as(u32, @bitCast(x)), @as(u32, @bitCast(y)) });
                 bad += 1;
@@ -300,135 +235,17 @@ fn testMathSweep() void {
     }
 }
 
-// ── Every kind on the GPU, the CPU path as the oracle ───────────────────
-
-/// Lengths around every edge the generated entries have: 0 and 1, the lane
-/// group (2, 4, 8, 16), the block (64, 100, 128, 256) and a few blocks, each
-/// one less, exact and one more, plus one that is none of those.
-const edge_lengths = [_]usize{ 0, 1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 99, 100, 101, 127, 128, 129, 255, 256, 257, 511, 512, 513, 1023, 1024, 1025, 4095, 4096, 4097, 70001 };
-const max_len = edge_lengths[edge_lengths.len - 1];
-
-/// One kind on both backends over every edge length. Floats compare within
-/// `same`'s tolerance (a reduce reorders), everything else bit for bit. One
-/// `check` per spec: the first length that disagrees is reported.
-fn kindCase(comptime Spec: type, label: []const u8, params_in: anytype) void {
-    const kind = comptime g.spec.kindOf(Spec);
-    // Typed at the call site (an untyped literal cannot cross `anytype`);
-    // gather and scatter take none.
-    const params = if (kind == .gather or kind == .scatter) {} else @as(Spec.Parameters, params_in);
-    var gpu = g.Kernel(Spec, .cuda).init(0) catch return skip("no CUDA device");
-    defer gpu.deinit();
-    var cpu = g.Kernel(Spec, .cpu).init(0) catch unreachable;
-    const Store = struct {
-        var a: [max_len]Spec.Value = undefined;
-        var b: [max_len]Spec.Value = undefined;
-        var ga: [max_len]Spec.Value = undefined;
-        var gb: [max_len]Spec.Value = undefined;
-        var in: [max_len]if (kind == .map_to) Spec.In else u8 = undefined;
-        var idx: [max_len]if (kind == .gather or kind == .scatter) Spec.Index else u8 = undefined;
-    };
-    for (edge_lengths) |len| {
-        // Deterministic, type-generic fill: small integers through a float.
-        for (0..len) |i| {
-            const f: f32 = @as(f32, @floatFromInt((i * 37) % 251)) - 125;
-            Store.a[i] = fill(Spec.Value, f);
-            Store.b[i] = fill(Spec.Value, -f * 0.5);
-            if (kind == .map_to) Store.in[i] = fill(Spec.In, f);
-            // Gather reads, so repeats are fine; scatter writes, and two
-            // threads on one slot are a documented race, so its indices are
-            // a permutation. Every fifth one lands past the end of `out`.
-            if (kind == .gather) Store.idx[i] = @intCast((i * 11 + 3) % (len + 2));
-            if (kind == .scatter) Store.idx[i] = @intCast(if (i % 5 == 0) len + 1 else len - 1 - i);
-        }
-        @memcpy(Store.ga[0..len], Store.a[0..len]);
-        @memcpy(Store.gb[0..len], Store.b[0..len]);
-        const ok = switch (kind) {
-            .map, .map_indexed => blk: {
-                gpu.run(Store.ga[0..len], params) catch break :blk false;
-                cpu.run(Store.a[0..len], params) catch unreachable;
-                break :blk allSame(Spec.Value, Store.ga[0..len], Store.a[0..len]);
-            },
-            .map_to => blk: {
-                gpu.run(Store.in[0..len], Store.ga[0..len], params) catch break :blk false;
-                cpu.run(Store.in[0..len], Store.a[0..len], params) catch unreachable;
-                break :blk allSame(Spec.Value, Store.ga[0..len], Store.a[0..len]);
-            },
-            .zip => blk: {
-                var out: [max_len]Spec.Value = undefined;
-                var gout: [max_len]Spec.Value = undefined;
-                gpu.run(Store.a[0..len], Store.b[0..len], gout[0..len], params) catch break :blk false;
-                cpu.run(Store.a[0..len], Store.b[0..len], out[0..len], params) catch unreachable;
-                break :blk allSame(Spec.Value, gout[0..len], out[0..len]);
-            },
-            .reduce => blk: {
-                const got = gpu.run(Store.a[0..len], params) catch break :blk false;
-                const want = cpu.run(Store.a[0..len], params) catch unreachable;
-                break :blk reduceSame(Spec.Value, got, want, len);
-            },
-            .gather, .scatter => blk: {
-                gpu.run(Store.a[0..len], Store.idx[0..len], Store.gb[0..len]) catch break :blk false;
-                cpu.run(Store.a[0..len], Store.idx[0..len], Store.b[0..len]) catch unreachable;
-                break :blk allSame(Spec.Value, Store.gb[0..len], Store.b[0..len]);
-            },
-        };
-        if (!ok) {
-            print("  {s}: GPU and CPU disagree at len {d}\n", .{ label, len });
-            return check(label, false);
-        }
-    }
-    check(label, true);
-}
-
-fn fill(comptime T: type, f: f32) T {
-    return switch (@typeInfo(T)) {
-        .float => @floatCast(f),
-        .int => @intCast(@as(i32, @intFromFloat(f)) & (if (@typeInfo(T).int.signedness == .unsigned) 0xff else 0x7f)),
-        .vector => |v| @splat(fill(v.child, f)),
-        else => @compileError("fill: " ++ @typeName(T)),
-    };
-}
-
-/// A float reduce reorders, so it gets a relative tolerance that grows with
-/// the length; an integer one must agree exactly.
-fn reduceSame(comptime T: type, got: T, want: T, len: usize) bool {
-    return switch (@typeInfo(T)) {
-        .float => std.math.approxEqRel(T, got, want, @as(T, @floatFromInt(len + 1)) * 1e-6) or (got == 0 and want == 0),
-        else => got == want,
-    };
-}
-
-fn testKinds() void {
-    print("\n[kinds]\n", .{});
-    if (!g.AutoKernel(k2.x_sum_f32).Cuda.available) return skip("this build emitted no CUDA artifacts");
-    const p: k2.Params = .{ .offset = 2 };
-    kindCase(k.scale_relu, "map f32 (4 per thread)", k.ScalarParams{ .scale = 2 });
-    kindCase(k.double_f64, "map f64 (2 per thread)", k.ScalarParams{ .scale = 0 });
-    kindCase(k.saturate_i16, "map i16 (8 per thread)", k.ScalarParams{ .scale = 0 });
-    kindCase(k2.x_map_u8, "map u8 (16 per thread)", p);
-    kindCase(k2.x_map_v4, "map v4f32 (1 per thread)", p);
-    kindCase(k2.x_indexed, "mapIndexed", p);
-    kindCase(k2.x_to_u8, "mapTo f32->u8", p);
-    kindCase(k2.x_widen, "mapTo f32->f64", p);
-    kindCase(k2.x_zip_f32, "zip", p);
-    kindCase(k2.x_sum_f32, "sum f32", p);
-    kindCase(k2.x_max_i32, "max i32 (block 100)", p);
-    kindCase(k2.x_xor_u32, "reduce xor u32 (block 64)", p);
-    kindCase(k2.x_gather, "gather", {});
-    kindCase(k2.x_scatter, "scatter", {});
-    print("  done\n", .{});
-}
-
 // ── Several devices: one handle, stream and pinned slice per device ──────
 
-/// Shards one map over every device the backend has, launches on all of them
-/// without waiting, then waits once per device. `GOMPUTE_FAKE_DEVICES=2`
+/// Shards one kernel over every device the backend has, launches on all of
+/// them without waiting, then waits once per device. `GOMPUTE_FAKE_DEVICES=2`
 /// makes a one-card machine run it with two contexts; one real card skips.
 fn testDevices() void {
     print("\n[devices]\n", .{});
-    if (!g.AutoKernel(k2.add_offset).Cuda.available) return skip("this build emitted no CUDA artifacts");
+    if (comptime !g.available(.cuda)) return skip("this build emitted no CUDA artifacts");
     const count = g.runtime.dynamic.deviceCount(.cuda) catch return skip("no CUDA driver");
     if (count < 2) return skip("one device; set GOMPUTE_FAKE_DEVICES=2 to shard across two contexts");
-    const K = g.Kernel(k2.add_offset, .cuda);
+    const K = g.RawKernel("raw_add_offset", .cuda);
     const Dev = struct { kernel: K, stream: K.Stream, buf: K.Buffer, host: []u8 };
     const n: usize = 1000;
     const per = n / 2;
@@ -438,22 +255,23 @@ fn testDevices() void {
 
     for (&devs, 0..) |*d, o| {
         d.kernel = K.init(@intCast(o)) catch return;
-        d.stream = d.kernel.context.createStreamNonBlocking() catch return;
-        d.kernel.stream = d.stream;
-        d.buf = d.kernel.alloc(per) catch return;
-        d.host = d.kernel.context.allocPinned(per * 4) catch return;
+        d.stream = d.kernel.createStreamNonBlocking() catch return;
+        d.buf = d.kernel.alloc(per * 4) catch return;
+        d.host = d.kernel.allocPinned(per * 4) catch return;
         @memcpy(d.host, std.mem.sliceAsBytes(input[o * per ..][0..per]));
     }
     defer for (&devs) |*d| {
-        d.kernel.context.freePinned(d.host);
+        d.kernel.freePinned(d.host);
         d.buf.free();
         d.stream.deinit();
         d.kernel.deinit();
     };
     // Enqueue everything on both devices, then wait: the two halves overlap.
+    var len: u64 = per;
+    var offset: f32 = 10;
     for (&devs) |*d| {
         d.buf.uploadAtAsync(d.host.ptr, 0, per * 4, &d.stream) catch return;
-        d.kernel.launch(&d.buf, per, .{ .offset = 10 }) catch return;
+        d.kernel.launchOn(&d.stream, g.Dim3.linear(per, 256), .{ .x = 256 }, 0, &.{ d.buf.argPtr(), g.interface.arg(&len), g.interface.arg(&offset) }) catch return;
         d.buf.downloadAtAsync(d.host.ptr, 0, per * 4, &d.stream) catch return;
     }
     for (&devs) |*d| d.stream.synchronize() catch return;
@@ -462,7 +280,7 @@ fn testDevices() void {
         const got: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, d.host));
         for (got, 0..) |v, i| ok = ok and v == input[o * per + i] + 10;
     }
-    check("sharded_map_on_every_device", ok);
+    check("sharded_kernel_on_every_device", ok);
 
     // A copy between the two is a peer copy; the first device's buffer ends
     // up holding the second's half.
@@ -481,26 +299,26 @@ fn testDevices() void {
     print("  {d} devices, peer access: {s}\n", .{ count, if (link) "direct" else |_| "staged" });
 }
 
-// ── Runtime dynamic: module load + buffer + kernel launch ───────────────
-
 /// The multi-root pipeline: `src/kernels2.zig` is a second, separately compiled
 /// artifact. Proves the merged name map reaches both roots, that a name decided
 /// at run time resolves into the right blob, and that an unknown one is an
 /// error rather than a panic.
 fn testSecondRoot() void {
     print("\n[second root]\n", .{});
-    if (!g.AutoKernel(k2.add_offset).Cuda.available) return skip("this build emitted no CUDA artifacts");
+    if (comptime !g.available(.cuda)) return skip("this build emitted no CUDA artifacts");
     const loaded = g.runtime.cuda.loadedModuleCount;
     const before = loaded();
 
     // Comptime-named, from the second root.
-    var kernel = g.Kernel(k2.add_offset, .cuda).init(0) catch |e| {
+    var kernel = g.RawKernel("raw_add_offset", .cuda).init(0) catch |e| {
         print("  init failed: {s}\n", .{@errorName(e)});
         return;
     };
     defer kernel.deinit();
+    var buf = kernel.alloc(3 * @sizeOf(f32)) catch return;
+    defer buf.free();
     var data = [_]f32{ 1, 2, 3 };
-    kernel.run(&data, .{ .offset = 10 }) catch |e| {
+    runOn(&kernel, &buf, @as([]f32, &data), @as(f32, 10)) catch |e| {
         print("  run failed: {s}\n", .{@errorName(e)});
         return;
     };
@@ -509,9 +327,9 @@ fn testSecondRoot() void {
     check("second_root_loaded_one_blob", loaded() == before + 1);
 
     // A name the compiler cannot see: chosen from a run-time value.
-    var buf: [16]u8 = undefined;
-    var buf2: [16]u8 = undefined;
-    const chosen = std.fmt.bufPrint(&buf, "raw_{s}", .{if (data[0] > 0) "triple" else "nope"}) catch return;
+    var name_buf: [16]u8 = undefined;
+    var name_buf2: [16]u8 = undefined;
+    const chosen = std.fmt.bufPrint(&name_buf, "raw_{s}", .{if (data[0] > 0) "triple" else "nope"}) catch return;
     var by_name = g.rawKernelByName(.cuda, chosen, 0) catch |e| {
         print("  rawKernelByName failed: {s}\n", .{@errorName(e)});
         return;
@@ -522,31 +340,24 @@ fn testSecondRoot() void {
     var device_buf = by_name.alloc(3 * @sizeOf(f32)) catch return;
     defer device_buf.free();
     var host_data = [_]f32{ 1, 2, 3 };
-    device_buf.upload(@ptrCast(&host_data), @sizeOf(@TypeOf(host_data))) catch return;
-    var len: u64 = 3;
-    by_name.launch(.{ .x = 1 }, .{ .x = 256 }, 0, &.{ device_buf.argPtr(), g.interface.arg(&len) }) catch return;
-    by_name.synchronize() catch return;
-    device_buf.download(@ptrCast(&host_data), @sizeOf(@TypeOf(host_data))) catch return;
+    runOn(&by_name, &device_buf, @as([]f32, &host_data), {}) catch return;
     check("runtime_named_kernel_result", allSame(f32, &host_data, &[_]f32{ 3, 6, 9 }));
 
     // An unknown name is an error, not a panic.
-    const bogus = std.fmt.bufPrint(&buf2, "raw_{s}", .{if (data[0] > 0) "nope" else "triple"}) catch return;
+    const bogus = std.fmt.bufPrint(&name_buf2, "raw_{s}", .{if (data[0] > 0) "nope" else "triple"}) catch return;
     if (g.rawKernelByName(.cuda, bogus, 0)) |_| {
         check("unknown_runtime_name_errors", false);
     } else |err| {
         check("unknown_runtime_name_errors", err == error.KernelNotFound);
         print("  \"{s}\" -> {s}\n", .{ bogus, @errorName(err) });
     }
-    print("  add_offset {any}, {s} {any}, blobs loaded {d}\n", .{
-        data,
-        chosen,
-        host_data,
-        loaded(),
-    });
+    print("  raw_add_offset {any}, {s} {any}, blobs loaded {d}\n", .{ data, chosen, host_data, loaded() });
 }
 
+// ── Runtime dynamic: module load + buffer + kernel launch ───────────────
+
 /// The generated index is built from the same kernel roots as the artifacts, so
-/// a name that is missing while the artifacts exist means a renamed spec or a
+/// a name that is missing while the artifacts exist means a renamed kernel or a
 /// mismatched root -- a regression to report, not a `.?` panic. `docs/runtime.md`
 /// shows the same shape as `orelse return error.KernelNotFound`.
 fn notInIndex() void {
@@ -568,11 +379,11 @@ fn testRuntimeDynamic() void {
     const artifacts = @import("gompute_kernels");
     const image: [:0]const u8 = switch (gpu.backend) {
         .cuda => if (artifacts.has_cuda)
-            artifacts.cuda_images[(artifacts.cuda_index.get("scale_relu") orelse return notInIndex()).blob]
+            artifacts.cuda_images[(artifacts.cuda_index.get("raw_scale") orelse return notInIndex()).blob]
         else
             return skip("this build emitted no CUDA artifacts"),
         .hip => if (artifacts.has_hip)
-            artifacts.hip_images[(artifacts.hip_index.get("scale_relu") orelse return notInIndex()).blob]
+            artifacts.hip_images[(artifacts.hip_index.get("raw_scale") orelse return notInIndex()).blob]
         else
             return skip("this build emitted no HIP artifacts"),
         .cpu => unreachable,
@@ -587,7 +398,7 @@ fn testRuntimeDynamic() void {
     check("runtime_load_module", true);
 
     // Get kernel handle
-    var kernel = module.getKernel("scale_relu") catch |e| {
+    var kernel = module.getKernel("raw_scale") catch |e| {
         print("  getKernel failed: {s}\n", .{@errorName(e)});
         return;
     };
@@ -612,11 +423,11 @@ fn testRuntimeDynamic() void {
     check("runtime_upload", true);
 
     var len: u64 = N;
-    var packed_params = g.abi.pack(k.ScalarParams, .{ .scale = @as(f32, 2.0) });
+    var scale: f32 = 2;
     var args = [_]g.interface.Arg{
         buf.argPtr(),
         g.interface.arg(&len),
-        g.interface.arg(&packed_params),
+        g.interface.arg(&scale),
     };
     const grid = g.Dim3.linear(N, 256);
     kernel.launch(grid, .{ .x = 256 }, 0, &args) catch |e| {
@@ -640,8 +451,7 @@ fn testRuntimeDynamic() void {
     var ok = true;
     for (result, 0..) |v, i| {
         const orig: f32 = @as(f32, @floatFromInt(i)) - 512;
-        const y = orig * 2.0;
-        const expected: f32 = if (y > 0) y else 0;
+        const expected = orig * 2.0;
         if (!same(f32, v, expected)) {
             ok = false;
             break;
@@ -693,29 +503,17 @@ fn testRuntimeDynamic() void {
     print("  runtime tests done\n", .{});
 }
 
-// ── CPU reference baseline ──────────────────────────────────────────────
+// ── Raw kernel ──────────────────────────────────────────────────────────
 
-fn testCpuReference() void {
-    print("\n[cpu reference] ", .{});
-    var data = [_]f32{ -3, -1, 0, 1, 3 };
-    var kern = g.Kernel(k.scale_relu, .cpu).init(0) catch unreachable;
-    kern.run(&data, .{ .scale = 2 }) catch unreachable;
-    check("cpu_ref", allSame(f32, &data, &.{ 0, 0, 0, 2, 6 }));
-    print("ok\n", .{});
-}
-
-// ── ABI pack/unpack ─────────────────────────────────────────────────────
-
-/// `raw_increment` is exported by kernels.zig via `exportRaw` and rides the same
-/// PTX/HSACO pipeline as the generated kernels, but is launched by hand: the
-/// caller owns the grid, the block, and the argument list.
+/// `raw_increment` is exported by kernels.zig via `exportRaw` and launched by
+/// hand: the caller owns the grid, the block, and the argument list.
 ///
-/// `AutoKernel(...).Cuda.available` is the comptime question "did this build
-/// emit CUDA artifacts?" -- `RawKernel(name, .cuda)` is a compile error when it
-/// did not, so a probe that must compile on any machine has to ask first.
+/// `g.available(.cuda)` is the comptime question "did this build emit CUDA
+/// artifacts?" -- `RawKernel(name, .cuda)` is a compile error when it did not,
+/// so a probe that must compile on any machine has to ask first.
 fn testRawKernel() void {
-    print("[raw kernel] ", .{});
-    if (comptime !g.AutoKernel(k.scale_relu).Cuda.available) return skip("this build emitted no CUDA artifacts");
+    print("\n[raw kernel] ", .{});
+    if (comptime !g.available(.cuda)) return skip("this build emitted no CUDA artifacts");
 
     // Not a skip: the artifacts exist, so failing to load one is a regression.
     var raw = g.RawKernel("raw_increment", .cuda).init(0) catch |e| {
@@ -723,82 +521,18 @@ fn testRawKernel() void {
         return;
     };
     defer raw.deinit();
-
     var data = [_]f32{ 1, 2, 3, 4, 5 };
-    const bytes = data.len * @sizeOf(f32);
-    const block: u32 = 256;
-
-    var buffer = raw.alloc(bytes) catch |e| {
+    var buffer = raw.alloc(@sizeOf(@TypeOf(data))) catch |e| {
         print("alloc failed: {s}\n", .{@errorName(e)});
         return;
     };
     defer buffer.free();
-
-    var len: u64 = data.len;
-    var args = [_]g.interface.Arg{ buffer.argPtr(), g.interface.arg(&len) };
-
-    buffer.upload(&data, bytes) catch |e| {
-        print("upload failed: {s}\n", .{@errorName(e)});
+    runOn(&raw, &buffer, @as([]f32, &data), {}) catch |e| {
+        print("run failed: {s}\n", .{@errorName(e)});
         return;
     };
-    raw.launch(g.Dim3.linear(data.len, block), .{ .x = block }, 0, &args) catch |e| {
-        print("launch failed: {s}\n", .{@errorName(e)});
-        return;
-    };
-    raw.synchronize() catch |e| {
-        print("sync failed: {s}\n", .{@errorName(e)});
-        return;
-    };
-    buffer.download(&data, bytes) catch |e| {
-        print("download failed: {s}\n", .{@errorName(e)});
-        return;
-    };
-
     check("raw_increment", allSame(f32, &data, &.{ 2, 3, 4, 5, 6 }));
     print("{any}\n", .{data});
-}
-
-fn testAbiPack() void {
-    print("[abi pack/unpack] ", .{});
-    const abi = g.abi;
-
-    const packed_scalar = abi.pack(k.ScalarParams, .{ .scale = 3.14 });
-    const unpacked_scalar = abi.unpack(k.ScalarParams, packed_scalar);
-    check("abi_scalar", same(f32, unpacked_scalar.scale, 3.14));
-
-    const packed_multi = abi.pack(k.MultiParams, .{ .scale = 2, .bias = -1, .enabled = true });
-    const unpacked_multi = abi.unpack(k.MultiParams, packed_multi);
-    check("abi_multi_scale", same(f32, unpacked_multi.scale, 2));
-    check("abi_multi_bias", same(f32, unpacked_multi.bias, -1));
-    check("abi_multi_bool", unpacked_multi.enabled == true);
-
-    const packed_false = abi.pack(k.MultiParams, .{ .scale = 0, .bias = 0, .enabled = false });
-    const unpacked_false = abi.unpack(k.MultiParams, packed_false);
-    check("abi_bool_false", unpacked_false.enabled == false);
-
-    const packed_arr = abi.pack(k.ArrayParams, .{ .weights = .{ 1, 2, 3, 4 } });
-    const unpacked_arr = abi.unpack(k.ArrayParams, packed_arr);
-    check("abi_array", unpacked_arr.weights[0] == 1 and unpacked_arr.weights[3] == 4);
-
-    const packed_nested = abi.pack(k.NestedParams, .{ .inner = .{ .scale = 7 }, .offset = -3 });
-    const unpacked_nested = abi.unpack(k.NestedParams, packed_nested);
-    check("abi_nested", same(f32, unpacked_nested.inner.scale, 7) and same(f32, unpacked_nested.offset, -3));
-
-    const B = abi.Boundary(k.MultiParams);
-    check("abi_extern_layout", @typeInfo(B).@"struct".layout == .@"extern");
-
-    print("ok\n", .{});
-}
-
-// ── Fusion direct eval ──────────────────────────────────────────────────
-
-fn testFusionDirect() void {
-    print("[fusion direct] ", .{});
-    check("fused_scale_sq", same(f32, k.ScaleSquare.eval(3, .{ .scale = 2 }), 36));
-    check("fused_abs_relu", same(f32, k.AbsRelu.eval(-5, .{ .scale = 0 }), 5));
-    check("fused_triple", same(f32, k.ScaleAbsSquare.eval(-3, .{ .scale = -2 }), 36));
-    check("fused_abs_scale", same(f32, k.AbsThenScale.eval(-4, .{ .scale = 3 }), 12));
-    print("ok\n", .{});
 }
 
 // ── Dim3 ────────────────────────────────────────────────────────────────

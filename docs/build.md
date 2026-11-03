@@ -176,9 +176,9 @@ defer kernel.deinit();
 try kernel.launch(grid, block, 0, &args);
 ```
 
-An unknown name is `error.KernelNotFound`, not a panic. The comptime paths
-(`Kernel(spec, .cuda)` and `RawKernel(name, .cuda)`) resolve through the same
-map at compile time, so a kernel that is in no root is still a compile error.
+An unknown name is `error.KernelNotFound`, not a panic. The comptime path,
+`RawKernel(name, .cuda)`, resolves through the same map at compile time, so a
+kernel that is in no root is still a compile error.
 
 Either way only the root that exports the kernel is JIT'd, and the runtime
 caches it per `(device, blob)`, so a process that touches 3 of 37 models pays

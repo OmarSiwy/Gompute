@@ -38,6 +38,6 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(exe);
 
     const run = b.addRunArtifact(exe);
-    const run_step = b.step("run", "Run CPU example");
+    const run_step = b.step("run", "Run the example");
     run_step.dependOn(&run.step);
 }

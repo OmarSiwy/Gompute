@@ -1,17 +1,15 @@
 const g = @import("gompute");
 
-pub const Params = struct {
-    scale: f32,
-};
-
-fn scaleRelu(x: f32, p: Params) f32 {
-    const y = x * p.scale;
-    return if (y > 0) y else 0;
+/// The element function: plain Zig, so the CPU calls it directly too.
+pub fn scaleRelu(x: f32, scale: f32) f32 {
+    return @max(x * scale, 0);
 }
 
-pub const scale_relu = g.map("scale_relu", f32, Params, scaleRelu, .{ .block_size = 256 });
+fn scaleReluKernel(data: g.GlobalPtr(f32), len: u64, scale: f32) callconv(g.kernel_callconv) void {
+    const i = g.globalIdX(256);
+    if (i < len) data[i] = scaleRelu(data[i], scale);
+}
 
 comptime {
-    // Every pub map spec in this file; no second list to keep in sync.
-    g.exportKernels(@This());
+    if (g.is_device) g.exportRaw("scale_relu", &scaleReluKernel);
 }
