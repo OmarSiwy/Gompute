@@ -2791,7 +2791,11 @@ const oracle = struct {
             }
             const p = m * w;
             q = @intCast((p >> 200) & 3);
-            var f: f128 = @as(f128, @floatFromInt(p & ((@as(u256, 1) << 200) - 1))) * 0x1p-200;
+            // The 200-bit fraction in two u128 halves: LLVM does not lower a
+            // u256 -> f128 conversion on aarch64.
+            const frac_hi: u128 = @truncate(p >> 72);
+            const frac_lo: u128 = @truncate(p & ((1 << 72) - 1));
+            var f: f128 = @as(f128, @floatFromInt(frac_hi)) * 0x1p-128 + @as(f128, @floatFromInt(frac_lo)) * 0x1p-200;
             if (f >= 0.5) {
                 f -= 1;
                 q += 1;
@@ -3264,7 +3268,8 @@ test "f32 exp, log, log2, log10, sin and cos are correctly rounded, host and dev
     // Every 16381st input by default; all 2^32 with GOMPUTE_MATH_EXHAUSTIVE=1
     // (run that under -Doptimize=ReleaseFast: about 20 s per function on 32 threads).
     if (dev) return error.SkipZigTest;
-    const all = std.testing.environ.getPosix("GOMPUTE_MATH_EXHAUSTIVE") != null;
+    // `getPosix` does not exist on Windows; the full sweep runs elsewhere.
+    const all = builtin.os.tag != .windows and std.testing.environ.getPosix("GOMPUTE_MATH_EXHAUSTIVE") != null;
     const stride: u64 = if (all) 1 else 16381;
     inline for (cr32) |F| {
         const n = if (all) @min(std.Thread.getCpuCount() catch 1, 64) else 1;
