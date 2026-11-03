@@ -13,6 +13,7 @@ release in their name); the package version is separate.
 | `0.17.0-v1.0.0` | 1.0.0   | 0.17.0                   |
 | `0.17.0-v1.4.0` | 1.4.0   | 0.17.0                   |
 | `v1.5.0`        | 1.5.0   | 0.18.0-dev.349+d924f83bf |
+| `v2.0.0`        | 2.0.0   | 0.18.0-dev.349+d924f83bf |
 
 `minimum_zig_version` in `build.zig.zon`, the overlay revision in `flake.lock`
 and the version in `.github/workflows/*` name the same build and move
