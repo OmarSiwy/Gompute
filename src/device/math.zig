@@ -320,6 +320,69 @@ fn softLog1p(x: f64) f64 {
     return s * (hfsq + R) + (dk * ln2_lo + c) - hfsq + f + dk * ln2_hi;
 }
 
+/// sign(x)*ln(|x| + sqrt(x^2+1)), musl's `asinh.c`/`asinhf.c` over THIS
+/// module's own `log`/`log1p` (not std's: a device build has no libm, which
+/// is the whole point of this file). f32 is one rounding of the f64 body
+/// (`viaF64`, as `expm1`/`log1p`); faithful under 2 ulp against an f128
+/// oracle (measured 1.000, `tests/` below).
+pub inline fn asinh(x: anytype) @TypeOf(x) {
+    if (Elem(@TypeOf(x)) == f32) return apply(viaF64(asinhBody), x);
+    return apply(asinhBody, x);
+}
+
+fn asinhBody(x: f64) f64 {
+    const u: u64 = @bitCast(x);
+    const e = (u >> 52) & 0x7FF;
+    var rx: f64 = @bitCast(u & (std.math.maxInt(u64) >> 1));
+    if (e >= 0x3FF + 26) {
+        rx = log(rx) + 0.693147180559945309417232121458176568;
+    } else if (e >= 0x3FF + 1) {
+        rx = log(2 * rx + 1 / (@sqrt(rx * rx + 1) + rx));
+    } else if (e >= 0x3FF - 26) {
+        rx = log1p(rx + rx * rx / (@sqrt(rx * rx + 1) + 1));
+    }
+    return if (u >> 63 != 0) -rx else rx;
+}
+
+/// ln(x + sqrt(x^2-1)) for x >= 1, musl's `acosh.c`/`acoshf.c` over this
+/// module's `log`/`log1p`. NaN below 1 (C99 F.10.2.1), the far-negative side
+/// included: the raw formula gives a finite wrong answer there, so the sign
+/// is checked, not just the magnitude. f32 is one rounding of the f64 body;
+/// under 2 ulp against an f128 oracle (measured, `tests/` below).
+pub inline fn acosh(x: anytype) @TypeOf(x) {
+    if (Elem(@TypeOf(x)) == f32) return apply(viaF64(acoshBody), x);
+    return apply(acoshBody, x);
+}
+
+fn acoshBody(x: f64) f64 {
+    const e = (@as(u64, @bitCast(x)) >> 52) & 0x7FF;
+    if (x < 0 and e >= 0x3FF + 1) return std.math.nan(f64);
+    if (e < 0x3FF + 1) return log1p(x - 1 + @sqrt((x - 1) * (x - 1) + 2 * (x - 1)));
+    if (e < 0x3FF + 26) return log(2 * x - 1 / (x + @sqrt(x * x - 1)));
+    return log(x) + 0.693147180559945309417232121458176568;
+}
+
+/// 0.5*ln((1+x)/(1-x)) for |x|<1, musl's `atanh.c`/`atanhf.c` over this
+/// module's `log1p`; +-inf at +-1, NaN past. f32 is one rounding of the f64
+/// body; under 2 ulp against an f128 oracle (measured, `tests/` below).
+pub inline fn atanh(x: anytype) @TypeOf(x) {
+    if (Elem(@TypeOf(x)) == f32) return apply(viaF64(atanhBody), x);
+    return apply(atanhBody, x);
+}
+
+fn atanhBody(x: f64) f64 {
+    const u: u64 = @bitCast(x);
+    const e = (u >> 52) & 0x7FF;
+    var y: f64 = @bitCast(u & (std.math.maxInt(u64) >> 1));
+    if (y == 1.0) return std.math.copysign(std.math.inf(f64), x);
+    if (e < 0x3FF - 1) {
+        if (e >= 0x3FF - 32) y = 0.5 * log1p(2 * y + 2 * y * y / (1 - y));
+    } else {
+        y = 0.5 * log1p(2 * (y / (1 - y)));
+    }
+    return if (u >> 63 != 0) -y else y;
+}
+
 /// arctangent: musl's `atan.c` and `atanf.c`, by way of std's scalar
 /// `atanBinary64`/`atanBinary32`, minus the subnormal underflow-flag line that
 /// does not compile for AMDGCN (see `expm1`). Every return is bit-identical to
@@ -438,6 +501,66 @@ fn softAtanf(x: f32) f32 {
     const i = id orelse return x_ - x_ * (s1 + s2);
     const z_ = atanhi[i] - ((x_ * (s1 + s2) - atanlo[i]) - x_);
     return if (sign) -z_ else z_;
+}
+
+/// atan(y/x) in (-pi, pi], musl's `atan2.c`/`atan2f.c` over this module's own
+/// `atan`; C99 F.10.1.4's signed zeros and infinities (`atan2(+-0, -0) =
+/// +-pi`, `atan2(+-0, +0) = +-0`). f32 widens to f64 and rounds once.
+/// Under 2 ulp against an f128 oracle (measured, `tests/` below).
+pub inline fn atan2(y: anytype, x: @TypeOf(y)) @TypeOf(y) {
+    if (Elem(@TypeOf(y)) == f32) return apply2(atan2fLane, y, x);
+    return apply2(atan2Body, y, x);
+}
+
+fn atan2fLane(y: f32, x: f32) f32 {
+    return @floatCast(atan2Body(y, x));
+}
+
+fn atan2Body(y: f64, x: f64) f64 {
+    const pi: f64 = 3.1415926535897931160E+00;
+    const pi_lo: f64 = 1.2246467991473531772E-16;
+    if (std.math.isNan(x) or std.math.isNan(y)) return x + y;
+    const ux: u64 = @bitCast(x);
+    var ix: u32 = @intCast(ux >> 32);
+    const lx: u32 = @intCast(ux & 0xFFFFFFFF);
+    const uy: u64 = @bitCast(y);
+    var iy: u32 = @intCast(uy >> 32);
+    const ly: u32 = @intCast(uy & 0xFFFFFFFF);
+    if ((ix -% 0x3FF00000) | lx == 0) return atan(y); // x = 1.0
+    // 2 * sign(x) + sign(y)
+    const m = ((iy >> 31) & 1) | ((ix >> 30) & 2);
+    ix &= 0x7FFFFFFF;
+    iy &= 0x7FFFFFFF;
+    if (iy | ly == 0) return switch (m) {
+        0, 1 => y, // atan(+-0, +...)
+        2 => pi, // atan(+0, -...)
+        else => -pi, // else: m is 3, atan(-0, -...)
+    };
+    if (ix | lx == 0) return if (m & 1 != 0) -pi / 2.0 else pi / 2.0;
+    if (ix == 0x7FF00000) {
+        if (iy == 0x7FF00000) return switch (m) {
+            0 => pi / 4.0,
+            1 => -pi / 4.0,
+            2 => 3.0 * pi / 4.0,
+            else => -3.0 * pi / 4.0, // else: m is 3
+        };
+        return switch (m) {
+            0 => 0.0,
+            1 => -0.0,
+            2 => pi,
+            else => -pi, // else: m is 3
+        };
+    }
+    // |y / x| > 0x1p64
+    if (ix +% (64 << 20) < iy or iy == 0x7FF00000) return if (m & 1 != 0) -pi / 2.0 else pi / 2.0;
+    // z = atan(|y / x|) with correct underflow
+    const z = if ((m & 2) != 0 and iy +% (64 << 20) < ix) 0.0 else atan(@abs(y / x));
+    return switch (m) {
+        0 => z,
+        1 => -z,
+        2 => pi - (z - pi_lo),
+        else => (z - pi_lo) - pi, // else: m is 3
+    };
 }
 
 /// f32 tanh, sinh and cosh: binary64 arithmetic on one f64 `exp`, rounded
@@ -2879,6 +3002,10 @@ pub const max_ulp = struct {
     pub const exp: f64 = 0.52;
     pub const log: f64 = 0.52;
     pub const pow: f64 = 0.55;
+    pub const asinh: f64 = 1.5;
+    pub const acosh: f64 = 2.3;
+    pub const atanh: f64 = 1.8;
+    pub const atan2: f64 = 1.5;
 };
 
 const oracle = struct {
@@ -2896,7 +3023,14 @@ const oracle = struct {
         return std.math.ldexp(sum, @intFromFloat(k));
     }
     fn logQ(x: f64) f128 {
-        const fr = std.math.frexp(@as(f128, x));
+        return lnQ(@as(f128, x));
+    }
+    /// `logQ`'s series, generalized to an f128 argument that is not itself
+    /// representable as an f64 — what `asinhQ`/`acoshQ`/`atanhQ` need: the
+    /// value inside their `ln` is a sum/quotient computed in f128, never
+    /// rounded to f64 first.
+    fn lnQ(x: f128) f128 {
+        const fr = std.math.frexp(x);
         var m = fr.significand;
         var e: f128 = @floatFromInt(fr.exponent);
         if (m < 0.70710678) {
@@ -2913,6 +3047,32 @@ const oracle = struct {
             term *= uu;
         }
         return 2 * sum + e * ln2;
+    }
+    /// sign(x)*ln(|x| + sqrt(x^2+1)) at f128 precision, `asinh`'s oracle.
+    fn asinhQ(x: f64) f128 {
+        const xf: f128 = x;
+        return std.math.copysign(lnQ(@abs(xf) + @sqrt(xf * xf + 1)), xf);
+    }
+    /// ln(x + sqrt(x^2-1)) at f128 precision, `acosh`'s oracle (x >= 1).
+    fn acoshQ(x: f64) f128 {
+        const xf: f128 = x;
+        return lnQ(xf + @sqrt(xf * xf - 1));
+    }
+    /// 0.5*ln((1+x)/(1-x)) at f128 precision, `atanh`'s oracle.
+    fn atanhQ(x: f64) f128 {
+        const xf: f128 = x;
+        return 0.5 * lnQ((1 + xf) / (1 - xf));
+    }
+    /// atan(y/x) at f128 precision over `std.math.atan`'s f128 body (musl's
+    /// `atanl`, 113 bits), `atan2`'s oracle for ordinary (non-axis, finite)
+    /// quadrants — the axis/infinity cases are checked exactly, not by ulp.
+    fn atan2Q(y: f64, x: f64) f128 {
+        const xf: f128 = x;
+        const yf: f128 = y;
+        const pi = 2 * pio2;
+        if (xf > 0) return std.math.atan(yf / xf);
+        if (yf >= 0) return std.math.atan(yf / xf) + pi;
+        return std.math.atan(yf / xf) - pi;
     }
     const pio2: f128 = 0x1.921fb54442d18469898cc51701b8p0;
     const pio2b: f128 = 0x1.cd129024e088a67cc74020bbea64p-114;
@@ -3002,6 +3162,95 @@ test "exp, log and pow stay inside max_ulp of an f128 oracle" {
     try std.testing.expect(worst[0] < max_ulp.exp);
     try std.testing.expect(worst[1] < max_ulp.log);
     try std.testing.expect(worst[2] < max_ulp.pow);
+}
+
+test "asinh, acosh, atanh and atan2: C99 F.10 special cases" {
+    // F.10.2.5 asinh: signed zeros, signed infinities, odd.
+    try std.testing.expectEqual(@as(u64, 0), @as(u64, @bitCast(asinh(@as(f64, 0.0)))));
+    try std.testing.expectEqual(@as(u64, 1 << 63), @as(u64, @bitCast(asinh(@as(f64, -0.0)))));
+    try std.testing.expectEqual(std.math.inf(f64), asinh(std.math.inf(f64)));
+    try std.testing.expectEqual(-std.math.inf(f64), asinh(-std.math.inf(f64)));
+    try std.testing.expect(std.math.isNan(asinh(std.math.nan(f64))));
+
+    // F.10.2.1 acosh: NaN below 1 (the far-negative side included), exact at
+    // 1, +inf at +inf.
+    for ([_]f64{ 0.999999, 0.0, -0.0, -1.0, -2.0, -1e300, -std.math.inf(f64) }) |x|
+        try std.testing.expect(std.math.isNan(acosh(x)));
+    try std.testing.expectEqual(@as(f64, 0.0), acosh(@as(f64, 1.0)));
+    try std.testing.expectEqual(std.math.inf(f64), acosh(std.math.inf(f64)));
+    try std.testing.expect(std.math.isNan(acosh(std.math.nan(f64))));
+
+    // F.10.2.3 atanh: signed zero, +-inf at +-1, NaN past +-1, odd.
+    try std.testing.expectEqual(@as(u64, 0), @as(u64, @bitCast(atanh(@as(f64, 0.0)))));
+    try std.testing.expectEqual(@as(u64, 1 << 63), @as(u64, @bitCast(atanh(@as(f64, -0.0)))));
+    try std.testing.expectEqual(std.math.inf(f64), atanh(@as(f64, 1.0)));
+    try std.testing.expectEqual(-std.math.inf(f64), atanh(@as(f64, -1.0)));
+    try std.testing.expect(std.math.isNan(atanh(@as(f64, 1.5))));
+    try std.testing.expect(std.math.isNan(atanh(@as(f64, -1.5))));
+    try std.testing.expect(std.math.isNan(atanh(std.math.nan(f64))));
+
+    // F.10.1.4 atan2: every signed-zero/infinity quadrant in the table, plus
+    // the x = 1 fast path (`atan2(y, 1) == atan(y)`).
+    const pi = std.math.pi;
+    try std.testing.expectEqual(@as(u64, 0), @as(u64, @bitCast(atan2(@as(f64, 0.0), @as(f64, 1.0)))));
+    try std.testing.expectEqual(@as(u64, 1 << 63), @as(u64, @bitCast(atan2(@as(f64, -0.0), @as(f64, 1.0)))));
+    try std.testing.expectEqual(pi, atan2(@as(f64, 0.0), @as(f64, -1.0)));
+    try std.testing.expectEqual(-pi, atan2(@as(f64, -0.0), @as(f64, -1.0)));
+    try std.testing.expectEqual(pi / 2.0, atan2(@as(f64, 1.0), @as(f64, 0.0)));
+    try std.testing.expectEqual(-pi / 2.0, atan2(@as(f64, -1.0), @as(f64, 0.0)));
+    try std.testing.expectEqual(pi / 4.0, atan2(std.math.inf(f64), std.math.inf(f64)));
+    try std.testing.expectEqual(-3.0 * pi / 4.0, atan2(-std.math.inf(f64), -std.math.inf(f64)));
+    try std.testing.expectEqual(@as(f64, 0.0), atan2(@as(f64, 1.0), std.math.inf(f64)));
+    try std.testing.expectEqual(pi, atan2(@as(f64, 1.0), -std.math.inf(f64)));
+    try std.testing.expectEqual(pi / 2.0, atan2(std.math.inf(f64), @as(f64, 1.0)));
+    try std.testing.expectEqual(atan(@as(f64, 0.37)), atan2(@as(f64, 0.37), @as(f64, 1.0)));
+    try std.testing.expect(std.math.isNan(atan2(std.math.nan(f64), @as(f64, 1.0))));
+    try std.testing.expect(std.math.isNan(atan2(@as(f64, 1.0), std.math.nan(f64))));
+
+    // f32 is one rounding of the f64 body; vectors are the scalar lane for lane.
+    try std.testing.expectEqual(@as(f32, 0.0), asinh(@as(f32, 0.0)));
+    try std.testing.expect(std.math.isNan(acosh(@as(f32, 0.5))));
+    const ainputs = [4]f64{ 1.0, -1.0, 2.5, -0.001 };
+    const va = asinh(@as(@Vector(4, f64), ainputs));
+    inline for (0..4) |i| try std.testing.expectEqual(asinh(ainputs[i]), va[i]);
+    const vt = atan2(@Vector(4, f64){ 1.0, -1.0, 0.5, -0.5 }, @Vector(4, f64){ 1.0, 1.0, -1.0, -1.0 });
+    inline for (.{ 1.0, -1.0, 0.5, -0.5 }, .{ 1.0, 1.0, -1.0, -1.0 }, 0..) |yy, xx, i|
+        try std.testing.expectEqual(atan2(@as(f64, yy), @as(f64, xx)), vt[i]);
+}
+
+test "asinh, acosh, atanh and atan2 stay inside max_ulp of an f128 oracle" {
+    if (dev) return error.SkipZigTest;
+    var prng = std.Random.DefaultPrng.init(0xA517);
+    const r = prng.random();
+    var worst = [4]f64{ 0, 0, 0, 0 };
+    for (0..50_000) |_| {
+        // exponent kept above -50: below that, sqrt(x^2+1) rounds to exactly
+        // 1 even in f128 (x^2 is below f128's ulp at 1), so the oracle's
+        // ln(|x| + sqrt(x^2+1)) collapses to ln(1) = 0 -- a cancellation in
+        // the ARGUMENT, not `lnQ`'s series, which `ulp`'s `ilogb(0)` then
+        // cannot take an exponent of. The branch this would exercise
+        // (`asinh(x) == x` for tiny x) is exact by construction either way.
+        const x = std.math.pow(f64, 2, r.float(f64) * 200 - 50) * @as(f64, if (r.boolean()) -1 else 1);
+        worst[0] = @max(worst[0], oracle.ulp(asinh(x), oracle.asinhQ(x)));
+        // exponent kept above -40: below that, 1.0 + 2^e underflows to
+        // exactly 1.0 in f64 and the result (and its oracle) round to
+        // exactly 0 -- `ulp`'s `ilogb(0)` is not finite there.
+        const ax = 1.0 + std.math.pow(f64, 2, r.float(f64) * 140 - 40);
+        worst[1] = @max(worst[1], oracle.ulp(acosh(ax), oracle.acoshQ(ax)));
+        const hx = (r.float(f64) * 2.0 - 1.0) * 0.999999;
+        worst[2] = @max(worst[2], oracle.ulp(atanh(hx), oracle.atanhQ(hx)));
+        const yy = r.float(f64) * 200.0 - 100.0;
+        const xx = r.float(f64) * 200.0 - 100.0;
+        if (xx != 0.0) worst[3] = @max(worst[3], oracle.ulp(atan2(yy, xx), oracle.atan2Q(yy, xx)));
+    }
+    std.debug.print(
+        "\n  f128 oracle: asinh {d:.3}, acosh {d:.3}, atanh {d:.3}, atan2 {d:.3} ulp\n",
+        .{ worst[0], worst[1], worst[2], worst[3] },
+    );
+    try std.testing.expect(worst[0] < max_ulp.asinh);
+    try std.testing.expect(worst[1] < max_ulp.acosh);
+    try std.testing.expect(worst[2] < max_ulp.atanh);
+    try std.testing.expect(worst[3] < max_ulp.atan2);
 }
 
 test "exp, log and pow fold at comptime to the bits they run to" {
