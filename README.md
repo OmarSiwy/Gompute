@@ -14,8 +14,9 @@ with FMA, such as `x86_64_v3` or aarch64).
 
 I am aware that, as the zig library evolves, this library will need to be updated
 greatly. Hence, I'll attempt to maintain the interface, only ADDING features, rather
-than removing any features. 2.0.0 is the exception: it removed the generated
-kernel layer (`map`, `zip`, `reduce`, `Kernel`, `AutoKernel` and the rest),
+than removing any features. The one exception came before 1.0.0: git b8a2213
+removed the generated kernel layer (`map`, `zip`, `reduce`, `Kernel`,
+`AutoKernel` and the rest),
 because Zig 0.18's loop vectorizer makes a plain CPU loop as fast as its
 generated one.
 
@@ -25,7 +26,7 @@ generated one.
 zig fetch --save git+https://github.com/OmarSiwy/Gompute.git
 ```
 
-Requires Zig 0.18.0-dev.349+d924f83bf (Zig master, pinned; the `0.17.0-v1.4.0` tag is
+Requires Zig 0.18.0-dev.349+d924f83bf (Zig master, pinned; git abd75e4 is
 the last Zig 0.17 build). Builds on Linux, Windows, macOS and wasm. The CUDA/HIP drivers are loaded at run time (`dlopen` / `LoadLibraryA`); on
 a machine without one `init` returns `error.InitFailed` and your code takes its
 CPU path. See [Platform support](docs/reference.md#platform-support).

@@ -4,19 +4,14 @@
 
 Gompute pins one Zig build at a time; every Zig release so far has moved
 `std.Build`, `@typeInfo` or the GPU backends under it. `main` follows Zig
-master at a pinned nightly, the same build ESPice pins. A release is a `v<version>` tag (the older tags carried the Zig
-release in their name); the package version is separate.
+master at a pinned nightly, the same build ESPice pins. A release is a
+`v<version>` tag equal to the version in `build.zig.zon`. 1.0.0 is the first
+release under this numbering; the earlier tags were retired, and every commit
+they named is on `main`.
 
-| Git tag         | Gompute | Zig                      |
-| --------------- | ------- | ------------------------ |
-| `0.16.0`        | 1.0.0   | 0.16.0                   |
-| `0.17.0-v1.0.0` | 1.0.0   | 0.17.0                   |
-| `0.17.0-v1.4.0` | 1.4.0   | 0.17.0                   |
-| `v1.5.0`        | 1.5.0   | 0.18.0-dev.349+d924f83bf |
-| `v2.0.0`        | 2.0.0   | 0.18.0-dev.349+d924f83bf |
-| `v2.0.1`        | 2.0.1   | 0.18.0-dev.349+d924f83bf |
-| `v2.1.0`        | 2.1.0   | 0.18.0-dev.349+d924f83bf |
-| `v3.0.0`        | 3.0.0   | 0.18.0-dev.349+d924f83bf |
+| Git tag  | Gompute | Zig                      |
+| -------- | ------- | ------------------------ |
+| `v1.0.0` | 1.0.0   | 0.18.0-dev.349+d924f83bf |
 
 `minimum_zig_version` in `build.zig.zon`, the overlay revision in `flake.lock`
 and the version in `.github/workflows/*` name the same build and move
@@ -197,7 +192,7 @@ target, never from the build host or at run time. The **FMA class** (x86_64
 with the `fma` feature such as `x86_64_v3` and newer, aarch64, NVPTX, AMDGCN)
 gets ARM optimized-routines' FMA body, written as explicit `@mulAdd`. The
 **FMA-free class** (baseline and `x86_64_v2`, wasm, everything else) keeps the
-FMA-free body, bit for bit what 2.0.1 returns. Both bodies have the same
+FMA-free body, bit for bit what git bd8800b returns. Both bodies have the same
 f128 worst error. Within one class, the bits match: a baseline build handed
 the FMA body (software `@mulAdd`) gives the FMA class's bits, which a digest
 test checks. Between classes, a few inputs differ by one ulp: 30, 2 and 23 of
@@ -255,7 +250,7 @@ at 4 lanes than the FMA-free vector form on `x86_64_v3`;
 | f32 `exp`, `log`, `log2`, `log10`, `sin`, `cos` | correctly rounded | f128 oracle, **all 2³² inputs** | Host and device bodies both, scalar and vector. |
 | f32 `exp2`, `tanh`, `sinh`, `cosh` | ≤ 0.501 ulp | f64, **all 2³² inputs** | exp2/tanh/cosh 0.50, sinh 0.501. f32 `tan` is the ratio of two roundings, not checked exhaustively. |
 | `expm1`, `log1p` | std's bits | std | `expm1` minus one line that does not compile for AMDGCN. |
-| `atan` | 0.741 ulp | f128 oracle | musl's, bit-identical to std's scalar atan; `atan(-0)` is -0. Before 2.0.1 it was std's vector body, +0 for -0. |
+| `atan` | 0.741 ulp | f128 oracle | musl's, bit-identical to std's scalar atan; `atan(-0)` is -0. Before git bd8800b it was std's vector body, +0 for -0. |
 | `asinh` | 1.259 ulp | f128 oracle | musl's, over this module's `log`/`log1p`; promised < 1.5 (`math.max_ulp`). Same worst error in both FMA classes. |
 | `acosh` | 2.152 ulp | f128 oracle | musl's; worst near x = 1. NaN below 1, the far-negative side included. Promised < 2.3. Both classes. |
 | `atanh` | 1.574 ulp | f128 oracle | musl's, over `log1p`; +-inf at +-1. Promised < 1.8. |

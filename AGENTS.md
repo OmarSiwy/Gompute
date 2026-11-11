@@ -37,7 +37,7 @@ the ones that count.
 
 - `main` is the only long-lived branch. Work lands through a pull request whose merge result passed `.github/workflows/test.yaml` (`test` on three OSes, `examples`, `cross` for every claimed target, `wasm` under wasmtime, `nix`). No `dev` branch.
 - The public surface only grows. A `pub` signature that a consumer could call is kept; a replacement is added beside it. The package version in `build.zig.zon` moves in the same commit as the change, and the commit message says what changed and the version.
-- The toolchain is a pinned nightly of Zig master, the same build ESPice pins. It is named in four places that move together: `build.zig.zon` (`minimum_zig_version`), `flake.lock` (the zig-overlay revision whose `master` is that build), `.github/workflows/*.yaml` (`ZIG_VERSION`) and `README.md`. A release is a `v<version>` tag (`v1.5.0`) whose version equals `build.zig.zon`'s; the docs' Versions table says which Zig it builds with.
+- The toolchain is a pinned nightly of Zig master, the same build ESPice pins. It is named in four places that move together: `build.zig.zon` (`minimum_zig_version`), `flake.lock` (the zig-overlay revision whose `master` is that build), `.github/workflows/*.yaml` (`ZIG_VERSION`) and `README.md`. A release is a `v<version>` tag (`v1.0.0`) whose version equals `build.zig.zon`'s; the docs' Versions table says which Zig it builds with.
 - Actions are pinned by commit SHA with the tag in a comment.
 - `docs/*.md` is the site (`zig build docs`) and `skill/gompute/` is the consumer skill; both describe the same API, so a `pub` change edits both. Every number in them is measured by `examples/bench` or a named test and says which Zig and which card.
 
