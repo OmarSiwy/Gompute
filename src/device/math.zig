@@ -22,16 +22,26 @@
 //! once, and f64 sin/cos/tanh/sinh/cosh/expm1 are musl's. Table-driven, no
 //! libm and no float builtin beyond `+ - * /`, `@sqrt` and bit casts.
 //!
-//! ONE body per function on every target: no contraction, no hardware approximation,
-//! no inline asm, no intrinsic. The same input gives the same bits on the
-//! host (with or without FMA hardware), NVPTX, AMDGCN and at comptime, which
-//! is what VerA's constant folding and ESPice's CPU/GPU comparison rely on;
-//! `examples/exhaustive` checks CUDA against the CPU bit for bit.
+//! One set of bits per FMA class. Every function but f64 exp, log and pow is
+//! one body on every target: no contraction, no hardware approximation, no
+//! inline asm, no intrinsic. f64 exp, log and pow have two bodies, the
+//! references' FMA-free one and their `__FP_FAST_FMA` one written as explicit
+//! `@mulAdd`; `fma_class` picks one at comptime from the TARGET (x86_64 with
+//! the `fma` feature, aarch64, NVPTX, AMDGCN), never from the build host or at
+//! run time. f64 `asinh` and `acosh` call f64 log, so they follow its class
+//! too (`asinhIn`, `acoshIn` take the class, for the tests). Within a class the
+//! same input gives the same bits on the host, NVPTX, AMDGCN and at comptime,
+//! which is what VerA's constant folding and
+//! ESPice's CPU/GPU comparison rely on; `examples/exhaustive` checks CUDA
+//! against the CPU bit for bit. A baseline x86_64 build that is handed the FMA
+//! body (software `@mulAdd`) gives the FMA class's bits, which the digest
+//! tests at the bottom of this file check.
 //!
 //! Accuracy, as tested at the bottom of this file:
 //!
 //!   f64 exp log pow              0.505 / 0.502 / 0.502 ulp vs an f128
-//!                                oracle; faithful, and monotone.
+//!                                oracle in both classes; faithful, and
+//!                                monotone.
 //!   f64 exp2 log2 log10          <=1 / <=1 / <=2 ulp vs glibc (log10's
 //!                                slack is glibc's own).
 //!   f64 sin cos                  musl's bits, = compiler_rt's `@sin`/`@cos`.
@@ -47,7 +57,8 @@
 //! at f32 and f64, f32 sin/cos/tanh/sinh/cosh, sqrt and rsqrt. The vector form
 //! is the scalar's own width-generic main path (`expMain`, `logMain`, ...);
 //! a vector holding any special lane takes the scalar body lane by lane. f64
-//! sin/cos/tanh/sinh/cosh, expm1, log1p and atan still run lane by lane.
+//! sin/cos/tanh/sinh/cosh, expm1, log1p and atan still run lane by lane, and
+//! so do the FMA-class f64 exp, log and pow (`expVecFma`, ...).
 //!
 //! Already safe everywhere and deliberately absent here: `@abs @trunc @round
 //! @floor @ceil @copysign @min @max`, `std.math.scalbn/frexp/modf`. `sqrt` and
@@ -58,10 +69,11 @@
 //! `contract` or `fast` flag), where each backend decides whether `a * b + c`
 //! rounds once or twice; `tests/no_contract.zig` holds every entry point's IR
 //! to none on four targets. An explicit `@mulAdd` is one rounding everywhere
-//! (hardware, compiler_rt, comptime), so it is deterministic; only the
-//! correctly rounded f32 bodies use it, because where there is no FMA
-//! hardware it is a compiler_rt `fma` call. The one-body functions are the
-//! references' no-FMA variants.
+//! (hardware, compiler_rt, comptime), so it is deterministic. The correctly
+//! rounded f32 bodies use it, and so do the FMA-class bodies of f64 exp, log
+//! and pow; nothing else does, because where there is no FMA hardware it is a
+//! compiler_rt `fma` call (28-49x slower for exp/log/pow, measured on baseline
+//! x86_64; `skill/gompute/OVERHEAD.md`).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -122,8 +134,8 @@ inline fn apply2(comptime f: anytype, x: anytype, y: @TypeOf(x)) @TypeOf(x) {
 }
 
 // ---------------------------------------------------------------------------
-// Public API. exp/exp2/log/log2/log10/pow are one body each, host and device;
-// the rest dispatch on the element type.
+// Public API. f64 exp/log/pow pick their body by `fma_class`; exp2/log2/log10
+// are one body each, host and device; the rest dispatch on the element type.
 //
 // Every entry point here is a dispatcher: it picks a scalar body and hands it
 // to `apply`, which runs it once or once per lane. Bodies never see a vector,
@@ -131,13 +143,14 @@ inline fn apply2(comptime f: anytype, x: anytype, y: @TypeOf(x)) @TypeOf(x) {
 // function rather than inline in the public one.
 // ---------------------------------------------------------------------------
 
-/// e^x, <=1 ulp on host AND device from one body: ARM optimized-routines
-/// `exp`/`expf`, which is what glibc >= 2.28 ships. See the note on `pow` for
-/// why matching the reference's arithmetic is worth more than the speed.
+/// e^x, <=1 ulp on host AND device: ARM optimized-routines `exp`/`expf`, which
+/// is what glibc >= 2.28 ships. f64 takes the reference's FMA body on an FMA
+/// target and its FMA-free body elsewhere (see the file header), so f64 bits
+/// are fixed per target class; f32 is one body everywhere.
 pub inline fn exp(x: anytype) @TypeOf(x) {
     if (Elem(@TypeOf(x)) == f32) return expf(x);
-    if (comptime isVec(@TypeOf(x))) return expVec(x, false);
-    return softExp(x);
+    if (comptime isVec(@TypeOf(x))) return if (fma_class) expVecFma(x) else expVec(x, false);
+    return if (fma_class) softExpFma(x) else softExp(x);
 }
 
 /// 2^x, exact for integer x. Same table as `exp`, its own reduction. f32 is
@@ -154,8 +167,8 @@ pub inline fn exp2(x: anytype) @TypeOf(x) {
     return softExp2(x);
 }
 
-/// Natural log, <=1 ulp on host AND device from one body: ARM
-/// optimized-routines `log` for f64, `logf` for f32.
+/// Natural log, <=1 ulp on host AND device: ARM optimized-routines `log` for
+/// f64, `logf` for f32. f64 bits are fixed per FMA class, as for `exp`.
 ///
 /// The f32 half is what closed this module's worst accuracy hole. It used to
 /// be `lg2.approx.f * ln2`, and that hardware is bounded ABSOLUTELY (~2^-21),
@@ -163,8 +176,8 @@ pub inline fn exp2(x: anytype) @TypeOf(x) {
 /// answer, which is exactly where a SPICE junction sits.
 pub inline fn log(x: anytype) @TypeOf(x) {
     if (Elem(@TypeOf(x)) == f32) return logf(x, .ln);
-    if (comptime isVec(@TypeOf(x))) return logVec(x, .ln);
-    return softLog(x);
+    if (comptime isVec(@TypeOf(x))) return if (fma_class) logVecFma(x) else logVec(x, .ln);
+    return if (fma_class) softLogFma(x) else softLog(x);
 }
 
 /// Base-2 log, <=1 ulp on host AND device: ARM optimized-routines
@@ -323,21 +336,29 @@ fn softLog1p(x: f64) f64 {
 /// sign(x)*ln(|x| + sqrt(x^2+1)), musl's `asinh.c`/`asinhf.c` over THIS
 /// module's own `log`/`log1p` (not std's: a device build has no libm, which
 /// is the whole point of this file). f32 is one rounding of the f64 body
-/// (`viaF64`, as `expm1`/`log1p`); faithful under 2 ulp against an f128
-/// oracle (measured 1.000, `tests/` below).
+/// (`viaF64`, as `expm1`/`log1p`); under `max_ulp.asinh` against an f128
+/// oracle in both FMA classes (`tests/` below). Its f64 bits follow the FMA
+/// class for |x| >= 2, where it calls f64 `log` (`log_splits`); f32 rounds
+/// that one-ulp split away on every input.
 pub inline fn asinh(x: anytype) @TypeOf(x) {
     if (Elem(@TypeOf(x)) == f32) return apply(viaF64(asinhBody), x);
     return apply(asinhBody, x);
 }
 
 fn asinhBody(x: f64) f64 {
+    return asinhIn(fma_class, x);
+}
+
+/// `asinhBody` over one class's f64 log, so a test runs both on any host.
+fn asinhIn(comptime fused: bool, x: f64) f64 {
+    const ln = if (fused) softLogFma else softLog;
     const u: u64 = @bitCast(x);
     const e = (u >> 52) & 0x7FF;
     var rx: f64 = @bitCast(u & (std.math.maxInt(u64) >> 1));
     if (e >= 0x3FF + 26) {
-        rx = log(rx) + 0.693147180559945309417232121458176568;
+        rx = ln(rx) + 0.693147180559945309417232121458176568;
     } else if (e >= 0x3FF + 1) {
-        rx = log(2 * rx + 1 / (@sqrt(rx * rx + 1) + rx));
+        rx = ln(2 * rx + 1 / (@sqrt(rx * rx + 1) + rx));
     } else if (e >= 0x3FF - 26) {
         rx = log1p(rx + rx * rx / (@sqrt(rx * rx + 1) + 1));
     }
@@ -348,23 +369,32 @@ fn asinhBody(x: f64) f64 {
 /// module's `log`/`log1p`. NaN below 1 (C99 F.10.2.1), the far-negative side
 /// included: the raw formula gives a finite wrong answer there, so the sign
 /// is checked, not just the magnitude. f32 is one rounding of the f64 body;
-/// under 2 ulp against an f128 oracle (measured, `tests/` below).
+/// under `max_ulp.acosh` against an f128 oracle in both FMA classes (`tests/`
+/// below). Its f64 bits follow the FMA class for x >= 2, where it calls f64
+/// `log` (`log_splits`); f32 rounds that one-ulp split away on every input.
 pub inline fn acosh(x: anytype) @TypeOf(x) {
     if (Elem(@TypeOf(x)) == f32) return apply(viaF64(acoshBody), x);
     return apply(acoshBody, x);
 }
 
 fn acoshBody(x: f64) f64 {
+    return acoshIn(fma_class, x);
+}
+
+/// `acoshBody` over one class's f64 log, so a test runs both on any host.
+fn acoshIn(comptime fused: bool, x: f64) f64 {
+    const ln = if (fused) softLogFma else softLog;
     const e = (@as(u64, @bitCast(x)) >> 52) & 0x7FF;
     if (x < 0 and e >= 0x3FF + 1) return std.math.nan(f64);
     if (e < 0x3FF + 1) return log1p(x - 1 + @sqrt((x - 1) * (x - 1) + 2 * (x - 1)));
-    if (e < 0x3FF + 26) return log(2 * x - 1 / (x + @sqrt(x * x - 1)));
-    return log(x) + 0.693147180559945309417232121458176568;
+    if (e < 0x3FF + 26) return ln(2 * x - 1 / (x + @sqrt(x * x - 1)));
+    return ln(x) + 0.693147180559945309417232121458176568;
 }
 
 /// 0.5*ln((1+x)/(1-x)) for |x|<1, musl's `atanh.c`/`atanhf.c` over this
 /// module's `log1p`; +-inf at +-1, NaN past. f32 is one rounding of the f64
 /// body; under 2 ulp against an f128 oracle (measured, `tests/` below).
+/// `log1p` is one body, so the bits are the same in both FMA classes.
 pub inline fn atanh(x: anytype) @TypeOf(x) {
     if (Elem(@TypeOf(x)) == f32) return apply(viaF64(atanhBody), x);
     return apply(atanhBody, x);
@@ -506,7 +536,8 @@ fn softAtanf(x: f32) f32 {
 /// atan(y/x) in (-pi, pi], musl's `atan2.c`/`atan2f.c` over this module's own
 /// `atan`; C99 F.10.1.4's signed zeros and infinities (`atan2(+-0, -0) =
 /// +-pi`, `atan2(+-0, +0) = +-0`). f32 widens to f64 and rounds once.
-/// Under 2 ulp against an f128 oracle (measured, `tests/` below).
+/// Under 2 ulp against an f128 oracle (measured, `tests/` below). `atan` is
+/// one body, so the bits are the same in both FMA classes.
 pub inline fn atan2(y: anytype, x: @TypeOf(y)) @TypeOf(y) {
     if (Elem(@TypeOf(y)) == f32) return apply2(atan2fLane, y, x);
     return apply2(atan2Body, y, x);
@@ -585,7 +616,7 @@ inline fn hypf(x: anytype, comptime which: enum { tanh, sinh, cosh }) @TypeOf(x)
         .tanh => blk: {
             const small = xd + xd * x2 * (sp(D, -1.0 / 3.0) + x2 * (sp(D, 2.0 / 15.0) + x2 * sp(D, -17.0 / 315.0)));
             // tanh(10) rounds to 1 in f32; clamping keeps e finite.
-            const e = exp(sp(D, 2) * @min(ax, sp(D, 10)));
+            const e = expFree(sp(D, 2) * @min(ax, sp(D, 10)));
             const big: D = @bitCast(@as(U, @bitCast((e - sp(D, 1)) / (e + sp(D, 1)))) | sign);
             // @min drops a NaN, so put it back.
             // The sign bit again so -0 stays -0: the series sums -0 and +0.
@@ -594,12 +625,12 @@ inline fn hypf(x: anytype, comptime which: enum { tanh, sinh, cosh }) @TypeOf(x)
         },
         .sinh => blk: {
             const small = xd + xd * x2 * (sp(D, 1.0 / 6.0) + x2 * (sp(D, 1.0 / 120.0) + x2 * sp(D, 1.0 / 5040.0)));
-            const e = exp(ax);
+            const e = expFree(ax);
             const big: D = @bitCast(@as(U, @bitCast(sp(D, 0.5) * e - sp(D, 0.5) / e)) | sign);
             break :blk sel(xd != xd, xd, sel(ax < sp(D, 0.25), small, big));
         },
         .cosh => blk: {
-            const e = exp(ax);
+            const e = expFree(ax);
             break :blk sel(xd != xd, xd, sp(D, 0.5) * e + sp(D, 0.5) / e);
         },
     };
@@ -899,6 +930,9 @@ fn viaF64(comptime f: fn (f64) f64) fn (f32) f32 {
 /// route is faithful (0.50 ulp measured), so an exact x^y still comes back
 /// exact: pow(2, 10) is 1024.
 ///
+/// f64 bits are fixed per FMA class, as for `exp`; f32 is one set of bits on
+/// every target.
+///
 /// f32 goes through the f64 body: one algorithm, one test surface, and a
 /// single f32 rounding of a 0.52-ulp f64 result is correctly rounded. Nothing
 /// in gompute or its consumers calls `pow` on f32 (Verilog-A `real` is f64),
@@ -908,8 +942,8 @@ fn viaF64(comptime f: fn (f64) f64) fn (f32) f32 {
 pub inline fn pow(x: anytype, y: @TypeOf(x)) @TypeOf(x) {
     const T = @TypeOf(x);
     if (Elem(T) == f32) return powf(x, y);
-    if (comptime !isVec(T)) return powBody(x, y);
-    return powVec(x, y);
+    if (comptime !isVec(T)) return if (fma_class) powBodyFma(x, y) else powBody(x, y);
+    return if (fma_class) powVecFma(x, y) else powVec(x, y);
 }
 
 /// f32 x^y: exp2(y * log2(x)) in binary64 for x positive and finite and y
@@ -1364,6 +1398,28 @@ fn softPow(x: f64, y: f64) f64 {
     var sign_bias: u32 = 0;
     var ix: u64 = @bitCast(x);
     const iy: u64 = @bitCast(y);
+    if (powSpecial(x, y, &ix, &sign_bias)) |v| return v;
+
+    var lo: f64 = undefined;
+    const hi = logInline(ix, &lo);
+    const yhi: f64 = @bitCast(iy & (~@as(u64, 0) << 27));
+    const ylo = y - yhi;
+    const lhi: f64 = @bitCast(@as(u64, @bitCast(hi)) & (~@as(u64, 0) << 27));
+    const llo = hi - lhi + lo;
+    const ehi = yhi * lhi;
+    const elo = ylo * lhi + y * llo; // |elo| < |ehi| * 2^-25
+    return expInline(ehi, elo, sign_bias);
+}
+
+/// `pow`'s special values, shared by both classes: returns the answer, or
+/// null with `ix` made positive and normal and `sign_bias` set for a negative
+/// result. `inline` so each body compiles as if it were written out in it.
+inline fn powSpecial(x: f64, y: f64, ix_: *u64, sign_bias_: *u32) ?f64 {
+    var sign_bias: u32 = sign_bias_.*;
+    var ix: u64 = ix_.*;
+    defer ix_.* = ix;
+    defer sign_bias_.* = sign_bias;
+    const iy: u64 = @bitCast(y);
     var topx = top12(x);
     const topy = top12(y);
 
@@ -1408,16 +1464,7 @@ fn softPow(x: f64, y: f64) f64 {
             ix -%= @as(u64, 52) << 52;
         }
     }
-
-    var lo: f64 = undefined;
-    const hi = logInline(ix, &lo);
-    const yhi: f64 = @bitCast(iy & (~@as(u64, 0) << 27));
-    const ylo = y - yhi;
-    const lhi: f64 = @bitCast(@as(u64, @bitCast(hi)) & (~@as(u64, 0) << 27));
-    const llo = hi - lhi + lo;
-    const ehi = yhi * lhi;
-    const elo = ylo * lhi + y * llo; // |elo| < |ehi| * 2^-25
-    return expInline(ehi, elo, sign_bias);
+    return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -1441,6 +1488,266 @@ fn softExp(x: f64) f64 {
         if (abstop >= comptime top12(std.math.inf(f64))) return 1.0 + x; // nan, +inf
     }
     return expInline(x, 0, 0);
+}
+
+// ---------------------------------------------------------------------------
+// The FMA class: exp, log and pow in ARM optimized-routines' `__FP_FAST_FMA`
+// forms (math/exp.c, math/log.c, math/pow.c: each `#if __FP_FAST_FMA` branch,
+// and the contractions GCC makes in the rest), written as explicit
+// `@mulAdd`. A target with a hardware fused multiply-add (`fma_class`) runs
+// these; every other target runs the FMA-free bodies above, whose bits are
+// frozen at 2.0.1. `@mulAdd` is one rounding everywhere (hardware,
+// compiler_rt, comptime), so these bodies give one set of bits on every
+// target that runs them, and the same bits on a host without FMA, slowly:
+// that is how their tests run everywhere.
+//
+// Only exp, log and pow (f64, scalar and vector) have two bodies. Every
+// other function -- exp2, log2, log10, expm1, log1p, the hyperbolics, all
+// of f32 -- calls the FMA-free cores directly and keeps one set of bits.
+// ---------------------------------------------------------------------------
+
+/// Whether the target has a hardware fused multiply-add, which picks the
+/// class of `exp`, `log` and `pow`. The same switch as ESPice's dual lanes
+/// (`fma_ok` in `src/device/dual.zig`), so lanes and values agree on what
+/// "the target has FMA" means. A target, never the build host: a comptime
+/// fold for an x86_64 baseline target gets the FMA-free bits.
+const fma_class = switch (arch) {
+    .x86_64 => std.Target.x86.featureSetHas(builtin.target.cpu.features, .fma),
+    .aarch64, .aarch64_be => true,
+    .nvptx64, .amdgcn => true,
+    else => false, // wasm, x86, riscv, ...: no fused multiply-add guaranteed
+};
+
+/// `expMain` in the FMA forms: the reduction and the polynomial contracted.
+inline fn expMainFma(comptime T: type, x: T, xtail: T, sign_bias: u64) struct { tmp: T, sbits: Bits(T), ki: Bits(T) } {
+    const U = Bits(T);
+    const shifted = @mulAdd(T, sp(T, md.invln2N), x, sp(T, md.shift));
+    const ki: U = @bitCast(shifted);
+    const kd = shifted - sp(T, md.shift);
+    const r = @mulAdd(T, kd, sp(T, md.negln2loN), @mulAdd(T, kd, sp(T, md.negln2hiN), x)) + xtail;
+
+    const row = gatherRows(u64, 2, exp_rows, ki & sp(U, 127));
+    const top = (ki +% sp(U, sign_bias)) << shamt(U, 52 - 7);
+    const tail: T = @bitCast(row[0]);
+    const sbits = row[1] +% top;
+
+    const c = md.exp_poly;
+    const r2 = r * r;
+    const p01 = @mulAdd(T, r2, @mulAdd(T, r, sp(T, c[1]), sp(T, c[0])), tail + r);
+    const tmp = @mulAdd(T, r2 * r2, @mulAdd(T, r, sp(T, c[3]), sp(T, c[2])), p01);
+    return .{ .tmp = tmp, .sbits = sbits, .ki = ki };
+}
+
+/// `expSpecial` with the reference's two products fused.
+fn expSpecialFma(tmp: f64, sbits_in: u64, ki: u64) f64 {
+    var sbits = sbits_in;
+    if (ki & 0x80000000 == 0) {
+        sbits -%= @as(u64, 1009) << 52;
+        const scale: f64 = @bitCast(sbits);
+        return @mulAdd(f64, scale, tmp, scale) * 0x1p1009;
+    }
+    sbits +%= @as(u64, 1022) << 52;
+    const scale: f64 = @bitCast(sbits);
+    var y = @mulAdd(f64, scale, tmp, scale);
+    if (@abs(y) < 1.0) {
+        const one: f64 = if (y < 0.0) -1.0 else 1.0;
+        var lo = @mulAdd(f64, scale, tmp, scale - y);
+        const hi = one + y;
+        lo = one - hi + y + lo;
+        y = (hi + lo) - one;
+        if (y == 0.0) y = @bitCast(sbits & 0x8000000000000000);
+    }
+    return 0x1p-1022 * y;
+}
+
+/// sign * exp(x + xtail) in the FMA forms, with one range test. `infnan`
+/// sorts inf and nan inside that test (for `exp`); `pow` has already.
+inline fn expInlineFma(x: f64, xtail: f64, sign_bias: u32, comptime infnan: bool) f64 {
+    const tiny_top = comptime top12(0x1p-54);
+    const abstop: u32 = top12(x) & 0x7ff;
+    if (abstop -% tiny_top >= comptime top12(512.0) - top12(0x1p-54)) {
+        if (abstop -% tiny_top >= 0x80000000) {
+            const one = 1.0 + x; // |x| < 2^-54
+            return if (sign_bias != 0) -one else one;
+        }
+        if (abstop >= comptime top12(1024.0)) {
+            if (infnan) {
+                if (@as(u64, @bitCast(x)) == comptime @as(u64, @bitCast(-std.math.inf(f64)))) return 0;
+                if (abstop >= comptime top12(std.math.inf(f64))) return 1.0 + x; // nan, +inf
+            }
+            if (@as(u64, @bitCast(x)) >> 63 != 0)
+                return if (sign_bias != 0) -@as(f64, 0) else 0;
+            return if (sign_bias != 0) -std.math.inf(f64) else std.math.inf(f64);
+        }
+        const m = expMainFma(f64, x, xtail, sign_bias);
+        return expSpecialFma(m.tmp, m.sbits, m.ki);
+    }
+    const m = expMainFma(f64, x, xtail, sign_bias);
+    const scale: f64 = @bitCast(m.sbits);
+    return @mulAdd(f64, scale, m.tmp, scale);
+}
+
+fn softExpFma(x: f64) f64 {
+    return expInlineFma(x, 0, 0, true);
+}
+
+/// `logMain` in the FMA forms: r = fma(z, invc, -1) needs no `log_tab2`.
+inline fn logMainFma(comptime T: type, ix: Bits(T)) struct { hi: T, lo: T } {
+    const U = Bits(T);
+    const tmp = ix -% sp(U, log_off);
+    const i = (tmp >> shamt(U, 52 - 7)) & sp(U, 127);
+    const k = @as(SBits(T), @bitCast(tmp)) >> shamt(U, 52);
+    const z: T = @bitCast(ix -% (tmp & sp(U, @as(u64, 0xfff) << 52)));
+    const row = gatherRows(f64, 4, &log_rows, i);
+    const r = @mulAdd(T, z, row[0], sp(T, -1.0));
+    const kd = kAsF64(T, k);
+    const w = @mulAdd(T, kd, sp(T, md.log_ln2hi), row[1]);
+    const hi = w + r;
+    const t = @mulAdd(T, kd, sp(T, md.log_ln2lo), w - hi + r);
+    const a = md.log_poly;
+    const r2 = r * r;
+    const inner = @mulAdd(T, r2, @mulAdd(T, r, sp(T, a[4]), sp(T, a[3])), @mulAdd(T, r, sp(T, a[2]), sp(T, a[1])));
+    const lo = @mulAdd(T, r * r2, inner, @mulAdd(T, r2, sp(T, a[0]), t));
+    return .{ .hi = hi, .lo = lo };
+}
+
+fn softLogFma(x: f64) f64 {
+    var ix: u64 = @bitCast(x);
+    if (ix -% log_near1_lo < log_near1_hi - log_near1_lo) {
+        // The band around 1: `logCore`'s series with its polynomial and its
+        // last product contracted, as GCC builds the reference with FMA.
+        if (ix == one_bits) return 0;
+        const r = x - 1.0;
+        const r2 = r * r;
+        const r3 = r * r2;
+        const b = md.log_poly1;
+        const p3 = @mulAdd(f64, r3, b[10], @mulAdd(f64, r2, b[9], @mulAdd(f64, r, b[8], b[7])));
+        const p2 = @mulAdd(f64, r3, p3, @mulAdd(f64, r2, b[6], @mulAdd(f64, r, b[5], b[4])));
+        var y = r3 * @mulAdd(f64, r3, p2, @mulAdd(f64, r2, b[3], @mulAdd(f64, r, b[2], b[1])));
+        const w0 = r * 0x1p27;
+        const rhi = r + w0 - w0;
+        const rlo = r - rhi;
+        const w = rhi * rhi * b[0];
+        const hi = r + w;
+        y += r - hi + w;
+        y = @mulAdd(f64, b[0] * rlo, rhi + r, y);
+        return y + hi;
+    }
+    if (logSpecial(x, &ix)) |v| return v;
+    const m = logMainFma(f64, ix);
+    return m.lo + m.hi;
+}
+
+/// `powLogMain` in the FMA forms (pow.c's `log_inline` under
+/// `__FP_FAST_FMA`): r = fma(z, invc, -1) and `lo3 = fma(ar, r, -ar2)` replace
+/// the split of z and of r.
+inline fn powLogMainFma(comptime T: type, ix: Bits(T)) struct { y: T, tail: T } {
+    const U = Bits(T);
+    const tmp = ix -% sp(U, 0x3fe6955500000000);
+    const i = (tmp >> shamt(U, 52 - 7)) & sp(U, 127);
+    const k = @as(SBits(T), @bitCast(tmp)) >> shamt(U, 52);
+    const z: T = @bitCast(ix -% (tmp & sp(U, @as(u64, 0xfff) << 52)));
+    const kd = kAsF64(T, k);
+    const row = gatherRows(f64, 4, powlog_rows, i);
+    const r = @mulAdd(T, z, row[0], sp(T, -1.0));
+    const t1 = @mulAdd(T, kd, sp(T, md.powlog_ln2hi), row[2]);
+    const t2 = t1 + r;
+    const lo1 = @mulAdd(T, kd, sp(T, md.powlog_ln2lo), row[3]);
+    const lo2 = t1 - t2 + r;
+    const a = md.powlog_poly;
+    const ar = sp(T, a[0]) * r;
+    const ar2 = r * ar;
+    const ar3 = r * ar2;
+    const hi = t2 + ar2;
+    const lo3 = @mulAdd(T, ar, r, -ar2);
+    const lo4 = t2 - hi + ar2;
+    const in5 = @mulAdd(T, r, sp(T, a[6]), sp(T, a[5]));
+    const in3 = @mulAdd(T, ar2, in5, @mulAdd(T, r, sp(T, a[4]), sp(T, a[3])));
+    const p = ar3 * @mulAdd(T, ar2, in3, @mulAdd(T, r, sp(T, a[2]), sp(T, a[1])));
+    const lo = lo1 + lo2 + lo3 + lo4 + p;
+    const y = hi + lo;
+    return .{ .y = y, .tail = hi - y + lo };
+}
+
+fn softPowFma(x: f64, y: f64) f64 {
+    var sign_bias: u32 = 0;
+    var ix: u64 = @bitCast(x);
+    if (powSpecial(x, y, &ix, &sign_bias)) |v| return v;
+    const l = powLogMainFma(f64, ix);
+    const ehi = y * l.y;
+    const elo = @mulAdd(f64, y, l.tail, @mulAdd(f64, y, l.y, -ehi));
+    return expInlineFma(ehi, elo, sign_bias, false);
+}
+
+/// `powBody` for the FMA class, f64 only.
+inline fn powBodyFma(x: f64, y: f64) f64 {
+    if (y == 0 or x == 1) return 1;
+    return softPowFma(x, y);
+}
+
+/// `expVec` for the FMA class: `expMainFma` over the whole vector when every
+/// lane is ordinary, `softExpFma` lane by lane otherwise.
+inline fn expVecFma(x: anytype) @TypeOf(x) {
+    @setEvalBranchQuota(100_000);
+    const T = @TypeOf(x);
+    const U = Bits(T);
+    const abstop = (@as(U, @bitCast(x)) >> shamt(U, 52)) & sp(U, 0x7ff);
+    const tiny = comptime top12(0x1p-54);
+    if (!@reduce(.And, abstop -% sp(U, tiny) < sp(U, comptime top12(512.0) - tiny))) {
+        @branchHint(.unlikely);
+        return apply(softExpFma, x);
+    }
+    const m = expMainFma(T, x, sp(T, 0.0), 0);
+    const scale: T = @bitCast(m.sbits);
+    return @mulAdd(T, scale, m.tmp, scale);
+}
+
+/// `logVec(.ln)` for the FMA class.
+inline fn logVecFma(x: anytype) @TypeOf(x) {
+    @setEvalBranchQuota(100_000);
+    const T = @TypeOf(x);
+    const U = Bits(T);
+    const ix: U = @bitCast(x);
+    const normal = (ix >> shamt(U, 48)) -% sp(U, 0x0010) < sp(U, 0x7ff0 - 0x0010);
+    const near1 = ix -% sp(U, log_near1_lo) < sp(U, log_near1_hi - log_near1_lo);
+    if (!@reduce(.And, normal) or @reduce(.Or, near1)) {
+        @branchHint(.unlikely);
+        return apply(softLogFma, x);
+    }
+    const p = logMainFma(T, ix);
+    return p.lo + p.hi;
+}
+
+/// `powVec` for the FMA class.
+inline fn powVecFma(x: anytype, y: @TypeOf(x)) @TypeOf(x) {
+    @setEvalBranchQuota(100_000);
+    const T = @TypeOf(x);
+    const U = Bits(T);
+    const ix: U = @bitCast(x);
+    const iy: U = @bitCast(y);
+    const topy = (iy >> shamt(U, 52)) & sp(U, 0x7ff);
+    const ok_x = (ix >> shamt(U, 52)) -% sp(U, 1) < sp(U, 0x7ff - 1);
+    const ok_y = topy -% sp(U, 0x3be) < sp(U, 0x43e - 0x3be);
+    if (@reduce(.And, ok_x) and @reduce(.And, ok_y)) {
+        const l = powLogMainFma(T, ix);
+        const ehi = y * l.y;
+        const elo = @mulAdd(T, y, l.tail, @mulAdd(T, y, l.y, -ehi));
+        const abstop = (@as(U, @bitCast(ehi)) >> shamt(U, 52)) & sp(U, 0x7ff);
+        const tiny = comptime top12(0x1p-54);
+        if (@reduce(.And, abstop -% sp(U, tiny) < sp(U, comptime top12(512.0) - tiny))) {
+            const m = expMainFma(T, ehi, elo, 0);
+            const scale: T = @bitCast(m.sbits);
+            return @mulAdd(T, scale, m.tmp, scale);
+        }
+    }
+    return apply2(powBodyFma, x, y);
+}
+
+/// The FMA-free `exp` at any width, for the callers whose bits do not depend
+/// on the class (f32 tanh, sinh and cosh).
+inline fn expFree(x: anytype) @TypeOf(x) {
+    if (comptime isVec(@TypeOf(x))) return expVec(x, false);
+    return softExp(x);
 }
 
 /// musl `tanh.c`, by way of std's `tanh64`, with `softExpm1` for expm1. The
@@ -2742,6 +3049,7 @@ test "exp, exp2, log, log2 and log10 match libm to 1 ulp" {
     // value out is the entire failure mode.
     inline for (.{
         .{ "exp", softExp, "exp", -745.2, 709.79, 709.782712893384, -745.1332191019411 },
+        .{ "exp fma", softExpFma, "exp", -745.2, 709.79, 709.782712893384, -745.1332191019411 },
         .{ "exp2", softExp2, "exp2", -1080.0, 1024.0, 1024.0, -1075.0 },
     }) |spec| {
         const mine: *const fn (f64) f64 = spec[1];
@@ -2761,6 +3069,7 @@ test "exp, exp2, log, log2 and log10 match libm to 1 ulp" {
     // path had no significant digits at all, and where a junction sits.
     inline for (.{
         .{ "log", softLog, "log", 1.0 },
+        .{ "log fma", softLogFma, "log", 1.0 },
         .{ "log2", softLog2, "log2", 1.0 },
         // 2, not 1, and the slack is GLIBC's. Its log10 is not from
         // optimized-routines — it is still `e_log10.c` — and measures 1.57
@@ -2980,9 +3289,9 @@ test "vector f64 exp, exp2, log, log2 and log10 are the scalar call, lane for la
             const yl2 = log2(xl);
             const yl10 = log10(xl);
             inline for (0..w) |l| {
-                try std.testing.expectEqual(@as(u64, @bitCast(softExp(xe[l]))), @as(u64, @bitCast(ye[l])));
+                try std.testing.expectEqual(@as(u64, @bitCast(exp(xe[l]))), @as(u64, @bitCast(ye[l])));
                 try std.testing.expectEqual(@as(u64, @bitCast(softExp2(xe[l]))), @as(u64, @bitCast(y2[l])));
-                try std.testing.expectEqual(@as(u64, @bitCast(softLog(xl[l]))), @as(u64, @bitCast(yl[l])));
+                try std.testing.expectEqual(@as(u64, @bitCast(log(xl[l]))), @as(u64, @bitCast(yl[l])));
                 try std.testing.expectEqual(@as(u64, @bitCast(softLog2(xl[l]))), @as(u64, @bitCast(yl2[l])));
                 try std.testing.expectEqual(@as(u64, @bitCast(softLog10(xl[l]))), @as(u64, @bitCast(yl10[l])));
             }
@@ -3142,43 +3451,128 @@ const oracle = struct {
     }
 };
 
-test "exp, log and pow stay inside max_ulp of an f128 oracle" {
+/// The two classes' bodies of exp, log and pow, scalar and 4-lane, so a
+/// test can run each class on any host: the FMA class through software
+/// `@mulAdd` where the host has no FMA. `fused` is the class argument of
+/// `asinhIn` and `acoshIn`.
+const classes = .{
+    struct {
+        const name = "FMA-free";
+        const fused = false;
+        fn e(x: f64) f64 {
+            return softExp(x);
+        }
+        fn l(x: f64) f64 {
+            return softLog(x);
+        }
+        fn p(x: f64, y: f64) f64 {
+            return powBody(x, y);
+        }
+        fn ev(x: @Vector(4, f64)) @Vector(4, f64) {
+            return expVec(x, false);
+        }
+        fn lv(x: @Vector(4, f64)) @Vector(4, f64) {
+            return logVec(x, .ln);
+        }
+        fn pv(x: @Vector(4, f64), y: @Vector(4, f64)) @Vector(4, f64) {
+            return powVec(x, y);
+        }
+    },
+    struct {
+        const name = "FMA";
+        const fused = true;
+        fn e(x: f64) f64 {
+            return softExpFma(x);
+        }
+        fn l(x: f64) f64 {
+            return softLogFma(x);
+        }
+        fn p(x: f64, y: f64) f64 {
+            return powBodyFma(x, y);
+        }
+        fn ev(x: @Vector(4, f64)) @Vector(4, f64) {
+            return expVecFma(x);
+        }
+        fn lv(x: @Vector(4, f64)) @Vector(4, f64) {
+            return logVecFma(x);
+        }
+        fn pv(x: @Vector(4, f64), y: @Vector(4, f64)) @Vector(4, f64) {
+            return powVecFma(x, y);
+        }
+    },
+};
+
+test "exp, log and pow stay inside max_ulp of an f128 oracle, both classes, scalar and vector" {
     if (dev) return error.SkipZigTest;
-    var prng = std.Random.DefaultPrng.init(0x7a11);
-    const r = prng.random();
-    var worst = [3]f64{ 0, 0, 0 };
-    for (0..20_000) |_| {
-        const x = r.float(f64) * 1440.0 - 735.0;
-        worst[0] = @max(worst[0], oracle.ulp(exp(x), oracle.expQ(x)));
-        const lx: f64 = @bitCast((r.int(u64) % 0x7fe0000000000000) + 0x0010000000000000);
-        worst[1] = @max(worst[1], oracle.ulp(log(lx), oracle.logQ(lx)));
-        const nx = 1.0 + (r.float(f64) - 0.5) * 0x1p-3; // log's band around 1
-        worst[1] = @max(worst[1], oracle.ulp(log(nx), oracle.logQ(nx)));
-        const px = std.math.pow(f64, 10.0, r.float(f64) * 15.0 - 3.0);
-        const py = r.float(f64) * 21.0 - 3.0;
-        worst[2] = @max(worst[2], oracle.ulp(pow(px, py), oracle.expQ(@as(f128, py) * oracle.logQ(px))));
+    inline for (classes) |C| {
+        var prng = std.Random.DefaultPrng.init(0x7a11);
+        const r = prng.random();
+        // exp, log (table), log (band around 1), pow; scalar then vector.
+        var worst: [2][4]f64 = @splat(@splat(0));
+        var xs: [4]f64 = undefined;
+        var ls: [4]f64 = undefined;
+        var ns: [4]f64 = undefined;
+        var pxs: [4]f64 = undefined;
+        var pys: [4]f64 = undefined;
+        for (0..20_000) |n| {
+            const k = n % 4;
+            xs[k] = r.float(f64) * 1440.0 - 735.0;
+            ls[k] = @bitCast((r.int(u64) % 0x7fe0000000000000) + 0x0010000000000000);
+            ns[k] = 1.0 + (r.float(f64) - 0.5) * 0x1p-3;
+            pxs[k] = std.math.pow(f64, 10.0, r.float(f64) * 15.0 - 3.0);
+            pys[k] = r.float(f64) * 21.0 - 3.0;
+            if (k != 3) continue;
+            const ve: [4]f64 = C.ev(xs);
+            const vl: [4]f64 = C.lv(ls);
+            const vn: [4]f64 = C.lv(ns);
+            const vp: [4]f64 = C.pv(pxs, pys);
+            for (0..4) |q| {
+                const want = [4]f128{ oracle.expQ(xs[q]), oracle.logQ(ls[q]), oracle.logQ(ns[q]), oracle.expQ(@as(f128, pys[q]) * oracle.logQ(pxs[q])) };
+                const sc = [4]f64{ C.e(xs[q]), C.l(ls[q]), C.l(ns[q]), C.p(pxs[q], pys[q]) };
+                const vc = [4]f64{ ve[q], vl[q], vn[q], vp[q] };
+                for (0..4) |f| {
+                    worst[0][f] = @max(worst[0][f], oracle.ulp(sc[f], want[f]));
+                    worst[1][f] = @max(worst[1][f], oracle.ulp(vc[f], want[f]));
+                }
+            }
+        }
+        std.debug.print("\n  f128 oracle, {s}: exp {d:.3}, log {d:.3} (near 1 {d:.3}), pow {d:.3} ulp; vector {d:.3} {d:.3} {d:.3} {d:.3}\n", .{ C.name, worst[0][0], worst[0][1], worst[0][2], worst[0][3], worst[1][0], worst[1][1], worst[1][2], worst[1][3] });
+        for (worst) |wv| {
+            try std.testing.expect(wv[0] < max_ulp.exp);
+            try std.testing.expect(wv[1] < max_ulp.log);
+            try std.testing.expect(wv[2] < max_ulp.log);
+            try std.testing.expect(wv[3] < max_ulp.pow);
+        }
     }
-    std.debug.print("\n  f128 oracle: exp {d:.3}, log {d:.3}, pow {d:.3} ulp\n", .{ worst[0], worst[1], worst[2] });
-    try std.testing.expect(worst[0] < max_ulp.exp);
-    try std.testing.expect(worst[1] < max_ulp.log);
-    try std.testing.expect(worst[2] < max_ulp.pow);
 }
 
-test "asinh, acosh, atanh and atan2: C99 F.10 special cases" {
-    // F.10.2.5 asinh: signed zeros, signed infinities, odd.
-    try std.testing.expectEqual(@as(u64, 0), @as(u64, @bitCast(asinh(@as(f64, 0.0)))));
-    try std.testing.expectEqual(@as(u64, 1 << 63), @as(u64, @bitCast(asinh(@as(f64, -0.0)))));
-    try std.testing.expectEqual(std.math.inf(f64), asinh(std.math.inf(f64)));
-    try std.testing.expectEqual(-std.math.inf(f64), asinh(-std.math.inf(f64)));
-    try std.testing.expect(std.math.isNan(asinh(std.math.nan(f64))));
+test "asinh, acosh, atanh and atan2: C99 F.10 special cases, both classes" {
+    inline for (classes) |C| {
+        const ash = struct {
+            fn f(x: f64) f64 {
+                return asinhIn(C.fused, x);
+            }
+        }.f;
+        const ach = struct {
+            fn f(x: f64) f64 {
+                return acoshIn(C.fused, x);
+            }
+        }.f;
+        // F.10.2.5 asinh: signed zeros, signed infinities, odd.
+        try std.testing.expectEqual(@as(u64, 0), @as(u64, @bitCast(ash(@as(f64, 0.0)))));
+        try std.testing.expectEqual(@as(u64, 1 << 63), @as(u64, @bitCast(ash(@as(f64, -0.0)))));
+        try std.testing.expectEqual(std.math.inf(f64), ash(std.math.inf(f64)));
+        try std.testing.expectEqual(-std.math.inf(f64), ash(-std.math.inf(f64)));
+        try std.testing.expect(std.math.isNan(ash(std.math.nan(f64))));
 
-    // F.10.2.1 acosh: NaN below 1 (the far-negative side included), exact at
-    // 1, +inf at +inf.
-    for ([_]f64{ 0.999999, 0.0, -0.0, -1.0, -2.0, -1e300, -std.math.inf(f64) }) |x|
-        try std.testing.expect(std.math.isNan(acosh(x)));
-    try std.testing.expectEqual(@as(f64, 0.0), acosh(@as(f64, 1.0)));
-    try std.testing.expectEqual(std.math.inf(f64), acosh(std.math.inf(f64)));
-    try std.testing.expect(std.math.isNan(acosh(std.math.nan(f64))));
+        // F.10.2.1 acosh: NaN below 1 (the far-negative side included), exact
+        // at 1, +inf at +inf.
+        for ([_]f64{ 0.999999, 0.0, -0.0, -1.0, -2.0, -1e300, -std.math.inf(f64) }) |x|
+            try std.testing.expect(std.math.isNan(ach(x)));
+        try std.testing.expectEqual(@as(f64, 0.0), ach(@as(f64, 1.0)));
+        try std.testing.expectEqual(std.math.inf(f64), ach(std.math.inf(f64)));
+        try std.testing.expect(std.math.isNan(ach(std.math.nan(f64))));
+    }
 
     // F.10.2.3 atanh: signed zero, +-inf at +-1, NaN past +-1, odd.
     try std.testing.expectEqual(@as(u64, 0), @as(u64, @bitCast(atanh(@as(f64, 0.0)))));
@@ -3218,44 +3612,49 @@ test "asinh, acosh, atanh and atan2: C99 F.10 special cases" {
         try std.testing.expectEqual(atan2(@as(f64, yy), @as(f64, xx)), vt[i]);
 }
 
-test "asinh, acosh, atanh and atan2 stay inside max_ulp of an f128 oracle" {
+test "asinh, acosh, atanh and atan2 stay inside max_ulp of an f128 oracle, both classes" {
     if (dev) return error.SkipZigTest;
-    var prng = std.Random.DefaultPrng.init(0xA517);
-    const r = prng.random();
-    var worst = [4]f64{ 0, 0, 0, 0 };
-    for (0..50_000) |_| {
-        // exponent kept above -50: below that, sqrt(x^2+1) rounds to exactly
-        // 1 even in f128 (x^2 is below f128's ulp at 1), so the oracle's
-        // ln(|x| + sqrt(x^2+1)) collapses to ln(1) = 0 -- a cancellation in
-        // the ARGUMENT, not `lnQ`'s series, which `ulp`'s `ilogb(0)` then
-        // cannot take an exponent of. The branch this would exercise
-        // (`asinh(x) == x` for tiny x) is exact by construction either way.
-        const x = std.math.pow(f64, 2, r.float(f64) * 200 - 50) * @as(f64, if (r.boolean()) -1 else 1);
-        worst[0] = @max(worst[0], oracle.ulp(asinh(x), oracle.asinhQ(x)));
-        // exponent kept above -40: below that, 1.0 + 2^e underflows to
-        // exactly 1.0 in f64 and the result (and its oracle) round to
-        // exactly 0 -- `ulp`'s `ilogb(0)` is not finite there.
-        const ax = 1.0 + std.math.pow(f64, 2, r.float(f64) * 140 - 40);
-        worst[1] = @max(worst[1], oracle.ulp(acosh(ax), oracle.acoshQ(ax)));
-        const hx = (r.float(f64) * 2.0 - 1.0) * 0.999999;
-        worst[2] = @max(worst[2], oracle.ulp(atanh(hx), oracle.atanhQ(hx)));
-        const yy = r.float(f64) * 200.0 - 100.0;
-        const xx = r.float(f64) * 200.0 - 100.0;
-        if (xx != 0.0) worst[3] = @max(worst[3], oracle.ulp(atan2(yy, xx), oracle.atan2Q(yy, xx)));
+    // atanh and atan2 do not depend on the class; they run in both anyway.
+    inline for (classes) |C| {
+        var prng = std.Random.DefaultPrng.init(0xA517);
+        const r = prng.random();
+        var worst = [4]f64{ 0, 0, 0, 0 };
+        for (0..50_000) |_| {
+            // exponent kept above -50: below that, sqrt(x^2+1) rounds to exactly
+            // 1 even in f128 (x^2 is below f128's ulp at 1), so the oracle's
+            // ln(|x| + sqrt(x^2+1)) collapses to ln(1) = 0 -- a cancellation in
+            // the ARGUMENT, not `lnQ`'s series, which `ulp`'s `ilogb(0)` then
+            // cannot take an exponent of. The branch this would exercise
+            // (`asinh(x) == x` for tiny x) is exact by construction either way.
+            const x = std.math.pow(f64, 2, r.float(f64) * 200 - 50) * @as(f64, if (r.boolean()) -1 else 1);
+            worst[0] = @max(worst[0], oracle.ulp(asinhIn(C.fused, x), oracle.asinhQ(x)));
+            // exponent kept above -40: below that, 1.0 + 2^e underflows to
+            // exactly 1.0 in f64 and the result (and its oracle) round to
+            // exactly 0 -- `ulp`'s `ilogb(0)` is not finite there.
+            const ax = 1.0 + std.math.pow(f64, 2, r.float(f64) * 140 - 40);
+            worst[1] = @max(worst[1], oracle.ulp(acoshIn(C.fused, ax), oracle.acoshQ(ax)));
+            const hx = (r.float(f64) * 2.0 - 1.0) * 0.999999;
+            worst[2] = @max(worst[2], oracle.ulp(atanh(hx), oracle.atanhQ(hx)));
+            const yy = r.float(f64) * 200.0 - 100.0;
+            const xx = r.float(f64) * 200.0 - 100.0;
+            if (xx != 0.0) worst[3] = @max(worst[3], oracle.ulp(atan2(yy, xx), oracle.atan2Q(yy, xx)));
+        }
+        std.debug.print(
+            "\n  f128 oracle, {s}: asinh {d:.3}, acosh {d:.3}, atanh {d:.3}, atan2 {d:.3} ulp\n",
+            .{ C.name, worst[0], worst[1], worst[2], worst[3] },
+        );
+        try std.testing.expect(worst[0] < max_ulp.asinh);
+        try std.testing.expect(worst[1] < max_ulp.acosh);
+        try std.testing.expect(worst[2] < max_ulp.atanh);
+        try std.testing.expect(worst[3] < max_ulp.atan2);
     }
-    std.debug.print(
-        "\n  f128 oracle: asinh {d:.3}, acosh {d:.3}, atanh {d:.3}, atan2 {d:.3} ulp\n",
-        .{ worst[0], worst[1], worst[2], worst[3] },
-    );
-    try std.testing.expect(worst[0] < max_ulp.asinh);
-    try std.testing.expect(worst[1] < max_ulp.acosh);
-    try std.testing.expect(worst[2] < max_ulp.atanh);
-    try std.testing.expect(worst[3] < max_ulp.atan2);
 }
 
-test "exp, log and pow fold at comptime to the bits they run to" {
-    // No FMA and no target intrinsic in any body, so comptime IEEE f64 is the
-    // same arithmetic every backend runs.
+test "exp, log and pow fold at comptime to the bits they run to, both classes" {
+    // No contraction and no target intrinsic in either body, and `@mulAdd`
+    // is one rounding at comptime as on every backend, so a fold is the
+    // arithmetic the target runs. The public entries take the target's
+    // class; `classes` reaches both.
     const S = struct {
         fn rt(x: f64) f64 {
             var v = x;
@@ -3271,6 +3670,13 @@ test "exp, log and pow fold at comptime to the bits they run to" {
             break :blk exp(x);
         };
         try std.testing.expectEqual(@as(u64, @bitCast(folded)), @as(u64, @bitCast(exp(S.rt(x)))));
+        inline for (classes) |C| {
+            const fc = comptime blk: {
+                @setEvalBranchQuota(1_000_000);
+                break :blk C.e(x);
+            };
+            try std.testing.expectEqual(@as(u64, @bitCast(fc)), @as(u64, @bitCast(C.e(S.rt(x)))));
+        }
     }
     inline for (ls) |x| {
         const fl, const fp = comptime blk: {
@@ -3279,45 +3685,55 @@ test "exp, log and pow fold at comptime to the bits they run to" {
         };
         try std.testing.expectEqual(@as(u64, @bitCast(fl)), @as(u64, @bitCast(log(S.rt(x)))));
         try std.testing.expectEqual(@as(u64, @bitCast(fp)), @as(u64, @bitCast(pow(S.rt(x), 1.4552480184709202))));
+        inline for (classes) |C| {
+            const cl, const cp = comptime blk: {
+                @setEvalBranchQuota(1_000_000);
+                break :blk .{ C.l(x), C.p(x, 1.4552480184709202) };
+            };
+            try std.testing.expectEqual(@as(u64, @bitCast(cl)), @as(u64, @bitCast(C.l(S.rt(x)))));
+            try std.testing.expectEqual(@as(u64, @bitCast(cp)), @as(u64, @bitCast(C.p(S.rt(x), 1.4552480184709202))));
+        }
     }
 }
 
-test "exp, log and pow: C99 F.10 special values and exact cases" {
-    const inf = std.math.inf(f64);
-    const nan = std.math.nan(f64);
-    try std.testing.expectEqual(@as(f64, 1), exp(@as(f64, 0)));
-    try std.testing.expectEqual(@as(f64, 1), exp(@as(f64, -0.0)));
-    try std.testing.expectEqual(inf, exp(inf));
-    try std.testing.expectEqual(@as(u64, 0), @as(u64, @bitCast(exp(-inf))));
-    try std.testing.expect(std.math.isNan(exp(nan)));
-    try std.testing.expectEqual(@as(f64, 0x1p-1074), exp(@as(f64, -0x1.74910d52d3051p9)));
-    try std.testing.expectEqual(@as(f64, 0), exp(@as(f64, -0x1.74910d52d3052p9)));
-    try std.testing.expect(exp(@as(f64, 0x1.62e42fefa39efp9)) < inf);
-    try std.testing.expectEqual(inf, exp(@as(f64, 0x1.62e42fefa39f0p9)));
-    try std.testing.expectEqual(std.math.e, exp(@as(f64, 1)));
+test "exp, log and pow: C99 F.10 special values and exact cases, both classes" {
+    inline for (classes) |C| {
+        const inf = std.math.inf(f64);
+        const nan = std.math.nan(f64);
+        try std.testing.expectEqual(@as(f64, 1), C.e(@as(f64, 0)));
+        try std.testing.expectEqual(@as(f64, 1), C.e(@as(f64, -0.0)));
+        try std.testing.expectEqual(inf, C.e(inf));
+        try std.testing.expectEqual(@as(u64, 0), @as(u64, @bitCast(C.e(-inf))));
+        try std.testing.expect(std.math.isNan(C.e(nan)));
+        try std.testing.expectEqual(@as(f64, 0x1p-1074), C.e(@as(f64, -0x1.74910d52d3051p9)));
+        try std.testing.expectEqual(@as(f64, 0), C.e(@as(f64, -0x1.74910d52d3052p9)));
+        try std.testing.expect(C.e(@as(f64, 0x1.62e42fefa39efp9)) < inf);
+        try std.testing.expectEqual(inf, C.e(@as(f64, 0x1.62e42fefa39f0p9)));
+        try std.testing.expectEqual(std.math.e, C.e(@as(f64, 1)));
 
-    try std.testing.expectEqual(@as(u64, 0), @as(u64, @bitCast(log(@as(f64, 1))))); // +0
-    try std.testing.expectEqual(-inf, log(@as(f64, 0)));
-    try std.testing.expectEqual(-inf, log(@as(f64, -0.0)));
-    try std.testing.expectEqual(inf, log(inf));
-    try std.testing.expect(std.math.isNan(log(@as(f64, -1))));
-    try std.testing.expect(std.math.isNan(log(nan)));
+        try std.testing.expectEqual(@as(u64, 0), @as(u64, @bitCast(C.l(@as(f64, 1))))); // +0
+        try std.testing.expectEqual(-inf, C.l(@as(f64, 0)));
+        try std.testing.expectEqual(-inf, C.l(@as(f64, -0.0)));
+        try std.testing.expectEqual(inf, C.l(inf));
+        try std.testing.expect(std.math.isNan(C.l(@as(f64, -1))));
+        try std.testing.expect(std.math.isNan(C.l(nan)));
 
-    try std.testing.expectEqual(@as(f64, 1), pow(@as(f64, -3), 0));
-    try std.testing.expectEqual(@as(f64, 1), pow(@as(f64, 1), nan));
-    try std.testing.expectEqual(@as(f64, 1024), pow(@as(f64, 2), 10));
-    try std.testing.expectEqual(@as(f64, -8), pow(@as(f64, -2), 3));
-    try std.testing.expectEqual(@as(f64, 0.0625), pow(@as(f64, -2), -4));
-    try std.testing.expectEqual(@as(f64, 2), pow(@as(f64, 4), 0.5));
-    try std.testing.expectEqual(@as(f64, 0.1), pow(@as(f64, 0.1), 1));
-    try std.testing.expect(std.math.isNan(pow(@as(f64, -2), 0.5)));
-    try std.testing.expectEqual(inf, pow(@as(f64, 0), -1));
-    try std.testing.expectEqual(-inf, pow(@as(f64, -0.0), -1));
-    try std.testing.expectEqual(@as(u64, 1 << 63), @as(u64, @bitCast(pow(@as(f64, -0.0), 3))));
-    try std.testing.expectEqual(@as(f64, 0), pow(@as(f64, 0.5), inf));
-    try std.testing.expectEqual(inf, pow(@as(f64, 2), inf));
-    try std.testing.expectEqual(inf, pow(@as(f64, 10), 400));
-    try std.testing.expectEqual(@as(f64, 0), pow(@as(f64, 10), -400));
+        try std.testing.expectEqual(@as(f64, 1), C.p(@as(f64, -3), 0));
+        try std.testing.expectEqual(@as(f64, 1), C.p(@as(f64, 1), nan));
+        try std.testing.expectEqual(@as(f64, 1024), C.p(@as(f64, 2), 10));
+        try std.testing.expectEqual(@as(f64, -8), C.p(@as(f64, -2), 3));
+        try std.testing.expectEqual(@as(f64, 0.0625), C.p(@as(f64, -2), -4));
+        try std.testing.expectEqual(@as(f64, 2), C.p(@as(f64, 4), 0.5));
+        try std.testing.expectEqual(@as(f64, 0.1), C.p(@as(f64, 0.1), 1));
+        try std.testing.expect(std.math.isNan(C.p(@as(f64, -2), 0.5)));
+        try std.testing.expectEqual(inf, C.p(@as(f64, 0), -1));
+        try std.testing.expectEqual(-inf, C.p(@as(f64, -0.0), -1));
+        try std.testing.expectEqual(@as(u64, 1 << 63), @as(u64, @bitCast(C.p(@as(f64, -0.0), 3))));
+        try std.testing.expectEqual(@as(f64, 0), C.p(@as(f64, 0.5), inf));
+        try std.testing.expectEqual(inf, C.p(@as(f64, 2), inf));
+        try std.testing.expectEqual(inf, C.p(@as(f64, 10), 400));
+        try std.testing.expectEqual(@as(f64, 0), C.p(@as(f64, 10), -400));
+    }
 }
 
 /// f(x) <= f(next(x)) for `n` adjacent-ulp steps either side of `x0`.
@@ -3340,73 +3756,75 @@ fn nonDecreasingAround(comptime f: fn (f64) f64, x0: f64, n: usize) !void {
     }
 }
 
-test "exp, log, pow, expm1, log1p and sinh are monotone across every table seam and branch" {
+test "exp, log, pow, expm1, log1p and sinh are monotone across every table seam and branch, both classes" {
     if (dev) return error.SkipZigTest;
-    const F = struct {
-        fn e(x: f64) f64 {
-            return exp(x);
+    inline for (classes) |C| {
+        const F = struct {
+            fn e(x: f64) f64 {
+                return C.e(x);
+            }
+            fn l(x: f64) f64 {
+                return C.l(x);
+            }
+            fn m1(x: f64) f64 {
+                return expm1(x);
+            }
+            fn sh(x: f64) f64 {
+                return sinh(x);
+            }
+            fn l1p(x: f64) f64 {
+                return log1p(x);
+            }
+            var py: f64 = 0;
+            var px: f64 = 0;
+            fn powX(x: f64) f64 {
+                return C.p(x, py);
+            }
+            fn powY(y: f64) f64 {
+                return C.p(px, y);
+            }
+        };
+        // exp: every k/128 rounding seam over the whole range, plus the branch
+        // edges (2^-54, 512, the overflow and underflow ends).
+        var j: f64 = -1075 * 128;
+        while (j < 1024 * 128) : (j += 37) try nonDecreasingAround(F.e, (j + 0.5) / md.invln2N, 3);
+        for ([_]f64{ 0x1p-54, -0x1p-54, 512, -512, 709.78, -708.4, -745.13, 0 }) |b| try nonDecreasingAround(F.e, b, 64);
+        // log: every table subinterval edge in a few binades, both band edges,
+        // and powers of two.
+        for ([_]i32{ -1022, -300, -1, 0, 1, 300, 1023 }) |e2| {
+            for (0..128) |i| {
+                const bits = (log_off + (@as(u64, i) << 45)) & 0x000fffffffffffff | (@as(u64, @intCast(1023 + e2)) << 52);
+                try nonDecreasingAround(F.l, @bitCast(bits), 3);
+            }
+            try nonDecreasingAround(F.l, std.math.ldexp(@as(f64, 1), e2), 32);
         }
-        fn l(x: f64) f64 {
-            return log(x);
+        for ([_]f64{ 1.0 - 0x1p-4, 1.0 + 0x1.09p-4, 1, 0x1p-1022 }) |b| try nonDecreasingAround(F.l, b, 64);
+        // expm1 and sinh at their reduction and branch edges.
+        for ([_]f64{ 0, 0x1p-54, -0x1p-54, 0.3465, -0.3465, 1.0397, -1.0397, 38.8, -38.8, 709.78 }) |b| try nonDecreasingAround(F.m1, b, 32);
+        for ([_]f64{ 0, 0.5, -0.5, 22, -22, 709.78 }) |b| try nonDecreasingAround(F.sh, b, 32);
+        // log1p: musl switches at sqrt(2)/2-1, sqrt(2)-1, 2^-29 and 2^53.
+        for ([_]f64{ -0.29289321881345254, 0.41421356237309503, 0x1p-29, -0x1p-29, 0, 0x1p53, -0.9999999999, 1e-300 }) |b| try nonDecreasingAround(F.l1p, b, 32);
+        // pow in x for fixed y >= 0 (and decreasing in x for y < 0, checked as
+        // increasing in 1/x... kept to y >= 0 here), and in y for fixed x > 1.
+        for ([_]f64{ 0.5, 1.4552480184709202, 2, 3, 0.693, 7.25 }) |y| {
+            F.py = y;
+            for ([_]f64{ 0x1p-1022, 1e-10, 0.5, 1, 1.0 - 0x1p-4, 1.0 + 0x1.09p-4, 2, 1e10 }) |b| try nonDecreasingAround(F.powX, b, 32);
         }
-        fn m1(x: f64) f64 {
-            return expm1(x);
+        for ([_]f64{ 1.0000001, 1.5, 2, 10, 1e10 }) |x| {
+            F.px = x;
+            for ([_]f64{ -64.5, -64, -1, -0.5, 0, 0.5, 1, 63.5, 64, 64.5, 100 }) |b| try nonDecreasingAround(F.powY, b, 32);
         }
-        fn sh(x: f64) f64 {
-            return sinh(x);
-        }
-        fn l1p(x: f64) f64 {
-            return log1p(x);
-        }
-        var py: f64 = 0;
-        var px: f64 = 0;
-        fn powX(x: f64) f64 {
-            return pow(x, py);
-        }
-        fn powY(y: f64) f64 {
-            return pow(px, y);
-        }
-    };
-    // exp: every k/128 rounding seam over the whole range, plus the branch
-    // edges (2^-54, 512, the overflow and underflow ends).
-    var j: f64 = -1075 * 128;
-    while (j < 1024 * 128) : (j += 37) try nonDecreasingAround(F.e, (j + 0.5) / md.invln2N, 3);
-    for ([_]f64{ 0x1p-54, -0x1p-54, 512, -512, 709.78, -708.4, -745.13, 0 }) |b| try nonDecreasingAround(F.e, b, 64);
-    // log: every table subinterval edge in a few binades, both band edges,
-    // and powers of two.
-    for ([_]i32{ -1022, -300, -1, 0, 1, 300, 1023 }) |e2| {
-        for (0..128) |i| {
-            const bits = (log_off + (@as(u64, i) << 45)) & 0x000fffffffffffff | (@as(u64, @intCast(1023 + e2)) << 52);
-            try nonDecreasingAround(F.l, @bitCast(bits), 3);
-        }
-        try nonDecreasingAround(F.l, std.math.ldexp(@as(f64, 1), e2), 32);
+        // Dense random sample, sorted: exp and log over their whole domains.
+        var prng = std.Random.DefaultPrng.init(0x3070_7070);
+        const r = prng.random();
+        var xs: [20_000]f64 = undefined;
+        for (&xs) |*x| x.* = r.float(f64) * 1440.0 - 735.0;
+        std.mem.sort(f64, &xs, {}, std.sort.asc(f64));
+        for (xs[1..], xs[0 .. xs.len - 1]) |b, a| try std.testing.expect(C.e(b) >= C.e(a));
+        for (&xs) |*x| x.* = @bitCast((r.int(u64) % 0x7fe0000000000000) + 0x0010000000000000);
+        std.mem.sort(f64, &xs, {}, std.sort.asc(f64));
+        for (xs[1..], xs[0 .. xs.len - 1]) |b, a| try std.testing.expect(C.l(b) >= C.l(a));
     }
-    for ([_]f64{ 1.0 - 0x1p-4, 1.0 + 0x1.09p-4, 1, 0x1p-1022 }) |b| try nonDecreasingAround(F.l, b, 64);
-    // expm1 and sinh at their reduction and branch edges.
-    for ([_]f64{ 0, 0x1p-54, -0x1p-54, 0.3465, -0.3465, 1.0397, -1.0397, 38.8, -38.8, 709.78 }) |b| try nonDecreasingAround(F.m1, b, 32);
-    for ([_]f64{ 0, 0.5, -0.5, 22, -22, 709.78 }) |b| try nonDecreasingAround(F.sh, b, 32);
-    // log1p: musl switches at sqrt(2)/2-1, sqrt(2)-1, 2^-29 and 2^53.
-    for ([_]f64{ -0.29289321881345254, 0.41421356237309503, 0x1p-29, -0x1p-29, 0, 0x1p53, -0.9999999999, 1e-300 }) |b| try nonDecreasingAround(F.l1p, b, 32);
-    // pow in x for fixed y >= 0 (and decreasing in x for y < 0, checked as
-    // increasing in 1/x... kept to y >= 0 here), and in y for fixed x > 1.
-    for ([_]f64{ 0.5, 1.4552480184709202, 2, 3, 0.693, 7.25 }) |y| {
-        F.py = y;
-        for ([_]f64{ 0x1p-1022, 1e-10, 0.5, 1, 1.0 - 0x1p-4, 1.0 + 0x1.09p-4, 2, 1e10 }) |b| try nonDecreasingAround(F.powX, b, 32);
-    }
-    for ([_]f64{ 1.0000001, 1.5, 2, 10, 1e10 }) |x| {
-        F.px = x;
-        for ([_]f64{ -64.5, -64, -1, -0.5, 0, 0.5, 1, 63.5, 64, 64.5, 100 }) |b| try nonDecreasingAround(F.powY, b, 32);
-    }
-    // Dense random sample, sorted: exp and log over their whole domains.
-    var prng = std.Random.DefaultPrng.init(0x3070_7070);
-    const r = prng.random();
-    var xs: [20_000]f64 = undefined;
-    for (&xs) |*x| x.* = r.float(f64) * 1440.0 - 735.0;
-    std.mem.sort(f64, &xs, {}, std.sort.asc(f64));
-    for (xs[1..], xs[0 .. xs.len - 1]) |b, a| try std.testing.expect(exp(b) >= exp(a));
-    for (&xs) |*x| x.* = @bitCast((r.int(u64) % 0x7fe0000000000000) + 0x0010000000000000);
-    std.mem.sort(f64, &xs, {}, std.sort.asc(f64));
-    for (xs[1..], xs[0 .. xs.len - 1]) |b, a| try std.testing.expect(log(b) >= log(a));
 }
 
 test "tanh, sinh, cosh, sin and cos keep std's values on the host" {
@@ -3695,4 +4113,459 @@ test "f32 exp, log, log2, log10, sin and cos are correctly rounded, host and dev
         try std.testing.expectEqual(@as(u64, 0), t.bad);
         try std.testing.expectEqual(@as(u64, 0), t.unsure);
     }
+}
+
+// ---------------------------------------------------------------------------
+// One set of bits per FMA class. The FMA-free class is frozen at 2.0.1: its
+// digests below were recorded from the 2.0.1 bodies (git bd8800b) before the
+// FMA bodies were added, and a moved bit anywhere in the sweep changes one.
+// The FMA class's digests were recorded on x86_64_v3 (hardware fma) and must
+// come out the same under `-mcpu=baseline`, where every `@mulAdd` is
+// compiler_rt's software fma: that is the proof the class is one set of bits.
+// ---------------------------------------------------------------------------
+
+const digest = struct {
+    /// The f64 inputs every digest walks: specials, each branch edge walked
+    /// ulp by ulp, a uniform range, every biased exponent of either sign, and
+    /// log's band around 1.
+    fn sweep64(ctx: anytype, comptime visit: anytype) void {
+        const specials = [_]u64{
+            0x0000000000000000, 0x8000000000000000, 0x7ff0000000000000, 0xfff0000000000000,
+            0x7ff8000000000000, 0xfff8000000000000, 0x7ff8000000000001, 0xfff800000000dead,
+            0x7ff0000000000001, 0x7ff4000000c0ffee, 0x0000000000000001, 0x8000000000000001,
+            0x000fffffffffffff, 0x0010000000000000, 0x7fefffffffffffff, 0xffefffffffffffff,
+            0x3ff0000000000000, 0xbff0000000000000,
+        };
+        for (specials) |b| visit(ctx, @bitCast(b));
+        const D = Diff(f64);
+        for ([_]f64{ 0x1p-54, 512.0, 1024.0, 709.782712893384, 745.1332191019411, 0x1p-1022, 1.0 - 0x1p-4, 1.0 + 0x1.09p-4, 1.0, 0.5, 2.0 }) |t0| for ([_]f64{ t0, -t0 }) |t| {
+            for (0..300) |i| {
+                const off: i64 = @intCast(i);
+                visit(ctx, D.unkey(D.key(t) +| off));
+                visit(ctx, D.unkey(D.key(t) -| off));
+            }
+        };
+        var prng = std.Random.DefaultPrng.init(0xD16E57);
+        const rnd = prng.random();
+        for (0..40_000) |_| visit(ctx, -750.0 + rnd.float(f64) * 1500.0);
+        for (0..40_000) |_| {
+            const e: u64 = rnd.intRangeAtMost(u64, 0, 2047);
+            visit(ctx, @bitCast((rnd.int(u64) & (1 << 63)) | (e << 52) | (rnd.int(u64) >> 12)));
+        }
+        for (0..20_000) |_| visit(ctx, 1.0 - 0x1.1p-4 + rnd.float(f64) * 0x1.1p-3);
+    }
+
+    /// (x, y) pairs for pow: x over every positive binade and both signs at
+    /// a few, y over the range that stays finite plus integers, and the C99
+    /// special-value cross product.
+    fn sweepPow(ctx: anytype, comptime visit: anytype) void {
+        var prng = std.Random.DefaultPrng.init(0xD16E58);
+        const rnd = prng.random();
+        for (0..60_000) |_| {
+            const e: u64 = rnd.intRangeAtMost(u64, 0, 2046);
+            const x: f64 = @bitCast((e << 52) | (rnd.int(u64) >> 12));
+            visit(ctx, x, rnd.float(f64) * 80.0 - 40.0);
+        }
+        for (0..20_000) |_| visit(ctx, @exp(rnd.float(f64) * 8.0 - 7.0), rnd.float(f64) * 4.0);
+        for (0..5_000) |_| visit(ctx, -(rnd.float(f64) * 4.0), @floatFromInt(rnd.intRangeAtMost(i32, -60, 60)));
+        const inf = std.math.inf(f64);
+        const s = [_]f64{ 0.0, -0.0, 1.0, -1.0, 2.0, -2.0, 0.5, -0.5, 3.0, inf, -inf, std.math.nan(f64), 1e300, 1e-300, 0x1p-1070, 0x1p-70, 1023.0, 1024.0, -1074.0, 1e10 };
+        for (s) |x| for (s) |y| visit(ctx, x, y);
+    }
+
+    fn sweep32(ctx: anytype, comptime visit: anytype) void {
+        var prng = std.Random.DefaultPrng.init(0xD16E59);
+        const rnd = prng.random();
+        for ([_]u32{ 0, 0x80000000, 0x7f800000, 0xff800000, 0x7fc00000, 0x7fc00001, 0xffc0dead, 0x00000001, 0x00800000, 0x7f7fffff, 0x3f800000, 0xbf800000 }) |b| visit(ctx, @bitCast(b));
+        for (0..60_000) |_| visit(ctx, @as(f32, @bitCast(rnd.int(u32))));
+        for (0..20_000) |_| visit(ctx, rnd.float(f32) * 200.0 - 100.0);
+    }
+
+    /// Every NaN as one pattern. Whether a signalling NaN comes back quieted
+    /// is the backend's call, not the body's: 2.0.1's f32 tanh, sinh and
+    /// cosh return 97 of the f32 sweep's signalling NaNs quieted in Debug and
+    /// untouched in ReleaseFast. The class claim is about every other value.
+    fn canon(y: anytype) @TypeOf(y) {
+        return if (y != y) std.math.nan(@TypeOf(y)) else y;
+    }
+
+    fn Hasher(comptime T: type) type {
+        return struct {
+            h: std.hash.Wyhash = .init(0),
+            f: *const fn (T) T,
+            fn visit(s: *@This(), x: T) void {
+                s.h.update(std.mem.asBytes(&canon(s.f(x))));
+            }
+        };
+    }
+
+    fn of64(f: *const fn (f64) f64) u64 {
+        var s: Hasher(f64) = .{ .f = f };
+        sweep64(&s, Hasher(f64).visit);
+        return s.h.final();
+    }
+
+    fn of32(f: *const fn (f32) f32) u64 {
+        var s: Hasher(f32) = .{ .f = f };
+        sweep32(&s, Hasher(f32).visit);
+        return s.h.final();
+    }
+
+    fn ofPow(f: *const fn (f64, f64) f64) u64 {
+        const S = struct {
+            h: std.hash.Wyhash = .init(0),
+            f: *const fn (f64, f64) f64,
+            fn visit(s: *@This(), x: f64, y: f64) void {
+                s.h.update(std.mem.asBytes(&canon(s.f(x, y))));
+            }
+        };
+        var s: S = .{ .f = f };
+        sweepPow(&s, S.visit);
+        return s.h.final();
+    }
+
+    /// `f` at vector width `w` over the same sweep, `w` inputs at a time
+    /// padded by repetition: the vector form must hash like a vector form, so
+    /// this digest is its own (lanes that equal the scalar are tested apart).
+    fn ofVec(comptime w: usize, comptime f: anytype) u64 {
+        const S = struct {
+            h: std.hash.Wyhash = .init(0),
+            buf: [w]f64 = @splat(1.0),
+            n: usize = 0,
+            fn visit(s: *@This(), x: f64) void {
+                s.buf[s.n % w] = x;
+                s.n += 1;
+                if (s.n % w != 0) return;
+                const y: [w]f64 = f(@as(@Vector(w, f64), s.buf));
+                for (y) |l| s.h.update(std.mem.asBytes(&canon(l)));
+            }
+        };
+        var s: S = .{};
+        sweep64(&s, S.visit);
+        return s.h.final();
+    }
+
+    /// A public entry at f64 or f32, as a plain function pointer.
+    fn pub64(comptime name: []const u8) *const fn (f64) f64 {
+        return &struct {
+            fn f(x: f64) f64 {
+                return @field(math_self, name)(x);
+            }
+        }.f;
+    }
+    fn pub32(comptime name: []const u8) *const fn (f32) f32 {
+        return &struct {
+            fn f(x: f32) f32 {
+                return @field(math_self, name)(x);
+            }
+        }.f;
+    }
+
+    const Named = struct { name: []const u8, d: u64 };
+
+    /// Compares `got` with `want` by name; prints every mismatch (and, when
+    /// `want` is empty, the table to paste).
+    fn check(got: []const Named, want: []const Named) !void {
+        var bad: usize = 0;
+        for (got) |g| {
+            const w: ?u64 = for (want) |x| {
+                if (std.mem.eql(u8, x.name, g.name)) break x.d;
+            } else null;
+            if (w == null or w.? != g.d) {
+                bad += 1;
+                std.debug.print("  digest {s}: got 0x{x:0>16}, recorded {?x}\n", .{ g.name, g.d, w });
+            }
+        }
+        if (bad != 0) {
+            std.debug.print("  as recorded here:\n", .{});
+            for (got) |g| std.debug.print("    .{{ .name = \"{s}\", .d = 0x{x:0>16} }},\n", .{ g.name, g.d });
+        }
+        try std.testing.expectEqual(want.len, got.len);
+        try std.testing.expectEqual(@as(usize, 0), bad);
+    }
+};
+
+const math_self = @This();
+
+/// The FMA-free bodies of exp, log and pow (called directly, so these hold in
+/// either class) and every function whose bits do not depend on the class,
+/// through its public entry. Recorded from 2.0.1 (git bd8800b, Zig
+/// 0.18.0-dev.349, x86_64 native, Debug) before any FMA body existed; the
+/// last eight from 2.1.0 (git 3943b21, same Zig and host, Debug), whose public
+/// asinh and acosh ran the FMA-free log, so "asinh free" and "acosh free" are
+/// that class's f64 bodies. Over this sweep the FMA class gives the same f64
+/// asinh and acosh bits too; `log_splits` holds inputs where it does not.
+const frozen_digests = [_]digest.Named{
+    .{ .name = "softExp", .d = 0x91828370a2505d97 },
+    .{ .name = "softLog", .d = 0x5efd5af710e00e61 },
+    .{ .name = "powBody", .d = 0xf5dd9a950205ba16 },
+    .{ .name = "expVec x2", .d = 0x91828370a2505d97 },
+    .{ .name = "logVec x2", .d = 0x5efd5af710e00e61 },
+    .{ .name = "powVec x2", .d = 0x47f480ce79640247 },
+    .{ .name = "exp2 x2", .d = 0x1e36ed7a95f85e60 },
+    .{ .name = "log2 x2", .d = 0x96e8f1ec6f347f21 },
+    .{ .name = "log10 x2", .d = 0x69bbbbd34c981470 },
+    .{ .name = "expVec x4", .d = 0xd4cd3e2b06cbb7bc },
+    .{ .name = "logVec x4", .d = 0x6dfaf289fe9aec47 },
+    .{ .name = "powVec x4", .d = 0x121db8c565f577be },
+    .{ .name = "exp2 x4", .d = 0x97c8db981906bfed },
+    .{ .name = "log2 x4", .d = 0xf89d4fdf9eda3e75 },
+    .{ .name = "log10 x4", .d = 0x016cc99868d39947 },
+    .{ .name = "expVec x8", .d = 0xd4cd3e2b06cbb7bc },
+    .{ .name = "logVec x8", .d = 0x6dfaf289fe9aec47 },
+    .{ .name = "powVec x8", .d = 0x121db8c565f577be },
+    .{ .name = "exp2 x8", .d = 0x97c8db981906bfed },
+    .{ .name = "log2 x8", .d = 0xf89d4fdf9eda3e75 },
+    .{ .name = "log10 x8", .d = 0x016cc99868d39947 },
+    .{ .name = "exp2", .d = 0x1e36ed7a95f85e60 },
+    .{ .name = "log2", .d = 0x96e8f1ec6f347f21 },
+    .{ .name = "log10", .d = 0x69bbbbd34c981470 },
+    .{ .name = "expm1", .d = 0xbf85cb5b58422de6 },
+    .{ .name = "log1p", .d = 0xb198213b58d5b8ac },
+    .{ .name = "sin", .d = 0xb18368ba760cc627 },
+    .{ .name = "cos", .d = 0xd7e7e8a13c49d0aa },
+    .{ .name = "tan", .d = 0x0ff5b9f97fdc962f },
+    .{ .name = "tanh", .d = 0x077cf23a09cc938b },
+    .{ .name = "sinh", .d = 0xae50ec329d85c2b9 },
+    .{ .name = "cosh", .d = 0xa350908d576f8125 },
+    .{ .name = "atan", .d = 0x41025ad3c5b6ad4c },
+    .{ .name = "exp f32", .d = 0xa47df50f9c8e27e3 },
+    .{ .name = "log f32", .d = 0x97cee995db02ddd8 },
+    .{ .name = "log2 f32", .d = 0x95d50a87cc90fba0 },
+    .{ .name = "log10 f32", .d = 0x30889f3ffa13217e },
+    .{ .name = "sin f32", .d = 0x94e9c32122643045 },
+    .{ .name = "cos f32", .d = 0x6b27719d6826b672 },
+    .{ .name = "tanh f32", .d = 0x12ff7fb2849ab02d },
+    .{ .name = "sinh f32", .d = 0xcedec60aa0423399 },
+    .{ .name = "cosh f32", .d = 0x4c1748be11822506 },
+    .{ .name = "atan f32", .d = 0x570364ab14264f7e },
+    .{ .name = "expm1 f32", .d = 0x54992a2259458d99 },
+    .{ .name = "log1p f32", .d = 0x1e7624a5b97c7280 },
+    .{ .name = "pow f32", .d = 0x44eb1304e174a416 },
+    .{ .name = "asinh free", .d = 0x010bf3831169bf5c },
+    .{ .name = "acosh free", .d = 0xfda98dba86678197 },
+    .{ .name = "atanh", .d = 0x2950b4618799f605 },
+    .{ .name = "atan2", .d = 0x5aba2c5ef06414cd },
+    .{ .name = "asinh f32", .d = 0xdda6e676ef013ac8 },
+    .{ .name = "acosh f32", .d = 0x179ee98cefaa71d4 },
+    .{ .name = "atanh f32", .d = 0x4f1b40a8bc98573c },
+    .{ .name = "atan2 f32", .d = 0x3336127f860bf7a8 },
+};
+fn frozenDigests() [54]digest.Named {
+    const F = struct {
+        fn ash(x: f64) f64 {
+            return asinhIn(false, x);
+        }
+        fn ach(x: f64) f64 {
+            return acoshIn(false, x);
+        }
+        fn at2(y: f64, x: f64) f64 {
+            return atan2(y, x);
+        }
+        fn at2f32(y: f32) f32 {
+            return atan2(y, @as(f32, -0.7));
+        }
+        fn powPlain(x: f64, y: f64) f64 {
+            return powBody(x, y);
+        }
+        fn powf32(x: f32) f32 {
+            return pow(x, @as(f32, 1.4552480184709202));
+        }
+        fn eV(v: anytype) @TypeOf(v) {
+            return expVec(v, false);
+        }
+        fn lV(v: anytype) @TypeOf(v) {
+            return logVec(v, .ln);
+        }
+        fn pV(v: anytype) @TypeOf(v) {
+            return powVec(v, @as(@TypeOf(v), @splat(1.4552480184709202)));
+        }
+        fn e2V(v: anytype) @TypeOf(v) {
+            return exp2(v);
+        }
+        fn l2V(v: anytype) @TypeOf(v) {
+            return log2(v);
+        }
+        fn l10V(v: anytype) @TypeOf(v) {
+            return log10(v);
+        }
+    };
+    var t: [54]digest.Named = undefined;
+    var n: usize = 0;
+    t[n] = .{ .name = "softExp", .d = digest.of64(&softExp) };
+    n += 1;
+    t[n] = .{ .name = "softLog", .d = digest.of64(&softLog) };
+    n += 1;
+    t[n] = .{ .name = "powBody", .d = digest.ofPow(&F.powPlain) };
+    n += 1;
+    inline for (.{ 2, 4, 8 }) |w| {
+        inline for (.{ .{ "expVec", F.eV }, .{ "logVec", F.lV }, .{ "powVec", F.pV }, .{ "exp2", F.e2V }, .{ "log2", F.l2V }, .{ "log10", F.l10V } }) |e| {
+            t[n] = .{ .name = e[0] ++ " x" ++ std.fmt.comptimePrint("{d}", .{w}), .d = digest.ofVec(w, e[1]) };
+            n += 1;
+        }
+    }
+    inline for (.{ "exp2", "log2", "log10", "expm1", "log1p", "sin", "cos", "tan", "tanh", "sinh", "cosh", "atan" }) |name| {
+        t[n] = .{ .name = name, .d = digest.of64(digest.pub64(name)) };
+        n += 1;
+    }
+    inline for (.{ "exp", "log", "log2", "log10", "sin", "cos", "tanh", "sinh", "cosh", "atan", "expm1", "log1p" }) |name| {
+        t[n] = .{ .name = name ++ " f32", .d = digest.of32(digest.pub32(name)) };
+        n += 1;
+    }
+    t[n] = .{ .name = "pow f32", .d = digest.of32(&F.powf32) };
+    n += 1;
+    t[n] = .{ .name = "asinh free", .d = digest.of64(&F.ash) };
+    t[n + 1] = .{ .name = "acosh free", .d = digest.of64(&F.ach) };
+    t[n + 2] = .{ .name = "atanh", .d = digest.of64(digest.pub64("atanh")) };
+    t[n + 3] = .{ .name = "atan2", .d = digest.ofPow(&F.at2) };
+    t[n + 4] = .{ .name = "asinh f32", .d = digest.of32(digest.pub32("asinh")) };
+    t[n + 5] = .{ .name = "acosh f32", .d = digest.of32(digest.pub32("acosh")) };
+    t[n + 6] = .{ .name = "atanh f32", .d = digest.of32(digest.pub32("atanh")) };
+    t[n + 7] = .{ .name = "atan2 f32", .d = digest.of32(&F.at2f32) };
+    n += 8;
+    std.debug.assert(n == t.len);
+    return t;
+}
+
+test "the FMA-free class returns 2.0.1's bits, and 2.1.0's for what 2.1.0 added" {
+    if (dev) return error.SkipZigTest;
+    const got = frozenDigests();
+    try digest.check(&got, &frozen_digests);
+}
+
+/// f64 inputs where asinh or acosh differs by one ulp between the classes,
+/// because f64 log does (18 and 17 of 10^7 inputs in [2, 2^101) on 3.0.0;
+/// none of the f32 inputs, all of them checked). `free` is 2.1.0's bits (git
+/// 3943b21), `fma` 3.0.0's FMA class (x86_64_v3).
+const log_splits = [_]struct { f: enum { asinh, acosh }, x: u64, free: u64, fma: u64 }{
+    .{ .f = .asinh, .x = 0x40021ab0374084e9, .free = 0x3ff8e312b326944e, .fma = 0x3ff8e312b326944d },
+    .{ .f = .asinh, .x = 0xc0021ab0374084e9, .free = 0xbff8e312b326944e, .fma = 0xbff8e312b326944d },
+    .{ .f = .asinh, .x = 0x41d5ffb47c2b5e8e, .free = 0x4035ce53a74cbf91, .fma = 0x4035ce53a74cbf90 },
+    .{ .f = .acosh, .x = 0x4018e4efb8a54bb6, .free = 0x40041eaa39dac9e5, .fma = 0x40041eaa39dac9e6 },
+    .{ .f = .acosh, .x = 0x41d5ffb47c2b5e8e, .free = 0x4035ce53a74cbf91, .fma = 0x4035ce53a74cbf90 },
+};
+
+test "f64 asinh and acosh take f64 log's class, and the public entry the target's" {
+    for (log_splits) |s| {
+        const x: f64 = @bitCast(s.x);
+        const free: u64 = @bitCast(if (s.f == .asinh) asinhIn(false, x) else acoshIn(false, x));
+        const fma: u64 = @bitCast(if (s.f == .asinh) asinhIn(true, x) else acoshIn(true, x));
+        const public: u64 = @bitCast(if (s.f == .asinh) asinh(x) else acosh(x));
+        try std.testing.expectEqual(s.free, free);
+        try std.testing.expectEqual(s.fma, fma);
+        try std.testing.expectEqual(if (fma_class) s.fma else s.free, public);
+    }
+}
+
+test "both classes: the vector forms are the scalar body, lane for lane" {
+    var prng = std.Random.DefaultPrng.init(0xC1A55);
+    const rnd = prng.random();
+    const specials = [_]f64{ 0, -0.0, 1, -1, -2, 0x1p-1074, 0x1p-1022, 0x1p-60, 709.78, 710, -745.2, -746, 600, -600, 1e308, std.math.inf(f64), -std.math.inf(f64), std.math.nan(f64), 1.0 + 0x1p-5, 1.0 - 0x1p-5 };
+    const ys = [_]f64{ 0, 1, -1, 2, 3, 0.5, 1e300, -1e300, std.math.nan(f64), 0x1p-70, 1.4552480184709202 };
+    const F = struct {
+        fn ev(comptime fused: bool, x: anytype) @TypeOf(x) {
+            return if (fused) expVecFma(x) else expVec(x, false);
+        }
+        fn lv(comptime fused: bool, x: anytype) @TypeOf(x) {
+            return if (fused) logVecFma(x) else logVec(x, .ln);
+        }
+        fn pv(comptime fused: bool, x: anytype, y: @TypeOf(x)) @TypeOf(x) {
+            return if (fused) powVecFma(x, y) else powVec(x, y);
+        }
+        fn e(comptime fused: bool, x: f64) f64 {
+            return if (fused) softExpFma(x) else softExp(x);
+        }
+        fn l(comptime fused: bool, x: f64) f64 {
+            return if (fused) softLogFma(x) else softLog(x);
+        }
+        fn p(comptime fused: bool, x: f64, y: f64) f64 {
+            return if (fused) powBodyFma(x, y) else powBody(x, y);
+        }
+    };
+    inline for (.{ false, true }) |fused| inline for (.{ 2, 4, 8 }) |w| {
+        const V = @Vector(w, f64);
+        for (0..20_000) |n| {
+            var xe: V = undefined;
+            var xl: V = undefined;
+            var px: V = undefined;
+            var py: V = undefined;
+            inline for (0..w) |q| {
+                xe[q] = (rnd.float(f64) - 0.5) * 1400;
+                xl[q] = @exp((rnd.float(f64) - 0.5) * 1400);
+                px[q] = std.math.pow(f64, 10.0, rnd.float(f64) * 30 - 15);
+                py[q] = rnd.float(f64) * 40 - 20;
+                if (n % 8 == 0 and rnd.boolean()) {
+                    xe[q] = specials[rnd.uintLessThan(usize, specials.len)];
+                    xl[q] = specials[rnd.uintLessThan(usize, specials.len)];
+                    px[q] = specials[rnd.uintLessThan(usize, specials.len)];
+                    py[q] = ys[rnd.uintLessThan(usize, ys.len)];
+                }
+            }
+            const ye = F.ev(fused, xe);
+            const yl = F.lv(fused, xl);
+            const yp = F.pv(fused, px, py);
+            inline for (0..w) |q| {
+                try std.testing.expectEqual(@as(u64, @bitCast(F.e(fused, xe[q]))), @as(u64, @bitCast(ye[q])));
+                try std.testing.expectEqual(@as(u64, @bitCast(F.l(fused, xl[q]))), @as(u64, @bitCast(yl[q])));
+                const want = F.p(fused, px[q], py[q]);
+                if (!(std.math.isNan(want) and std.math.isNan(yp[q])))
+                    try std.testing.expectEqual(@as(u64, @bitCast(want)), @as(u64, @bitCast(yp[q])));
+            }
+        }
+    };
+}
+
+/// The FMA bodies of exp, log and pow, scalar and at 2, 4 and 8 lanes.
+/// Recorded on x86_64_v3 (hardware fma, Zig 0.18.0-dev.349, Debug); the
+/// same test under `-mcpu=baseline` runs every `@mulAdd` through compiler_rt
+/// and must produce the same digests.
+const fma_digests = [_]digest.Named{
+    .{ .name = "softExpFma", .d = 0x51d2178f2524251e },
+    .{ .name = "softLogFma", .d = 0x7c4468fe857b89f8 },
+    .{ .name = "powBodyFma", .d = 0x7d48672db48e4e8b },
+    .{ .name = "expVecFma x2", .d = 0x51d2178f2524251e },
+    .{ .name = "logVecFma x2", .d = 0x7c4468fe857b89f8 },
+    .{ .name = "powVecFma x2", .d = 0x7c57f84c1a056970 },
+    .{ .name = "expVecFma x4", .d = 0xc307c44c829a8c24 },
+    .{ .name = "logVecFma x4", .d = 0x5954afe3a374245b },
+    .{ .name = "powVecFma x4", .d = 0xb2a61f990373ccd0 },
+    .{ .name = "expVecFma x8", .d = 0xc307c44c829a8c24 },
+    .{ .name = "logVecFma x8", .d = 0x5954afe3a374245b },
+    .{ .name = "powVecFma x8", .d = 0xb2a61f990373ccd0 },
+};
+
+fn fmaDigests() [12]digest.Named {
+    const F = struct {
+        fn p(x: f64, y: f64) f64 {
+            return powBodyFma(x, y);
+        }
+        fn ev(v: anytype) @TypeOf(v) {
+            return expVecFma(v);
+        }
+        fn lv(v: anytype) @TypeOf(v) {
+            return logVecFma(v);
+        }
+        fn pv(v: anytype) @TypeOf(v) {
+            return powVecFma(v, @as(@TypeOf(v), @splat(1.4552480184709202)));
+        }
+    };
+    var t: [12]digest.Named = undefined;
+    t[0] = .{ .name = "softExpFma", .d = digest.of64(&softExpFma) };
+    t[1] = .{ .name = "softLogFma", .d = digest.of64(&softLogFma) };
+    t[2] = .{ .name = "powBodyFma", .d = digest.ofPow(&F.p) };
+    var n: usize = 3;
+    inline for (.{ 2, 4, 8 }) |w| {
+        inline for (.{ .{ "expVecFma", F.ev }, .{ "logVecFma", F.lv }, .{ "powVecFma", F.pv } }) |e| {
+            t[n] = .{ .name = e[0] ++ " x" ++ std.fmt.comptimePrint("{d}", .{w}), .d = digest.ofVec(w, e[1]) };
+            n += 1;
+        }
+    }
+    std.debug.assert(n == t.len);
+    return t;
+}
+
+test "the FMA class is one set of bits, with or without FMA hardware" {
+    if (dev) return error.SkipZigTest;
+    const got = fmaDigests();
+    try digest.check(&got, &fma_digests);
 }

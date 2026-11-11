@@ -104,7 +104,8 @@ fn gpu() !void {
 // g.math throughput: `BENCH=math zig build run -Doptimize=ReleaseFast`. Each
 // element makes 8 calls (see kernels.zig), so these are calls per second, not
 // bytes. GPU: best of 5 event-timed rounds. CPU: the scalar call in a plain
-// loop and the vector form 8 (f32) or 4 (f64) lanes wide, median of 5.
+// loop, the vector form 2 lanes wide (the pair a tuple entry would take),
+// and 8 (f32) or 4 (f64) lanes wide, median of 5.
 // ---------------------------------------------------------------------------
 
 const math_n_gpu = 1 << 22;
@@ -161,7 +162,7 @@ fn mathBench(io: std.Io) !void {
     const gpa = std.heap.page_allocator;
     var ctx: ?g.runtime.cuda.Context = if (comptime g.available(B)) g.runtime.cuda.Context.init(0) catch null else null;
     defer if (ctx) |*c| c.deinit();
-    print("g.math: GPU Gcalls/s (n={d}) | CPU ns/call scalar, vector (n={d})\n", .{ math_n_gpu, math_n_cpu });
+    print("g.math: GPU Gcalls/s (n={d}) | CPU ns/call scalar, 2 lanes, 8 (f32) or 4 (f64) lanes (n={d})\n", .{ math_n_gpu, math_n_cpu });
     inline for (.{ f32, f64 }) |T| {
         const w = if (T == f32) 8 else 4;
         const host_in = try gpa.alloc(T, math_n_gpu);
@@ -180,8 +181,9 @@ fn mathBench(io: std.Io) !void {
         inline for (k.math_fns) |name| {
             const gcalls = if (buf) |*b| @as(f64, math_n_gpu * 8) / (try mathGpuOne(T, name, &on.?, b, host_in)) / 1e3 else 0;
             const s_ns = try mathCpuOne(T, name, 1, io, xs, host_in[0..math_n_cpu]);
+            const v2_ns = try mathCpuOne(T, name, 2, io, xs, host_in[0..math_n_cpu]);
             const v_ns = try mathCpuOne(T, name, w, io, xs, host_in[0..math_n_cpu]);
-            print("  {s:<6} {s}  {d:>8.2} Gcalls/s  | {d:>6.2} {d:>6.2} ns\n", .{ name, @typeName(T), gcalls, s_ns, v_ns });
+            print("  {s:<6} {s}  {d:>8.2} Gcalls/s  | {d:>6.2} {d:>6.2} {d:>6.2} ns\n", .{ name, @typeName(T), gcalls, s_ns, v2_ns, v_ns });
         }
     }
 }
