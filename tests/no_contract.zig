@@ -18,10 +18,10 @@ fn logFamily(x: anytype) @TypeOf(x) {
     return m.log(x) + m.log2(x) + m.log10(x) + m.log1p(x) + m.sqrt(x) + m.rsqrt(x);
 }
 fn trigFamily(x: anytype) @TypeOf(x) {
-    return m.sin(x) + m.cos(x) + m.tan(x) + m.atan(x);
+    return m.sin(x) + m.cos(x) + m.tan(x) + m.atan(x) + m.atan2(x, x);
 }
 fn hypFamily(x: anytype) @TypeOf(x) {
-    return m.tanh(x) + m.sinh(x) + m.cosh(x);
+    return m.tanh(x) + m.sinh(x) + m.cosh(x) + m.asinh(x) + m.acosh(x) + m.atanh(x);
 }
 fn contracted(x: anytype) @TypeOf(x) {
     @setFloatMode(.optimized);
