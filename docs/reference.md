@@ -202,8 +202,11 @@ f128 worst error. Within one class, the bits match: a baseline build handed
 the FMA body (software `@mulAdd`) gives the FMA class's bits, which a digest
 test checks. Between classes, a few inputs differ by one ulp: 30, 2 and 23 of
 65,536 for exp, log and pow, measured with `examples/exhaustive` on a
-baseline host against the GPU. Every other
-function, and all of f32, returns the same bits in both classes.
+baseline host against the GPU. f64 `asinh` and `acosh` call f64 `log` for
+|x| ≥ 2, so they split the same way on a few inputs (`log_splits` in
+`math.zig` pins some); f32 `asinh` and `acosh` round that split away, which a
+sweep of every f32 input confirmed. Every other function, and the rest of
+f32, returns the same bits in both classes.
 `examples/exhaustive` checks the CUDA result against the CPU result bit for
 bit for every function over 64K inputs; build the host in the card's class
 (the default native build on an FMA machine).
@@ -253,8 +256,8 @@ at 4 lanes than the FMA-free vector form on `x86_64_v3`;
 | f32 `exp2`, `tanh`, `sinh`, `cosh` | ≤ 0.501 ulp | f64, **all 2³² inputs** | exp2/tanh/cosh 0.50, sinh 0.501. f32 `tan` is the ratio of two roundings, not checked exhaustively. |
 | `expm1`, `log1p` | std's bits | std | `expm1` minus one line that does not compile for AMDGCN. |
 | `atan` | 0.741 ulp | f128 oracle | musl's, bit-identical to std's scalar atan; `atan(-0)` is -0. Before 2.0.1 it was std's vector body, +0 for -0. |
-| `asinh` | 1.259 ulp | f128 oracle | musl's, over this module's `log`/`log1p`; promised < 1.5 (`math.max_ulp`). |
-| `acosh` | 2.152 ulp | f128 oracle | musl's; worst near x = 1. NaN below 1, the far-negative side included. Promised < 2.3. |
+| `asinh` | 1.259 ulp | f128 oracle | musl's, over this module's `log`/`log1p`; promised < 1.5 (`math.max_ulp`). Same worst error in both FMA classes. |
+| `acosh` | 2.152 ulp | f128 oracle | musl's; worst near x = 1. NaN below 1, the far-negative side included. Promised < 2.3. Both classes. |
 | `atanh` | 1.574 ulp | f128 oracle | musl's, over `log1p`; +-inf at +-1. Promised < 1.8. |
 | `atan2` | 1.300 ulp | f128 oracle | musl's, over this module's `atan`; C99 F.10.1.4's signed zeros and quadrants. Promised < 1.5. |
 

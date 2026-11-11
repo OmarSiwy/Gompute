@@ -147,9 +147,10 @@ exp, log, log2, log10, sin and cos by being correctly rounded (checked on all
 at comptime from the target (FMA class: x86_64 with `fma`, aarch64, NVPTX,
 AMDGCN; the FMA-free class keeps 2.0.1's bits), the rest by being one body
 with no FMA or intrinsic (no optional contraction in the IR, checked on four
-targets). `asinh` and `acosh` call f64 `log`, so they follow its class. A
-baseline host build is in the FMA-free class, so it can disagree with the GPU
-by one ulp on f64 exp/log/pow, asinh and acosh. `atan(-0)` is -0 from 2.0.1
+targets). f64 `asinh` and `acosh` call f64 `log`, so they follow its class;
+their f32 forms round the split away. A baseline host build is in the
+FMA-free class, so it can disagree with the GPU by one ulp on f64
+exp/log/pow, asinh and acosh. `atan(-0)` is -0 from 2.0.1
 on; 2.0.0 returned +0. `asinh`, `acosh`, `atanh` and `atan2` (musl's, over
 this module's own `log`/`log1p`/`atan`) are new in 2.1.0. `math.max_ulp` holds the f64
 bounds: exp 0.52, log 0.52, pow 0.55 (measured 0.505 / 0.502 / 0.502 against

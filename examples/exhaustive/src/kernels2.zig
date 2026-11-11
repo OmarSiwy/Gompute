@@ -38,12 +38,16 @@ pub fn mathOf(comptime T: type) fn (T, u32) T {
                 13 => g.math.atan(x),
                 14 => g.math.pow(x, @as(T, 1.4552480184709202)),
                 15 => g.math.sqrt(x),
+                16 => g.math.asinh(x),
+                17 => g.math.acosh(x),
+                18 => g.math.atanh(x),
+                19 => g.math.atan2(x, @as(T, -0.7)),
                 else => x,
             };
         }
     }.call;
 }
-pub const math_function_count = 16;
+pub const math_function_count = 20;
 /// The `mathOf` indices whose f32 result is correctly rounded, so the GPU
 /// body may differ from the CPU one and must still match it on all 2^32 inputs.
 pub const math_cr32 = [_]u32{ 0, 1, 3, 4, 5, 6 };

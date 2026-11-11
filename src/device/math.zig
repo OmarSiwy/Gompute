@@ -28,8 +28,10 @@
 //! references' FMA-free one and their `__FP_FAST_FMA` one written as explicit
 //! `@mulAdd`; `fma_class` picks one at comptime from the TARGET (x86_64 with
 //! the `fma` feature, aarch64, NVPTX, AMDGCN), never from the build host or at
-//! run time. Within a class the same input gives the same bits on the host,
-//! NVPTX, AMDGCN and at comptime, which is what VerA's constant folding and
+//! run time. f64 `asinh` and `acosh` call f64 log, so they follow its class
+//! too (`asinhIn`, `acoshIn` take the class, for the tests). Within a class the
+//! same input gives the same bits on the host, NVPTX, AMDGCN and at comptime,
+//! which is what VerA's constant folding and
 //! ESPice's CPU/GPU comparison rely on; `examples/exhaustive` checks CUDA
 //! against the CPU bit for bit. A baseline x86_64 build that is handed the FMA
 //! body (software `@mulAdd`) gives the FMA class's bits, which the digest
@@ -334,21 +336,29 @@ fn softLog1p(x: f64) f64 {
 /// sign(x)*ln(|x| + sqrt(x^2+1)), musl's `asinh.c`/`asinhf.c` over THIS
 /// module's own `log`/`log1p` (not std's: a device build has no libm, which
 /// is the whole point of this file). f32 is one rounding of the f64 body
-/// (`viaF64`, as `expm1`/`log1p`); faithful under 2 ulp against an f128
-/// oracle (measured 1.000, `tests/` below).
+/// (`viaF64`, as `expm1`/`log1p`); under `max_ulp.asinh` against an f128
+/// oracle in both FMA classes (`tests/` below). Its f64 bits follow the FMA
+/// class for |x| >= 2, where it calls f64 `log` (`log_splits`); f32 rounds
+/// that one-ulp split away on every input.
 pub inline fn asinh(x: anytype) @TypeOf(x) {
     if (Elem(@TypeOf(x)) == f32) return apply(viaF64(asinhBody), x);
     return apply(asinhBody, x);
 }
 
 fn asinhBody(x: f64) f64 {
+    return asinhIn(fma_class, x);
+}
+
+/// `asinhBody` over one class's f64 log, so a test runs both on any host.
+fn asinhIn(comptime fused: bool, x: f64) f64 {
+    const ln = if (fused) softLogFma else softLog;
     const u: u64 = @bitCast(x);
     const e = (u >> 52) & 0x7FF;
     var rx: f64 = @bitCast(u & (std.math.maxInt(u64) >> 1));
     if (e >= 0x3FF + 26) {
-        rx = log(rx) + 0.693147180559945309417232121458176568;
+        rx = ln(rx) + 0.693147180559945309417232121458176568;
     } else if (e >= 0x3FF + 1) {
-        rx = log(2 * rx + 1 / (@sqrt(rx * rx + 1) + rx));
+        rx = ln(2 * rx + 1 / (@sqrt(rx * rx + 1) + rx));
     } else if (e >= 0x3FF - 26) {
         rx = log1p(rx + rx * rx / (@sqrt(rx * rx + 1) + 1));
     }
@@ -359,23 +369,32 @@ fn asinhBody(x: f64) f64 {
 /// module's `log`/`log1p`. NaN below 1 (C99 F.10.2.1), the far-negative side
 /// included: the raw formula gives a finite wrong answer there, so the sign
 /// is checked, not just the magnitude. f32 is one rounding of the f64 body;
-/// under 2 ulp against an f128 oracle (measured, `tests/` below).
+/// under `max_ulp.acosh` against an f128 oracle in both FMA classes (`tests/`
+/// below). Its f64 bits follow the FMA class for x >= 2, where it calls f64
+/// `log` (`log_splits`); f32 rounds that one-ulp split away on every input.
 pub inline fn acosh(x: anytype) @TypeOf(x) {
     if (Elem(@TypeOf(x)) == f32) return apply(viaF64(acoshBody), x);
     return apply(acoshBody, x);
 }
 
 fn acoshBody(x: f64) f64 {
+    return acoshIn(fma_class, x);
+}
+
+/// `acoshBody` over one class's f64 log, so a test runs both on any host.
+fn acoshIn(comptime fused: bool, x: f64) f64 {
+    const ln = if (fused) softLogFma else softLog;
     const e = (@as(u64, @bitCast(x)) >> 52) & 0x7FF;
     if (x < 0 and e >= 0x3FF + 1) return std.math.nan(f64);
     if (e < 0x3FF + 1) return log1p(x - 1 + @sqrt((x - 1) * (x - 1) + 2 * (x - 1)));
-    if (e < 0x3FF + 26) return log(2 * x - 1 / (x + @sqrt(x * x - 1)));
-    return log(x) + 0.693147180559945309417232121458176568;
+    if (e < 0x3FF + 26) return ln(2 * x - 1 / (x + @sqrt(x * x - 1)));
+    return ln(x) + 0.693147180559945309417232121458176568;
 }
 
 /// 0.5*ln((1+x)/(1-x)) for |x|<1, musl's `atanh.c`/`atanhf.c` over this
 /// module's `log1p`; +-inf at +-1, NaN past. f32 is one rounding of the f64
 /// body; under 2 ulp against an f128 oracle (measured, `tests/` below).
+/// `log1p` is one body, so the bits are the same in both FMA classes.
 pub inline fn atanh(x: anytype) @TypeOf(x) {
     if (Elem(@TypeOf(x)) == f32) return apply(viaF64(atanhBody), x);
     return apply(atanhBody, x);
@@ -517,7 +536,8 @@ fn softAtanf(x: f32) f32 {
 /// atan(y/x) in (-pi, pi], musl's `atan2.c`/`atan2f.c` over this module's own
 /// `atan`; C99 F.10.1.4's signed zeros and infinities (`atan2(+-0, -0) =
 /// +-pi`, `atan2(+-0, +0) = +-0`). f32 widens to f64 and rounds once.
-/// Under 2 ulp against an f128 oracle (measured, `tests/` below).
+/// Under 2 ulp against an f128 oracle (measured, `tests/` below). `atan` is
+/// one body, so the bits are the same in both FMA classes.
 pub inline fn atan2(y: anytype, x: @TypeOf(y)) @TypeOf(y) {
     if (Elem(@TypeOf(y)) == f32) return apply2(atan2fLane, y, x);
     return apply2(atan2Body, y, x);
@@ -3433,10 +3453,12 @@ const oracle = struct {
 
 /// The two classes' bodies of exp, log and pow, scalar and 4-lane, so a
 /// test can run each class on any host: the FMA class through software
-/// `@mulAdd` where the host has no FMA.
+/// `@mulAdd` where the host has no FMA. `fused` is the class argument of
+/// `asinhIn` and `acoshIn`.
 const classes = .{
     struct {
         const name = "FMA-free";
+        const fused = false;
         fn e(x: f64) f64 {
             return softExp(x);
         }
@@ -3458,6 +3480,7 @@ const classes = .{
     },
     struct {
         const name = "FMA";
+        const fused = true;
         fn e(x: f64) f64 {
             return softExpFma(x);
         }
@@ -3523,21 +3546,33 @@ test "exp, log and pow stay inside max_ulp of an f128 oracle, both classes, scal
     }
 }
 
-test "asinh, acosh, atanh and atan2: C99 F.10 special cases" {
-    // F.10.2.5 asinh: signed zeros, signed infinities, odd.
-    try std.testing.expectEqual(@as(u64, 0), @as(u64, @bitCast(asinh(@as(f64, 0.0)))));
-    try std.testing.expectEqual(@as(u64, 1 << 63), @as(u64, @bitCast(asinh(@as(f64, -0.0)))));
-    try std.testing.expectEqual(std.math.inf(f64), asinh(std.math.inf(f64)));
-    try std.testing.expectEqual(-std.math.inf(f64), asinh(-std.math.inf(f64)));
-    try std.testing.expect(std.math.isNan(asinh(std.math.nan(f64))));
+test "asinh, acosh, atanh and atan2: C99 F.10 special cases, both classes" {
+    inline for (classes) |C| {
+        const ash = struct {
+            fn f(x: f64) f64 {
+                return asinhIn(C.fused, x);
+            }
+        }.f;
+        const ach = struct {
+            fn f(x: f64) f64 {
+                return acoshIn(C.fused, x);
+            }
+        }.f;
+        // F.10.2.5 asinh: signed zeros, signed infinities, odd.
+        try std.testing.expectEqual(@as(u64, 0), @as(u64, @bitCast(ash(@as(f64, 0.0)))));
+        try std.testing.expectEqual(@as(u64, 1 << 63), @as(u64, @bitCast(ash(@as(f64, -0.0)))));
+        try std.testing.expectEqual(std.math.inf(f64), ash(std.math.inf(f64)));
+        try std.testing.expectEqual(-std.math.inf(f64), ash(-std.math.inf(f64)));
+        try std.testing.expect(std.math.isNan(ash(std.math.nan(f64))));
 
-    // F.10.2.1 acosh: NaN below 1 (the far-negative side included), exact at
-    // 1, +inf at +inf.
-    for ([_]f64{ 0.999999, 0.0, -0.0, -1.0, -2.0, -1e300, -std.math.inf(f64) }) |x|
-        try std.testing.expect(std.math.isNan(acosh(x)));
-    try std.testing.expectEqual(@as(f64, 0.0), acosh(@as(f64, 1.0)));
-    try std.testing.expectEqual(std.math.inf(f64), acosh(std.math.inf(f64)));
-    try std.testing.expect(std.math.isNan(acosh(std.math.nan(f64))));
+        // F.10.2.1 acosh: NaN below 1 (the far-negative side included), exact
+        // at 1, +inf at +inf.
+        for ([_]f64{ 0.999999, 0.0, -0.0, -1.0, -2.0, -1e300, -std.math.inf(f64) }) |x|
+            try std.testing.expect(std.math.isNan(ach(x)));
+        try std.testing.expectEqual(@as(f64, 0.0), ach(@as(f64, 1.0)));
+        try std.testing.expectEqual(std.math.inf(f64), ach(std.math.inf(f64)));
+        try std.testing.expect(std.math.isNan(ach(std.math.nan(f64))));
+    }
 
     // F.10.2.3 atanh: signed zero, +-inf at +-1, NaN past +-1, odd.
     try std.testing.expectEqual(@as(u64, 0), @as(u64, @bitCast(atanh(@as(f64, 0.0)))));
@@ -3577,39 +3612,42 @@ test "asinh, acosh, atanh and atan2: C99 F.10 special cases" {
         try std.testing.expectEqual(atan2(@as(f64, yy), @as(f64, xx)), vt[i]);
 }
 
-test "asinh, acosh, atanh and atan2 stay inside max_ulp of an f128 oracle" {
+test "asinh, acosh, atanh and atan2 stay inside max_ulp of an f128 oracle, both classes" {
     if (dev) return error.SkipZigTest;
-    var prng = std.Random.DefaultPrng.init(0xA517);
-    const r = prng.random();
-    var worst = [4]f64{ 0, 0, 0, 0 };
-    for (0..50_000) |_| {
-        // exponent kept above -50: below that, sqrt(x^2+1) rounds to exactly
-        // 1 even in f128 (x^2 is below f128's ulp at 1), so the oracle's
-        // ln(|x| + sqrt(x^2+1)) collapses to ln(1) = 0 -- a cancellation in
-        // the ARGUMENT, not `lnQ`'s series, which `ulp`'s `ilogb(0)` then
-        // cannot take an exponent of. The branch this would exercise
-        // (`asinh(x) == x` for tiny x) is exact by construction either way.
-        const x = std.math.pow(f64, 2, r.float(f64) * 200 - 50) * @as(f64, if (r.boolean()) -1 else 1);
-        worst[0] = @max(worst[0], oracle.ulp(asinh(x), oracle.asinhQ(x)));
-        // exponent kept above -40: below that, 1.0 + 2^e underflows to
-        // exactly 1.0 in f64 and the result (and its oracle) round to
-        // exactly 0 -- `ulp`'s `ilogb(0)` is not finite there.
-        const ax = 1.0 + std.math.pow(f64, 2, r.float(f64) * 140 - 40);
-        worst[1] = @max(worst[1], oracle.ulp(acosh(ax), oracle.acoshQ(ax)));
-        const hx = (r.float(f64) * 2.0 - 1.0) * 0.999999;
-        worst[2] = @max(worst[2], oracle.ulp(atanh(hx), oracle.atanhQ(hx)));
-        const yy = r.float(f64) * 200.0 - 100.0;
-        const xx = r.float(f64) * 200.0 - 100.0;
-        if (xx != 0.0) worst[3] = @max(worst[3], oracle.ulp(atan2(yy, xx), oracle.atan2Q(yy, xx)));
+    // atanh and atan2 do not depend on the class; they run in both anyway.
+    inline for (classes) |C| {
+        var prng = std.Random.DefaultPrng.init(0xA517);
+        const r = prng.random();
+        var worst = [4]f64{ 0, 0, 0, 0 };
+        for (0..50_000) |_| {
+            // exponent kept above -50: below that, sqrt(x^2+1) rounds to exactly
+            // 1 even in f128 (x^2 is below f128's ulp at 1), so the oracle's
+            // ln(|x| + sqrt(x^2+1)) collapses to ln(1) = 0 -- a cancellation in
+            // the ARGUMENT, not `lnQ`'s series, which `ulp`'s `ilogb(0)` then
+            // cannot take an exponent of. The branch this would exercise
+            // (`asinh(x) == x` for tiny x) is exact by construction either way.
+            const x = std.math.pow(f64, 2, r.float(f64) * 200 - 50) * @as(f64, if (r.boolean()) -1 else 1);
+            worst[0] = @max(worst[0], oracle.ulp(asinhIn(C.fused, x), oracle.asinhQ(x)));
+            // exponent kept above -40: below that, 1.0 + 2^e underflows to
+            // exactly 1.0 in f64 and the result (and its oracle) round to
+            // exactly 0 -- `ulp`'s `ilogb(0)` is not finite there.
+            const ax = 1.0 + std.math.pow(f64, 2, r.float(f64) * 140 - 40);
+            worst[1] = @max(worst[1], oracle.ulp(acoshIn(C.fused, ax), oracle.acoshQ(ax)));
+            const hx = (r.float(f64) * 2.0 - 1.0) * 0.999999;
+            worst[2] = @max(worst[2], oracle.ulp(atanh(hx), oracle.atanhQ(hx)));
+            const yy = r.float(f64) * 200.0 - 100.0;
+            const xx = r.float(f64) * 200.0 - 100.0;
+            if (xx != 0.0) worst[3] = @max(worst[3], oracle.ulp(atan2(yy, xx), oracle.atan2Q(yy, xx)));
+        }
+        std.debug.print(
+            "\n  f128 oracle, {s}: asinh {d:.3}, acosh {d:.3}, atanh {d:.3}, atan2 {d:.3} ulp\n",
+            .{ C.name, worst[0], worst[1], worst[2], worst[3] },
+        );
+        try std.testing.expect(worst[0] < max_ulp.asinh);
+        try std.testing.expect(worst[1] < max_ulp.acosh);
+        try std.testing.expect(worst[2] < max_ulp.atanh);
+        try std.testing.expect(worst[3] < max_ulp.atan2);
     }
-    std.debug.print(
-        "\n  f128 oracle: asinh {d:.3}, acosh {d:.3}, atanh {d:.3}, atan2 {d:.3} ulp\n",
-        .{ worst[0], worst[1], worst[2], worst[3] },
-    );
-    try std.testing.expect(worst[0] < max_ulp.asinh);
-    try std.testing.expect(worst[1] < max_ulp.acosh);
-    try std.testing.expect(worst[2] < max_ulp.atanh);
-    try std.testing.expect(worst[3] < max_ulp.atan2);
 }
 
 test "exp, log and pow fold at comptime to the bits they run to, both classes" {
@@ -4252,7 +4290,11 @@ const math_self = @This();
 /// The FMA-free bodies of exp, log and pow (called directly, so these hold in
 /// either class) and every function whose bits do not depend on the class,
 /// through its public entry. Recorded from 2.0.1 (git bd8800b, Zig
-/// 0.18.0-dev.349, x86_64 native, Debug) before any FMA body existed.
+/// 0.18.0-dev.349, x86_64 native, Debug) before any FMA body existed; the
+/// last eight from 2.1.0 (git 3943b21, same Zig and host, Debug), whose public
+/// asinh and acosh ran the FMA-free log, so "asinh free" and "acosh free" are
+/// that class's f64 bodies. Over this sweep the FMA class gives the same f64
+/// asinh and acosh bits too; `log_splits` holds inputs where it does not.
 const frozen_digests = [_]digest.Named{
     .{ .name = "softExp", .d = 0x91828370a2505d97 },
     .{ .name = "softLog", .d = 0x5efd5af710e00e61 },
@@ -4300,9 +4342,29 @@ const frozen_digests = [_]digest.Named{
     .{ .name = "expm1 f32", .d = 0x54992a2259458d99 },
     .{ .name = "log1p f32", .d = 0x1e7624a5b97c7280 },
     .{ .name = "pow f32", .d = 0x44eb1304e174a416 },
+    .{ .name = "asinh free", .d = 0x010bf3831169bf5c },
+    .{ .name = "acosh free", .d = 0xfda98dba86678197 },
+    .{ .name = "atanh", .d = 0x2950b4618799f605 },
+    .{ .name = "atan2", .d = 0x5aba2c5ef06414cd },
+    .{ .name = "asinh f32", .d = 0xdda6e676ef013ac8 },
+    .{ .name = "acosh f32", .d = 0x179ee98cefaa71d4 },
+    .{ .name = "atanh f32", .d = 0x4f1b40a8bc98573c },
+    .{ .name = "atan2 f32", .d = 0x3336127f860bf7a8 },
 };
-fn frozenDigests() [46]digest.Named {
+fn frozenDigests() [54]digest.Named {
     const F = struct {
+        fn ash(x: f64) f64 {
+            return asinhIn(false, x);
+        }
+        fn ach(x: f64) f64 {
+            return acoshIn(false, x);
+        }
+        fn at2(y: f64, x: f64) f64 {
+            return atan2(y, x);
+        }
+        fn at2f32(y: f32) f32 {
+            return atan2(y, @as(f32, -0.7));
+        }
         fn powPlain(x: f64, y: f64) f64 {
             return powBody(x, y);
         }
@@ -4328,7 +4390,7 @@ fn frozenDigests() [46]digest.Named {
             return log10(v);
         }
     };
-    var t: [46]digest.Named = undefined;
+    var t: [54]digest.Named = undefined;
     var n: usize = 0;
     t[n] = .{ .name = "softExp", .d = digest.of64(&softExp) };
     n += 1;
@@ -4352,14 +4414,47 @@ fn frozenDigests() [46]digest.Named {
     }
     t[n] = .{ .name = "pow f32", .d = digest.of32(&F.powf32) };
     n += 1;
+    t[n] = .{ .name = "asinh free", .d = digest.of64(&F.ash) };
+    t[n + 1] = .{ .name = "acosh free", .d = digest.of64(&F.ach) };
+    t[n + 2] = .{ .name = "atanh", .d = digest.of64(digest.pub64("atanh")) };
+    t[n + 3] = .{ .name = "atan2", .d = digest.ofPow(&F.at2) };
+    t[n + 4] = .{ .name = "asinh f32", .d = digest.of32(digest.pub32("asinh")) };
+    t[n + 5] = .{ .name = "acosh f32", .d = digest.of32(digest.pub32("acosh")) };
+    t[n + 6] = .{ .name = "atanh f32", .d = digest.of32(digest.pub32("atanh")) };
+    t[n + 7] = .{ .name = "atan2 f32", .d = digest.of32(&F.at2f32) };
+    n += 8;
     std.debug.assert(n == t.len);
     return t;
 }
 
-test "the FMA-free class returns 2.0.1's bits" {
+test "the FMA-free class returns 2.0.1's bits, and 2.1.0's for what 2.1.0 added" {
     if (dev) return error.SkipZigTest;
     const got = frozenDigests();
     try digest.check(&got, &frozen_digests);
+}
+
+/// f64 inputs where asinh or acosh differs by one ulp between the classes,
+/// because f64 log does (18 and 17 of 10^7 inputs in [2, 2^101) on 3.0.0;
+/// none of the f32 inputs, all of them checked). `free` is 2.1.0's bits (git
+/// 3943b21), `fma` 3.0.0's FMA class (x86_64_v3).
+const log_splits = [_]struct { f: enum { asinh, acosh }, x: u64, free: u64, fma: u64 }{
+    .{ .f = .asinh, .x = 0x40021ab0374084e9, .free = 0x3ff8e312b326944e, .fma = 0x3ff8e312b326944d },
+    .{ .f = .asinh, .x = 0xc0021ab0374084e9, .free = 0xbff8e312b326944e, .fma = 0xbff8e312b326944d },
+    .{ .f = .asinh, .x = 0x41d5ffb47c2b5e8e, .free = 0x4035ce53a74cbf91, .fma = 0x4035ce53a74cbf90 },
+    .{ .f = .acosh, .x = 0x4018e4efb8a54bb6, .free = 0x40041eaa39dac9e5, .fma = 0x40041eaa39dac9e6 },
+    .{ .f = .acosh, .x = 0x41d5ffb47c2b5e8e, .free = 0x4035ce53a74cbf91, .fma = 0x4035ce53a74cbf90 },
+};
+
+test "f64 asinh and acosh take f64 log's class, and the public entry the target's" {
+    for (log_splits) |s| {
+        const x: f64 = @bitCast(s.x);
+        const free: u64 = @bitCast(if (s.f == .asinh) asinhIn(false, x) else acoshIn(false, x));
+        const fma: u64 = @bitCast(if (s.f == .asinh) asinhIn(true, x) else acoshIn(true, x));
+        const public: u64 = @bitCast(if (s.f == .asinh) asinh(x) else acosh(x));
+        try std.testing.expectEqual(s.free, free);
+        try std.testing.expectEqual(s.fma, fma);
+        try std.testing.expectEqual(if (fma_class) s.fma else s.free, public);
+    }
 }
 
 test "both classes: the vector forms are the scalar body, lane for lane" {

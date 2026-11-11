@@ -8,9 +8,9 @@ one builds with. Releases before 2.1.0 are described by their tags.
 
 - **f64 `exp`, `log` and `pow` take an FMA body on an FMA target** (x86_64
   with `fma`, aarch64, NVPTX, AMDGCN), picked at comptime from the target,
-  never the build host, so their bits, and those of `asinh` and `acosh`,
-  which call f64 `log`, are the same within one FMA class rather than on
-  every target. The FMA-free class keeps 2.0.1's and 2.1.0's bits. A host
+  never the build host, so their bits, and those of f64 `asinh` and
+  `acosh`, which call f64 `log`, are the same within one FMA class rather
+  than on every target. The FMA-free class keeps 2.0.1's and 2.1.0's bits. A host
   built for baseline x86_64 can now differ from the GPU by one ulp: 30, 2
   and 23 of 65,536 inputs for `exp`, `log` and `pow`. Both classes stay at
   0.505 / 0.502 / 0.502 ulp against an f128 reference. On `x86_64_v3` a
