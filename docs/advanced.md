@@ -41,7 +41,8 @@ then returns `error.Unsupported`.
 
 `g.globalIdX` reads the block size the kernel was launched with on both
 vendors (`%ntid.x`, and on AMD the dispatch packet), so any `block` works. Its
-argument is ignored; it stays because kernels written for 1.4.0 pass one.
+argument is ignored; it stays because kernels written against git abd75e4
+(the last Zig 0.17 build) pass one.
 
 `g.builtins` has the rest of the device intrinsics. It exists only in the
 device compilation, so name it under `if (g.is_device)` or inside a kernel

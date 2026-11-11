@@ -1496,7 +1496,7 @@ fn softExp(x: f64) f64 {
 // and the contractions GCC makes in the rest), written as explicit
 // `@mulAdd`. A target with a hardware fused multiply-add (`fma_class`) runs
 // these; every other target runs the FMA-free bodies above, whose bits are
-// frozen at 2.0.1. `@mulAdd` is one rounding everywhere (hardware,
+// frozen at git bd8800b. `@mulAdd` is one rounding everywhere (hardware,
 // compiler_rt, comptime), so these bodies give one set of bits on every
 // target that runs them, and the same bits on a host without FMA, slowly:
 // that is how their tests run everywhere.
@@ -2780,7 +2780,7 @@ test "atan is bit-identical to std's scalar body, and keeps the sign of zero" {
     try std.testing.expect(std.math.isNan(atan(std.math.nan(f32))));
 
     // atan(-0) = -0 (C11 F.10.1.3), compared as bits: `==` cannot tell the
-    // zeros apart, which is how 2.0.0 shipped +0 here. Scalar and vector.
+    // zeros apart, which is how git 70b722d shipped +0 here. Scalar and vector.
     try std.testing.expectEqual(@as(u64, 0x8000000000000000), @as(u64, @bitCast(atan(@as(f64, -0.0)))));
     try std.testing.expectEqual(@as(u32, 0x80000000), @as(u32, @bitCast(atan(@as(f32, -0.0)))));
     try std.testing.expectEqual(@as(u64, 0), @as(u64, @bitCast(atan(@as(f64, 0.0)))));
@@ -2791,7 +2791,7 @@ test "atan is bit-identical to std's scalar body, and keeps the sign of zero" {
     try std.testing.expectEqual(@as(u32, 0), @as(u32, @bitCast(vf[1])));
 
     // Faithful against std's f128 atan (musl atanl, 113 bits) as the oracle:
-    // 0.741 measured; 2.0.0's vector body was 1.235 ulp on VerA's sample.
+    // 0.741 measured; git 70b722d's vector body was 1.235 ulp on VerA's sample.
     var prng = std.Random.DefaultPrng.init(0xa7a2);
     const r = prng.random();
     var worst: f64 = 0;
@@ -4116,9 +4116,9 @@ test "f32 exp, log, log2, log10, sin and cos are correctly rounded, host and dev
 }
 
 // ---------------------------------------------------------------------------
-// One set of bits per FMA class. The FMA-free class is frozen at 2.0.1: its
-// digests below were recorded from the 2.0.1 bodies (git bd8800b) before the
-// FMA bodies were added, and a moved bit anywhere in the sweep changes one.
+// One set of bits per FMA class. The FMA-free class is frozen at git bd8800b:
+// its digests below were recorded from those bodies before the FMA bodies
+// were added, and a moved bit anywhere in the sweep changes one.
 // The FMA class's digests were recorded on x86_64_v3 (hardware fma) and must
 // come out the same under `-mcpu=baseline`, where every `@mulAdd` is
 // compiler_rt's software fma: that is the proof the class is one set of bits.
@@ -4182,7 +4182,7 @@ const digest = struct {
     }
 
     /// Every NaN as one pattern. Whether a signalling NaN comes back quieted
-    /// is the backend's call, not the body's: 2.0.1's f32 tanh, sinh and
+    /// is the backend's call, not the body's: git bd8800b's f32 tanh, sinh and
     /// cosh return 97 of the f32 sweep's signalling NaNs quieted in Debug and
     /// untouched in ReleaseFast. The class claim is about every other value.
     fn canon(y: anytype) @TypeOf(y) {
@@ -4289,9 +4289,9 @@ const math_self = @This();
 
 /// The FMA-free bodies of exp, log and pow (called directly, so these hold in
 /// either class) and every function whose bits do not depend on the class,
-/// through its public entry. Recorded from 2.0.1 (git bd8800b, Zig
-/// 0.18.0-dev.349, x86_64 native, Debug) before any FMA body existed; the
-/// last eight from 2.1.0 (git 3943b21, same Zig and host, Debug), whose public
+/// through its public entry. Recorded at git bd8800b (Zig 0.18.0-dev.349,
+/// x86_64 native, Debug) before any FMA body existed; the last eight at git
+/// 3943b21 (same Zig and host, Debug), whose public
 /// asinh and acosh ran the FMA-free log, so "asinh free" and "acosh free" are
 /// that class's f64 bodies. Over this sweep the FMA class gives the same f64
 /// asinh and acosh bits too; `log_splits` holds inputs where it does not.
@@ -4427,16 +4427,16 @@ fn frozenDigests() [54]digest.Named {
     return t;
 }
 
-test "the FMA-free class returns 2.0.1's bits, and 2.1.0's for what 2.1.0 added" {
+test "the FMA-free class returns the frozen bodies' bits (bd8800b, 3943b21)" {
     if (dev) return error.SkipZigTest;
     const got = frozenDigests();
     try digest.check(&got, &frozen_digests);
 }
 
 /// f64 inputs where asinh or acosh differs by one ulp between the classes,
-/// because f64 log does (18 and 17 of 10^7 inputs in [2, 2^101) on 3.0.0;
-/// none of the f32 inputs, all of them checked). `free` is 2.1.0's bits (git
-/// 3943b21), `fma` 3.0.0's FMA class (x86_64_v3).
+/// because f64 log does (18 and 17 of 10^7 inputs in [2, 2^101) at git
+/// 60807c3; none of the f32 inputs, all of them checked). `free` is git
+/// 3943b21's bits, `fma` the FMA class at git 60807c3 (x86_64_v3).
 const log_splits = [_]struct { f: enum { asinh, acosh }, x: u64, free: u64, fma: u64 }{
     .{ .f = .asinh, .x = 0x40021ab0374084e9, .free = 0x3ff8e312b326944e, .fma = 0x3ff8e312b326944d },
     .{ .f = .asinh, .x = 0xc0021ab0374084e9, .free = 0xbff8e312b326944e, .fma = 0xbff8e312b326944d },

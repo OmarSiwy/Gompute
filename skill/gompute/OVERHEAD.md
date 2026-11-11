@@ -3,18 +3,19 @@
 Three measurement sets, all on one machine: an RTX 4060 Laptop GPU (sm_89,
 24 SMs, peak 256 GB/s from `Context.info`) with an i9-14900HX host.
 
-- **2.0.0** (bandwidth, `BENCH=math`): `examples/bench`,
+- **git 70b722d** (bandwidth): `examples/bench`,
   `zig build run -Doptimize=ReleaseFast`, Zig 0.18.0-dev.349+d924f83bf,
   measured 2026-11-03. Bandwidth is 20 back-to-back `launchOn`s on a
   non-blocking stream, timed with events after a warm-up.
-- **1.4.0** (first `init`, launch, graphs, startup): Zig 0.17.0,
+- **git abd75e4** (first `init`, launch, graphs, startup): Zig 0.17.0,
   `ReleaseFast -Dcpu=native`, median of 200 runs, kernel `add_offset`
   (`x + offset`, f32, one element per thread). Measured through the removed
   `Kernel` handle, whose `init` and `launch` took the same path `RawKernel`
   takes now (the same `openModule`, then `makeCurrent` + `cuLaunchKernel`).
-  Not re-measured on 2.0.0.
+  Not re-measured since.
 - **libm comparison** ("Device math against the libraries it replaces"):
-  the f64 table from 1.4.0 on Zig 0.17.0, the f32 table from 1.5.0; the
+  the f64 table from git abd75e4 on Zig 0.17.0, the f32 table from git
+  15ab581; the
   glibc and zig@ columns have not been re-measured since.
 
 Expect the same shape on other hardware, though the exact numbers will move.
@@ -57,14 +58,14 @@ At n = 1M the buffers sit in the 24 MB L2 and read over 100% of DRAM peak,
 so that size measures the cache, not the bus. At n = 1024 a launch is
 ~2.2–2.4 µs device-side whatever the kernel: overhead-bound.
 
-Driver and launch costs (1.4.0, see the top):
+Driver and launch costs (git abd75e4, see the top):
 
 | Operation | n = 1024 | n = 1M f32 | What it does |
 | --- | ---: | ---: | --- |
 | first `init` in the process | 220–255 ms | | `cuInit` 55–145 ms + primary context 75–90 ms (NVIDIA driver) + PTX JIT 9 ms cold / 0.1 ms from the driver's cache |
 | first `init` after a background warm-up | 0.29 ms | | see "Startup" below |
 | later `init`, same device/root | 0.4 µs | | table lookup: context and module are process-wide and cached |
-| upload + launch + sync + download, pageable memory | 12.3 µs | 834 µs | 1.4.0's removed `run()`; the copies, not the launch |
+| upload + launch + sync + download, pageable memory | 12.3 µs | 834 µs | the removed `run()` (git abd75e4); the copies, not the launch |
 | `launch` + `synchronize()` | 4.8 µs | 11.8 µs | the launch itself |
 | 10 × `launch` + sync | 19.9 µs | 90.5 µs | ~1.5 µs CPU-side per extra launch |
 | graph of 10 launches, replay + sync | 13.0 µs | 85.2 µs | one driver call for all ten |
@@ -87,7 +88,7 @@ What to take from it:
   saving shrinks to ~6%, because the GPU time dominates. Graphs remove
   CPU-side submission cost, not kernel time.
 - Device math gives CPU and GPU the same bits. f32 exp, log, log2, log10,
-  sin, cos and atan run in f32 on the GPU (3.0.0 `BENCH=math`: exp 111–155,
+  sin, cos and atan run in f32 on the GPU (1.0.0 `BENCH=math`: exp 111–155,
   log 99, log2/log10 89, sin/cos 67, atan 108 Gcalls/s). Every other f32 function
   (exp2, expm1, log1p, tan, tanh, sinh, cosh, pow) computes in f64, 1.5–4
   Gcalls/s, because f64 runs at 1/64 rate on consumer NVIDIA
@@ -102,7 +103,7 @@ What to take from it:
 
 ## Device math throughput (`BENCH=math`)
 
-3.0.0, Zig 0.18.0-dev.349, RTX 4060 Laptop and i9-14900HX, host built for
+1.0.0, Zig 0.18.0-dev.349, RTX 4060 Laptop and i9-14900HX, host built for
 `x86_64_v3` (the FMA class). Each element makes 8 calls. GPU: Gcalls/s over
 4M elements, best of 5 rounds. CPU: ns per call over 64K elements, least of 5
 rounds pinned to one core (`taskset -c 14`, load average 8.5–8.7), the scalar
@@ -128,10 +129,11 @@ lanes wide.
 | pow | 2.17 | 11.09 | 7.61 | 4.21 | 2.36 | 8.48 | 5.69 | 3.70 |
 
 f64 `exp`, `log` and `pow` by FMA class, ns per call (scalar / ×2 / ×4) and
-GPU Gcalls/s, same harness and rounds. "2.0.1" is the FMA-free body on every
-target; "3.0.0" is what each target gets now. Baseline does not move.
+GPU Gcalls/s, same harness and rounds. "bd8800b" is the FMA-free body on
+every target (git bd8800b); "1.0.0" is what each target gets now. Baseline
+does not move.
 
-| fn | `x86_64_v3` 2.0.1 | `x86_64_v3` 3.0.0 | baseline 2.0.1 | baseline 3.0.0 | GPU 2.0.1 | GPU 3.0.0 |
+| fn | `x86_64_v3` bd8800b | `x86_64_v3` 1.0.0 | baseline bd8800b | baseline 1.0.0 | GPU bd8800b | GPU 1.0.0 |
 | --- | --- | --- | --- | --- | ---: | ---: |
 | exp | 3.04 / 2.00 / 1.33 | 2.17 / 1.62 / 1.12 | 3.14 / 2.32 / 2.06 | 3.14 / 2.32 / 2.06 | 4.84 | 7.26 |
 | log | 3.79 / 2.88 / 1.94 | 2.74 / 2.16 / 1.45 | 3.86 / 3.22 / 2.81 | 3.87 / 3.22 / 2.81 | 4.03 | 6.22 |
@@ -175,8 +177,8 @@ element, lower is better.
 | cos | 14.55 | 13.74 | 11.58 | 13.09 | |
 | tanh | 11.97 | 11.85 | 15.64 | 11.95 | |
 
-1.5.0 numbers for f32. 1.6.0's correctly rounded exp, log, log2, log10, sin
-and cos cost about 1.5× these on the CPU (`BENCH=math`, scalar and vector);
+Git 15ab581 numbers for f32. The correctly rounded exp, log, log2, log10,
+sin and cos (git 9b23952) cost about 1.5× these on the CPU (`BENCH=math`, scalar and vector);
 the glibc and zig@ columns have not been re-measured.
 
 | f32 | gompute | g.vector | glibc | zig@ | std |
@@ -198,7 +200,7 @@ What it says:
   f32, including sin/cos (4×).
 - **Scalar, gompute is on par with glibc** for exp/exp2/log/log10. It's
   slower where glibc uses FMA and gompute does not: f64 `log2` 4.8 vs 3.4,
-  f64 `pow` 13.8 vs 10.9 (2.0.x numbers). From 3.0.0, f64 exp, log and pow
+  f64 `pow` 13.8 vs 10.9 (measured before the FMA bodies). In 1.0.0, f64 exp, log and pow
   use FMA on FMA targets; `BENCH=math` above measures pow 12.18 → 8.48 ns on
   `x86_64_v3`, a different harness from this table. It's
   also slower on f32 `pow` scalar (11.8 vs 5.2, where glibc has a dedicated
@@ -241,7 +243,7 @@ warm.join();
 var kernel = try g.RawKernel("scale_relu", .cuda).init(0); // makeCurrent + cached module load
 ```
 
-Measured on 1.4.0: 255 ms became 0.29 ms on the critical path, as long as the
+Measured at git abd75e4: 255 ms became 0.29 ms on the critical path, as long as the
 app has ~250 ms of its own work to overlap. On a headless Linux box,
 `nvidia-smi -pm 1` (persistence mode) keeps the driver initialized between
 processes and cuts `cuInit` itself.

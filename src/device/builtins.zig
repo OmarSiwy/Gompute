@@ -31,8 +31,8 @@ extern fn @"llvm.nvvm.nanosleep"(u32) callconv(.c) void;
 /// vendors: `%ntid.x` on NVPTX, the dispatch packet's `workgroup_size_x` on
 /// AMDGCN (Zig's `@workGroupSize` emits the load the language cannot spell,
 /// `addrspace(.constant)` being rejected on amdgcn). `block_size` is ignored;
-/// it stays in the signature because every kernel written against 1.4.0
-/// passes it, and it used to be what AMDGCN multiplied by.
+/// it stays in the signature because every kernel written against git
+/// abd75e4 (the last Zig 0.17 build) passes it, and it used to be what AMDGCN multiplied by.
 pub inline fn globalIdX(comptime block_size: u32) usize {
     _ = block_size;
     return @as(usize, @workGroupId(0)) * @workGroupSize(0) + @workItemId(0);
