@@ -140,10 +140,14 @@ Block-shared scratch is a file-scope `var x: [N]T addrspace(.shared) = undefined
 Device math (`g.math`, also the std-only module `dep.module("math")`): `exp
 exp2 log log2 log10 log1p pow sin cos tan tanh sinh cosh expm1 atan sqrt
 rsqrt`, for `f32`/`f64`/vectors; `pow(x, y: @TypeOf(x))`. Each gives the
-same bits on host, NVPTX, AMDGCN and at comptime: f32 exp, log, log2, log10,
-sin and cos by being correctly rounded (checked on all 2³² inputs), the rest
-by being one body with no FMA or intrinsic (no optional contraction in the IR,
-checked on four targets). `atan(-0)` is -0 from 2.0.1 on; 2.0.0 returned +0. `math.max_ulp` holds the f64
+same bits on host, NVPTX, AMDGCN and at comptime within one FMA class: f32
+exp, log, log2, log10, sin and cos by being correctly rounded (checked on all
+2³² inputs), f64 exp, log and pow by an FMA body and an FMA-free body picked
+at comptime from the target (FMA class: x86_64 with `fma`, aarch64, NVPTX,
+AMDGCN; the FMA-free class keeps 2.0.1's bits), the rest by being one body
+with no FMA or intrinsic (no optional contraction in the IR, checked on four
+targets). A baseline host build is in the FMA-free class, so it can disagree
+with the GPU by one ulp on f64 exp/log/pow. `atan(-0)` is -0 from 2.0.1 on; 2.0.0 returned +0. `math.max_ulp` holds the f64
 bounds: exp 0.52, log 0.52, pow 0.55 (measured 0.505 / 0.502 / 0.502 against
 f128). The vector forms are lane-exact with the scalar call; a CPU loop
 reaches them only by stepping `@Vector`s by hand.

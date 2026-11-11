@@ -117,7 +117,10 @@ Install with `zig fetch --save git+https://github.com/OmarSiwy/Gompute.git`.
   rest: those builtins do not compile for NVPTX/AMDGCN. `g.math` covers `exp`,
   `exp2`, `log`, `log2`, `log10`, `log1p`, `pow`, `sin`, `cos`, `tan`, `tanh`,
   `sinh`, `cosh`, `expm1`, `atan`, `sqrt` and `rsqrt`, for `f32`, `f64` and
-  `@Vector`s of either. CPU, GPU and comptime give the same bits. f32 `exp`,
+  `@Vector`s of either. CPU, GPU and comptime give the same bits when the
+  CPU target has FMA (`x86_64_v3`, native on a recent x86, aarch64): f64
+  `exp`/`log`/`pow` pick an FMA or FMA-free body from the target at comptime,
+  and a baseline x86_64 build is off by one ulp on a few inputs. f32 `exp`,
   `log`, `log2`, `log10`, `sin`, `cos` are correctly rounded (all 2³² inputs);
   f64 `exp`/`log`/`pow` are faithful (≤0.505 ulp) and monotone. To use the
   math without the GPU layer, import `dep.module("math")`.

@@ -15,6 +15,7 @@ release in their name); the package version is separate.
 | `v1.5.0`        | 1.5.0   | 0.18.0-dev.349+d924f83bf |
 | `v2.0.0`        | 2.0.0   | 0.18.0-dev.349+d924f83bf |
 | `v2.0.1`        | 2.0.1   | 0.18.0-dev.349+d924f83bf |
+| `v3.0.0`        | 3.0.0   | 0.18.0-dev.349+d924f83bf |
 
 `minimum_zig_version` in `build.zig.zon`, the overlay revision in `flake.lock`
 and the version in `.github/workflows/*` name the same build and move
@@ -182,15 +183,29 @@ from what an f32 kernel computes. The set:
 `exp exp2 log log2 log10 log1p pow sin cos tan tanh sinh cosh expm1 atan sqrt
 rsqrt`.
 
-**The same bits everywhere.** No function uses a hardware approximation,
-inline asm or a target intrinsic, so a given input gives the same bits on the
-host (with or without FMA hardware), on NVPTX, on AMDGCN, and when evaluated
-at comptime. Most functions get there by being one body with no FMA, and
+**The same bits per FMA class.** No function uses a hardware approximation,
+inline asm or a target intrinsic, so a given input gives the same bits on
+every target of one FMA class, on the host, NVPTX, AMDGCN and at comptime.
+Most functions are one body with no FMA, the same on every target, and
 `zig build test` checks that no entry point's IR on x86_64, aarch64, NVPTX or
 AMDGCN lets the compiler fuse a multiply and add on its own (`llvm.fmuladd`,
 `contract`).
+
+f64 `exp`, `log` and `pow` have two bodies, chosen at comptime from the
+target, never from the build host or at run time. The **FMA class** (x86_64
+with the `fma` feature such as `x86_64_v3` and newer, aarch64, NVPTX, AMDGCN)
+gets ARM optimized-routines' FMA body, written as explicit `@mulAdd`. The
+**FMA-free class** (baseline and `x86_64_v2`, wasm, everything else) keeps the
+FMA-free body, bit for bit what 2.0.1 returns. Both bodies have the same
+f128 worst error. Within one class, the bits match: a baseline build handed
+the FMA body (software `@mulAdd`) gives the FMA class's bits, which a digest
+test checks. Between classes, a few inputs differ by one ulp: 30, 2 and 23 of
+65,536 for exp, log and pow, measured with `examples/exhaustive` on a
+baseline host against the GPU. Every other
+function, and all of f32, returns the same bits in both classes.
 `examples/exhaustive` checks the CUDA result against the CPU result bit for
-bit for every function over 64K inputs.
+bit for every function over 64K inputs; build the host in the card's class
+(the default native build on an FMA machine).
 
 f32 `exp`, `log`, `log2`, `log10`, `sin` and `cos` get there differently:
 they are **correctly rounded**, so any two bodies agree. The GPU runs an f32
@@ -217,15 +232,17 @@ constants.
 scalar body is the width-1 instance of the same code. A vector with any
 special lane (zero, subnormal, inf, NaN, huge) falls back to the scalar body
 for each lane. f64 `sin`/`cos`/`tanh`/`sinh`/`cosh`/`expm1`, `log1p` and
-`atan` still run one lane at a time.
+`atan` still run one lane at a time, and so do the FMA-class f64 `exp`, `log`
+and `pow` (still 1.19–1.34x faster at 4 lanes than the FMA-free vector form
+on `x86_64_v3`; `skill/gompute/OVERHEAD.md`).
 
 **Accuracy**, as the maximum error measured in tests:
 
 | | Max error | Reference | Notes |
 | --- | --- | --- | --- |
-| `exp` | 0.505 ulp | f128 oracle | ARM optimized-routines. Faithful; promised < 0.52 (`math.max_ulp`). |
-| `log` | 0.502 ulp | f128 oracle | Faithful; promised < 0.52. `log(1)` is +0. |
-| `pow` | 0.502 ulp | f128 oracle | Faithful; promised < 0.55. Exact results come back exact. |
+| `exp` | 0.505 ulp | f128 oracle | ARM optimized-routines. Faithful; promised < 0.52 (`math.max_ulp`). Same worst error in both FMA classes. |
+| `log` | 0.502 ulp | f128 oracle | Faithful; promised < 0.52. `log(1)` is +0. 0.500 away from 1, 0.502 in the band near 1, both classes. |
+| `pow` | 0.502 ulp | f128 oracle | Faithful; promised < 0.55. Exact results come back exact. Both classes. |
 | `exp2`, `log2`, `log10` | ≤1 / ≤1 / ≤2 ulp | glibc | f64 `log10` is 0.52 ulp against a 60-digit reference; the gap is glibc's error. |
 | f64 `sin`, `cos` | bit-identical to `@sin`/`@cos` | compiler_rt | musl, including Payne-Hanek for huge arguments. |
 | f64 `cosh` | 0.998 ulp | f128 oracle | std's is 1.131. |
@@ -235,8 +252,8 @@ for each lane. f64 `sin`/`cos`/`tanh`/`sinh`/`cosh`/`expm1`, `log1p` and
 | `expm1`, `log1p` | std's bits | std | `expm1` minus one line that does not compile for AMDGCN. |
 | `atan` | 0.741 ulp | f128 oracle | musl's, bit-identical to std's scalar atan; `atan(-0)` is -0. Before 2.0.1 it was std's vector body, +0 for -0. |
 
-`exp`, `log`, `pow` (in both arguments), `expm1`, `log1p` and `sinh` are
-**monotone**. That is tested at every table seam and branch edge, so a prover
+`exp`, `log`, `pow` (in both arguments, in both FMA classes), `expm1`,
+`log1p` and `sinh` are **monotone**. That is tested at every table seam and branch edge, so a prover
 that evaluates only at interval endpoints can rely on it. That is why integer
 `y` goes through the same table route as any other `y`: the old
 square-and-multiply fast path stepped down across y = -64.

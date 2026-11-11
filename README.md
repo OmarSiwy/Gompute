@@ -3,7 +3,8 @@
 A Zig library for GPU kernels written in Zig: you write the kernel, the build
 compiles it to PTX (CUDA) and HSACO (HIP) and embeds both in your executable, a
 thin runtime loads the driver at run time and launches it, and `g.math` gives
-device-safe math with the same bits on the host and the GPU.
+device-safe math with the same bits on the host and the GPU (for a host built
+with FMA, such as `x86_64_v3` or aarch64).
 
 [Documentation](https://omarsiwy.github.io/Gompute/) ·
 [Guide](https://omarsiwy.github.io/Gompute/guide.html) ·

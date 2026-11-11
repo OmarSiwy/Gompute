@@ -87,42 +87,62 @@ What to take from it:
   saving shrinks to ~6%, because the GPU time dominates. Graphs remove
   CPU-side submission cost, not kernel time.
 - Device math gives CPU and GPU the same bits. f32 exp, log, log2, log10,
-  sin, cos and atan run in f32 on the GPU (2.0.0 `BENCH=math`: exp 111, log
-  99, log2/log10 89, sin/cos 67, atan 181 Gcalls/s). Every other f32 function
+  sin, cos and atan run in f32 on the GPU (3.0.0 `BENCH=math`: exp 111–155,
+  log 99, log2/log10 89, sin/cos 67, atan 108 Gcalls/s). Every other f32 function
   (exp2, expm1, log1p, tan, tanh, sinh, cosh, pow) computes in f64, 1.5–4
   Gcalls/s, because f64 runs at 1/64 rate on consumer NVIDIA
   (`context.fp64Ratio()` tells you). A throughput-bound kernel that can live
   with hardware approximations and target-dependent bits can call `@exp2`
   directly. Accuracy is ≤0.505 ulp for f64 exp/log/pow against an f128
-  oracle.
+  oracle, in both FMA classes; their bits are the same per class, and the
+  GPU is in the FMA class.
 - `pow` with an integer exponent takes the full table route, like any other
   exponent (a square-and-multiply shortcut broke monotonicity). In a hot
   kernel, write `x * x` yourself for `pow(x, 2)`.
 
 ## Device math throughput (`BENCH=math`)
 
-2.0.0, Zig 0.18.0-dev.349, RTX 4060 Laptop and i9-14900HX (not pinned to a
-core). Each element makes 8 calls. GPU: Gcalls/s over 4M elements, best of 5
-event-timed rounds. CPU: ns per call over 64K elements, median of 5, the
-scalar call in a plain loop and the vector form 8 (f32) or 4 (f64) lanes wide.
+3.0.0, Zig 0.18.0-dev.349, RTX 4060 Laptop and i9-14900HX, host built for
+`x86_64_v3` (the FMA class). Each element makes 8 calls. GPU: Gcalls/s over
+4M elements, best of 5 rounds. CPU: ns per call over 64K elements, least of 5
+rounds pinned to one core (`taskset -c 14`, load average 8.5–8.7), the scalar
+call in a plain loop and the vector form 2 lanes and 8 (f32) or 4 (f64)
+lanes wide.
 
-| fn | f32 GPU | f32 scalar | f32 vector | f64 GPU | f64 scalar | f64 vector |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| exp | 111.36 | 1.82 | 1.47 | 4.87 | 5.13 | 1.80 |
-| exp2 | 4.05 | 4.46 | 1.72 | 5.64 | 4.16 | 1.66 |
-| expm1 | 1.48 | 12.07 | 13.44 | 2.00 | 12.74 | 12.94 |
-| log | 98.70 | 5.43 | 2.10 | 4.05 | 6.75 | 2.86 |
-| log2 | 89.04 | 5.67 | 2.30 | 3.42 | 7.44 | 3.05 |
-| log10 | 88.97 | 5.68 | 2.28 | 2.71 | 9.50 | 3.53 |
-| log1p | 1.72 | 8.83 | 9.15 | 1.72 | 9.53 | 8.22 |
-| sin | 67.70 | 7.40 | 2.64 | 3.11 | 8.26 | 8.00 |
-| cos | 67.01 | 7.48 | 2.57 | 3.12 | 7.96 | 7.96 |
-| tan | 1.75 | 8.20 | 2.42 | 1.48 | 15.93 | 15.64 |
-| tanh | 2.46 | 27.40 | 3.02 | 1.59 | 10.37 | 10.17 |
-| sinh | 2.52 | 21.15 | 2.81 | 1.63 | 10.73 | 9.75 |
-| cosh | 3.39 | 21.06 | 2.28 | 3.24 | 5.03 | 4.91 |
-| atan | 181.04 | 4.10 | 0.57 | 3.23 | 4.69 | 1.20 |
-| pow | 2.18 | 18.95 | 5.53 | 1.51 | 12.28 | 4.42 |
+| fn | f32 GPU | f32 scalar | f32 ×2 | f32 ×8 | f64 GPU | f64 scalar | f64 ×2 | f64 ×4 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| exp | 154.57 | 1.58 | 2.15 | 1.19 | 7.26 | 2.17 | 1.62 | 1.12 |
+| exp2 | 5.66 | 3.18 | 2.12 | 1.42 | 5.61 | 2.50 | 1.77 | 1.16 |
+| expm1 | 2.07 | 8.88 | 8.39 | 8.87 | 1.99 | 7.63 | 7.55 | 7.54 |
+| log | 99.23 | 4.42 | 4.51 | 1.68 | 6.22 | 2.74 | 2.16 | 1.45 |
+| log2 | 89.29 | 4.58 | 5.22 | 1.83 | 3.40 | 4.64 | 3.28 | 2.17 |
+| log10 | 89.29 | 4.62 | 5.22 | 1.83 | 2.70 | 6.02 | 3.88 | 2.48 |
+| log1p | 1.71 | 6.67 | 6.47 | 6.76 | 1.71 | 5.67 | 5.50 | 5.59 |
+| sin | 67.15 | 5.68 | 3.84 | 2.05 | 3.09 | 4.47 | 4.36 | 4.40 |
+| cos | 66.60 | 5.75 | 3.88 | 2.08 | 3.10 | 4.62 | 4.66 | 4.69 |
+| tan | 1.76 | 5.50 | 3.66 | 1.77 | 1.47 | 9.28 | 9.18 | 9.27 |
+| tanh | 2.45 | 5.65 | 3.64 | 2.40 | 1.58 | 9.48 | 9.32 | 9.43 |
+| sinh | 2.50 | 5.18 | 3.36 | 2.19 | 1.62 | 9.22 | 9.12 | 9.54 |
+| cosh | 3.37 | 4.60 | 2.74 | 1.69 | 3.23 | 4.96 | 4.92 | 4.79 |
+| atan | 108.46 | 2.78 | 2.73 | 2.71 | 2.76 | 4.98 | 4.71 | 4.81 |
+| pow | 2.17 | 11.09 | 7.61 | 4.21 | 2.36 | 8.48 | 5.69 | 3.70 |
+
+f64 `exp`, `log` and `pow` by FMA class, ns per call (scalar / ×2 / ×4) and
+GPU Gcalls/s, same harness and rounds. "2.0.1" is the FMA-free body on every
+target; "3.0.0" is what each target gets now. Baseline does not move.
+
+| fn | `x86_64_v3` 2.0.1 | `x86_64_v3` 3.0.0 | baseline 2.0.1 | baseline 3.0.0 | GPU 2.0.1 | GPU 3.0.0 |
+| --- | --- | --- | --- | --- | ---: | ---: |
+| exp | 3.04 / 2.00 / 1.33 | 2.17 / 1.62 / 1.12 | 3.14 / 2.32 / 2.06 | 3.14 / 2.32 / 2.06 | 4.84 | 7.26 |
+| log | 3.79 / 2.88 / 1.94 | 2.74 / 2.16 / 1.45 | 3.86 / 3.22 / 2.81 | 3.87 / 3.22 / 2.81 | 4.03 | 6.22 |
+| pow | 12.18 / 7.70 / 4.48 | 8.48 / 5.69 / 3.70 | 12.43 / 7.99 / 7.49 | 12.41 / 8.00 / 7.49 | 1.50 | 2.36 |
+
+The FMA body on a target without FMA hardware is a compiler_rt `fma` call
+per `@mulAdd`: on baseline it measured 154.55 / 128.28 / 343.93 ns for
+exp / log / pow scalar, 28–49× the FMA-free body. That is why the class
+follows the target and is never forced. The f32 GPU `exp` column swings
+between runs with no code change (110.70 and 153.84 Gcalls/s seen); treat
+it as ±30%.
 
 The vector form buys nothing for expm1 and log1p at either width, or for f64
 sin, cos, tan, tanh, sinh and cosh. This harness differs from the libm
@@ -177,8 +197,10 @@ What it says:
   f64 sin/cos/tanh.** It's 2–2.5× faster on f64 exp/log/pow, and 2–4× on
   f32, including sin/cos (4×).
 - **Scalar, gompute is on par with glibc** for exp/exp2/log/log10. It's
-  slower where glibc uses FMA, which gompute is barred from by its
-  bit-identity contract: f64 `log2` 4.8 vs 3.4, f64 `pow` 13.8 vs 10.9. It's
+  slower where glibc uses FMA and gompute does not: f64 `log2` 4.8 vs 3.4,
+  f64 `pow` 13.8 vs 10.9 (2.0.x numbers). From 3.0.0, f64 exp, log and pow
+  use FMA on FMA targets; `BENCH=math` above measures pow 12.18 → 8.48 ns on
+  `x86_64_v3`, a different harness from this table. It's
   also slower on f32 `pow` scalar (11.8 vs 5.2, where glibc has a dedicated
   f32 algorithm) and f32 `tanh` scalar (7.1 vs 4.4).
 - **Accuracy is the same class or better.** f64 exp/log/pow are 0.505 /
@@ -188,8 +210,10 @@ What it says:
   glibc promises < 1 ulp for these and doesn't give identical bits across
   CPU/GPU.
 - **What the others can't do:** the same bits on the CPU, on NVIDIA, on AMD
-  and at comptime, plus monotone exp/log/pow/expm1/log1p/sinh. glibc's
-  results depend on FMA hardware, and there's no glibc on a GPU.
+  and at comptime within one FMA class, plus monotone
+  exp/log/pow/expm1/log1p/sinh. glibc's results depend on the FMA hardware it
+  finds at run time; gompute's class is fixed by the target at comptime, and
+  there's no glibc on a GPU.
 - `std.math.pow` is 4–10× slower than everything else here. Never use it in
   a kernel.
 
