@@ -15,6 +15,7 @@ release in their name); the package version is separate.
 | `v1.5.0`        | 1.5.0   | 0.18.0-dev.349+d924f83bf |
 | `v2.0.0`        | 2.0.0   | 0.18.0-dev.349+d924f83bf |
 | `v2.0.1`        | 2.0.1   | 0.18.0-dev.349+d924f83bf |
+| `v2.1.0`        | 2.1.0   | 0.18.0-dev.349+d924f83bf |
 
 `minimum_zig_version` in `build.zig.zon`, the overlay revision in `flake.lock`
 and the version in `.github/workflows/*` name the same build and move
@@ -179,8 +180,8 @@ Every one is `inline fn (x: anytype) @TypeOf(x)`, except `pow(x, y)` where
 literal or `const lim = 80.0` is a `comptime_float` and a compile error;
 write `@as(f64, 80.0)`. That's deliberate: choosing f64 silently could differ
 from what an f32 kernel computes. The set:
-`exp exp2 log log2 log10 log1p pow sin cos tan tanh sinh cosh expm1 atan sqrt
-rsqrt`.
+`exp exp2 log log2 log10 log1p pow sin cos tan tanh sinh cosh expm1 atan atan2
+asinh acosh atanh sqrt rsqrt`.
 
 **The same bits everywhere.** No function uses a hardware approximation,
 inline asm or a target intrinsic, so a given input gives the same bits on the
@@ -216,8 +217,8 @@ constants.
 `cosh`. Each vector lane is the scalar call's result bit for bit, because the
 scalar body is the width-1 instance of the same code. A vector with any
 special lane (zero, subnormal, inf, NaN, huge) falls back to the scalar body
-for each lane. f64 `sin`/`cos`/`tanh`/`sinh`/`cosh`/`expm1`, `log1p` and
-`atan` still run one lane at a time.
+for each lane. f64 `sin`/`cos`/`tanh`/`sinh`/`cosh`/`expm1`, `log1p`,
+`atan`, `asinh`, `acosh`, `atanh` and `atan2` still run one lane at a time.
 
 **Accuracy**, as the maximum error measured in tests:
 
@@ -234,6 +235,10 @@ for each lane. f64 `sin`/`cos`/`tanh`/`sinh`/`cosh`/`expm1`, `log1p` and
 | f32 `exp2`, `tanh`, `sinh`, `cosh` | ≤ 0.501 ulp | f64, **all 2³² inputs** | exp2/tanh/cosh 0.50, sinh 0.501. f32 `tan` is the ratio of two roundings, not checked exhaustively. |
 | `expm1`, `log1p` | std's bits | std | `expm1` minus one line that does not compile for AMDGCN. |
 | `atan` | 0.741 ulp | f128 oracle | musl's, bit-identical to std's scalar atan; `atan(-0)` is -0. Before 2.0.1 it was std's vector body, +0 for -0. |
+| `asinh` | 1.259 ulp | f128 oracle | musl's, over this module's `log`/`log1p`; promised < 1.5 (`math.max_ulp`). |
+| `acosh` | 2.152 ulp | f128 oracle | musl's; worst near x = 1. NaN below 1, the far-negative side included. Promised < 2.3. |
+| `atanh` | 1.574 ulp | f128 oracle | musl's, over `log1p`; +-inf at +-1. Promised < 1.8. |
+| `atan2` | 1.300 ulp | f128 oracle | musl's, over this module's `atan`; C99 F.10.1.4's signed zeros and quadrants. Promised < 1.5. |
 
 `exp`, `log`, `pow` (in both arguments), `expm1`, `log1p` and `sinh` are
 **monotone**. That is tested at every table seam and branch edge, so a prover

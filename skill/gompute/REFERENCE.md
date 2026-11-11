@@ -138,14 +138,18 @@ compile error and `exportRaw` is a no-op, so guard the export with
 Block-shared scratch is a file-scope `var x: [N]T addrspace(.shared) = undefined;`.
 
 Device math (`g.math`, also the std-only module `dep.module("math")`): `exp
-exp2 log log2 log10 log1p pow sin cos tan tanh sinh cosh expm1 atan sqrt
-rsqrt`, for `f32`/`f64`/vectors; `pow(x, y: @TypeOf(x))`. Each gives the
+exp2 log log2 log10 log1p pow sin cos tan tanh sinh cosh expm1 atan atan2
+asinh acosh atanh sqrt rsqrt`, for `f32`/`f64`/vectors; `pow(x, y: @TypeOf(x))`,
+`atan2(y, x: @TypeOf(y))`. Each gives the
 same bits on host, NVPTX, AMDGCN and at comptime: f32 exp, log, log2, log10,
 sin and cos by being correctly rounded (checked on all 2³² inputs), the rest
 by being one body with no FMA or intrinsic (no optional contraction in the IR,
-checked on four targets). `atan(-0)` is -0 from 2.0.1 on; 2.0.0 returned +0. `math.max_ulp` holds the f64
+checked on four targets). `atan(-0)` is -0 from 2.0.1 on; 2.0.0 returned +0.
+`asinh`, `acosh`, `atanh` and `atan2` (musl's, over this module's own
+`log`/`log1p`/`atan`) are new in 2.1.0. `math.max_ulp` holds the f64
 bounds: exp 0.52, log 0.52, pow 0.55 (measured 0.505 / 0.502 / 0.502 against
-f128). The vector forms are lane-exact with the scalar call; a CPU loop
+f128); asinh 1.5, acosh 2.3, atanh 1.8, atan2 1.5 (measured 1.259 / 2.152 /
+1.574 / 1.300). The vector forms are lane-exact with the scalar call; a CPU loop
 reaches them only by stepping `@Vector`s by hand.
 
 ## Build API (`@import("gompute")` in build.zig)
