@@ -1221,7 +1221,7 @@ inline fn logVec(x: anytype, comptime which: enum { ln, log2, log10 }) @TypeOf(x
 /// 0 if not an integer, 1 if an odd integer, 2 if an even one. `iy` must be
 /// the bit pattern of a non-zero finite double.
 fn checkint(iy: u64) u32 {
-    const e: u32 = @truncate(iy >> 52 & 0x7ff);
+    const e: u32 = @truncate((iy >> 52) & 0x7ff);
     if (e < 0x3ff) return 0; // |y| < 1
     if (e > 0x3ff + 52) return 2; // no fractional bits left, and even
     const sh: u6 = @intCast(0x3ff + 52 - e);
@@ -3793,7 +3793,7 @@ test "exp, log, pow, expm1, log1p and sinh are monotone across every table seam 
         // and powers of two.
         for ([_]i32{ -1022, -300, -1, 0, 1, 300, 1023 }) |e2| {
             for (0..128) |i| {
-                const bits = (log_off + (@as(u64, i) << 45)) & 0x000fffffffffffff | (@as(u64, @intCast(1023 + e2)) << 52);
+                const bits = ((log_off + (@as(u64, i) << 45)) & 0x000fffffffffffff) | (@as(u64, @intCast(1023 + e2)) << 52);
                 try nonDecreasingAround(F.l, @bitCast(bits), 3);
             }
             try nonDecreasingAround(F.l, std.math.ldexp(@as(f64, 1), e2), 32);

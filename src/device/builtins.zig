@@ -141,13 +141,20 @@ const wg_fence: struct { release: []const u8, acquire: []const u8 = "" } = if (b
             return builtin.target.cpu.features.isEnabled(@backingInt(feature));
         }
     }.f;
+    // LLVM's `gfx12-insts` and `gfx10-insts`: `gfx12_insts`/`gfx10_insts` in Zig up
+    // to 0.18.0-dev.349, `gfx12`/`gfx10` from 0.18.0-dev.1151.
+    const insts = struct {
+        fn f(comptime new: []const u8, comptime old: []const u8) std.Target.amdgcn.Feature {
+            return @field(std.Target.amdgcn.Feature, if (@hasField(std.Target.amdgcn.Feature, new)) new else old);
+        }
+    }.f;
     // Zig 0.18's amdgcn has no `tgsplit` mode feature, only `tgsplit_support`.
     if (@hasField(std.Target.amdgcn.Feature, "tgsplit") and has(.tgsplit)) @compileError("barrier: tgsplit is not supported");
-    if (has(.gfx12_insts)) break :blk .{
+    if (has(insts("gfx12", "gfx12_insts"))) break :blk .{
         .release = "s_wait_loadcnt 0x0\n\ts_wait_storecnt 0x0\n\ts_wait_dscnt 0x0",
         .acquire = "global_inv scope:SCOPE_SE",
     };
-    if (has(.gfx10_insts)) break :blk .{
+    if (has(insts("gfx10", "gfx10_insts"))) break :blk .{
         .release = "s_waitcnt vmcnt(0) lgkmcnt(0)\n\ts_waitcnt_vscnt null, 0x0",
         .acquire = "buffer_gl0_inv",
     };
