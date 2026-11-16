@@ -386,8 +386,8 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("tests/device_entries.zig"),
             .target = b.resolveTargetQuery(std.Target.Query.parse(.{
                 .arch_os_abi = "amdgcn-amdhsa",
-                // `buildArtifacts` adds `trap_handler` to every HIP target; see there.
-                .cpu_features = "gfx1100+trap_handler",
+                // Traps lower to `s_trap 2` with no extra feature; see `buildArtifacts`.
+                .cpu_features = "gfx1100",
             }) catch unreachable),
             .optimize = .fast,
             .strip = true,
@@ -431,8 +431,10 @@ pub fn build(b: *std.Build) void {
     const math_only = b.createModule(.{ .root_source_file = b.path("src/device/math.zig") });
     const contraction: []const []const u8 = &.{ "@llvm.fmuladd.", " contract ", " fast " };
     const contract_targets = [_][2][]const u8{
-        .{ "x86_64-freestanding", "x86_64_v3" },
-        .{ "aarch64-freestanding", "generic" },
+        // Zig 0.18.0-dev.1151 gives x86_64-freestanding soft float (`__mulsf3`),
+        // which no contraction can reach; x86_64-linux keeps SSE/AVX.
+        .{ "x86_64-linux", "x86_64_v3" },
+        .{ "aarch64-freestanding", "baseline" },
         .{ "nvptx64-cuda", "sm_80" },
         .{ "amdgcn-amdhsa", "gfx1100" },
     };
@@ -746,7 +748,7 @@ fn buildArtifacts(
         const cpu = d.cpu orelse continue;
         const tag = @tagName(d.device);
 
-        var query = std.Target.Query.parse(.{
+        const query = std.Target.Query.parse(.{
             .arch_os_abi = d.triple,
             .cpu_features = cpu,
         }) catch |err| std.debug.panic(
@@ -754,10 +756,9 @@ fn buildArtifacts(
                 "run `zig targets` for the full list.",
             .{ tag, cpu, err, d.expected_cpu },
         );
-        // LLVM turns `trap-handler` on for every amdhsa target, but Zig hands it
-        // an explicit feature list that leaves it off, and then a kernel's
-        // `@trap()` lowers to a silent `s_endpgm` instead of `s_trap 2`.
-        if (d.device == .hip) query.cpu_features_add.addFeature(@backingInt(std.Target.amdgcn.Feature.trap_handler));
+        // Zig 0.18.0-dev.1151 no longer has the amdgcn `trap_handler` feature,
+        // and its LLVM lowers a kernel's `@trap()` to `s_trap 2` without it
+        // (checked on gfx1100), so HIP targets need no extra feature for traps.
         const target = b.resolveTargetQuery(query);
         const mode = if (d.optimize) |m| deviceOptimize(m) else optimize;
         var lanes: HeavyLanes = .init(b, options.heavy_lanes);
